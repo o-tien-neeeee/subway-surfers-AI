@@ -144,3 +144,53 @@ class TestBuffering:
         s.pop_executable()
         assert s.action_step == 2 and s.stats.suppressed_duplicates == 1
         assert s.snapshot()["action_step"] == 2
+
+
+class TestConfidenceAwareCadence:
+    """§9: cadence depends on CPU load AND horizon confidence together."""
+
+    def test_high_load_low_confidence_slow(self) -> None:
+        s, _ = make_scheduler()
+        s.set_signal(0.95, 0.2)
+        assert s.cadence == s.cfg.max_decision_frames
+
+    def test_high_load_high_confidence_fast(self) -> None:
+        s, _ = make_scheduler()
+        s.set_signal(0.95, 0.9)  # hazard brewing: safety outranks thrift
+        assert s.cadence == s.cfg.min_decision_frames
+
+    def test_low_load_any_confidence_fast(self) -> None:
+        s, _ = make_scheduler()
+        s.set_signal(0.1, 0.0)
+        assert s.cadence == s.cfg.min_decision_frames
+        s.set_signal(0.1, 0.9)
+        assert s.cadence == s.cfg.min_decision_frames
+
+    def test_confidence_at_threshold_is_fast(self) -> None:
+        s, _ = make_scheduler()
+        s.set_signal(0.95, s.cfg.fast_confidence)
+        assert s.cadence == s.cfg.min_decision_frames
+
+    def test_confidence_none_behaves_like_set_load(self) -> None:
+        s1, _ = make_scheduler()
+        s2, _ = make_scheduler()
+        s1.set_load(0.95)
+        s2.set_signal(0.95, None)
+        assert s1.cadence == s2.cadence
+
+    def test_snapshot_reports_signal(self) -> None:
+        s, _ = make_scheduler()
+        s.set_signal(0.42, 0.83)
+        snap = s.snapshot()
+        assert snap["load"] == pytest.approx(0.42)
+        assert snap["confidence"] == pytest.approx(0.83)
+        s.set_signal(0.1, None)
+        assert s.snapshot()["confidence"] is None
+
+    def test_actor_passes_confidence_through(self) -> None:
+        # integration seam: BotActor calls set_signal(load, hz.confidence);
+        # simulate a rising-confidence sequence and check cadence reacts.
+        s, _ = make_scheduler()
+        for conf in (0.1, 0.5, 0.76):
+            s.set_signal(0.95, conf)
+        assert s.cadence == s.cfg.min_decision_frames

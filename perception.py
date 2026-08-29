@@ -89,10 +89,15 @@ class ZonePreprocessor:
         cfg: PerceptionConfig,
         horizon_frac: float,
         anchor_xy: Optional[tuple[int, int]] = None,
+        require_anchor: bool = True,
     ) -> None:
         self.cfg = cfg
         self.horizon_frac = horizon_frac
         self.anchor_xy = anchor_xy  # absolute pixels inside region
+        # When False, frames stay valid without a death-anchor patch — used by
+        # the demo recorder (BC data does not need the anchor) and by the
+        # actor when the user has not calibrated step 3 yet.
+        self.require_anchor = require_anchor
         self.horizon_h_cache: dict[int, int] = {}
 
     def set_anchor(self, xy: Optional[tuple[int, int]]) -> None:
@@ -124,14 +129,15 @@ class ZonePreprocessor:
             interpolation=cv2.INTER_AREA,
         )
         patch = anchor_patch(image, *self.anchor_xy) if self.anchor_xy else None
+        valid = patch is not None or not self.require_anchor
         return ZoneResult(
             frame_id=frame_id,
             ts=ts,
             horizon_gray=horizon_gray,
             ground_gray=ground_gray,
             anchor_patch=patch,
-            valid=patch is not None,
-            reason="ok" if patch is not None else "anchor_missing",
+            valid=valid,
+            reason="ok" if valid else "anchor_missing",
         )
 
 

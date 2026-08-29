@@ -97,7 +97,8 @@ class DemoRecorder:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.read_frame = read_frame  # returns Frame or None (latest-wins)
-        self.pre = ZonePreprocessor(cfg.perception, cfg.perception.horizon_frac)
+        self.pre = ZonePreprocessor(cfg.perception, cfg.perception.horizon_frac,
+                                    require_anchor=False)
         self._frames: list[np.ndarray] = []
         self._actions: list[int] = []
         self._ts: list[float] = []
@@ -169,28 +170,37 @@ class DemoRecorder:
         meta = {
             "fps_target": self.cfg.capture.target_fps,
             "region": {
+                "left": self.cfg.region.left, "top": self.cfg.region.top,
                 "width": self.cfg.region.width, "height": self.cfg.region.height,
+                "screen_width": self.cfg.region.screen_width,
+                "screen_height": self.cfg.region.screen_height,
                 "dpi_scale": self.cfg.region.dpi_scale,
             },
             "horizon_frac": self.cfg.perception.horizon_frac,
             "profile": self.cfg.rl.profile,
+            "keymap": {str(a): k for a, k in self.cfg.input.keymap.items()},
+            "anchor_calibrated": self.cfg.death.anchor_set(),
+            "respawn_calibrated": self.cfg.input.respawn_set(),
             "recorded_at": time.time(),
         }
         path = self.out_dir / (
             "episode_" + time.strftime("%Y%m%d_%H%M%S") + ".npz"
         )
         tmp = path.with_suffix(".npz.tmp")
-        np.savez_compressed(
-            str(tmp),
-            frames=np.stack(self._frames).astype(np.uint8),
-            actions=np.asarray(self._actions, dtype=np.int64),
-            timestamps=np.asarray(self._ts, dtype=np.float64),
-            done=done_flags,
-            score=np.asarray(self._score, dtype=np.float32),
-            confidence=np.asarray(self._conf, dtype=np.float32),
-            death_state=np.asarray(self._death, dtype="U16"),
-            meta=np.str_(json.dumps(meta)),
-        )
+        # NOTE: pass an open file object — numpy silently appends ".npz" to a
+        # str filename, which would leave the atomic tmp file never created.
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(
+                fh,
+                frames=np.stack(self._frames).astype(np.uint8),
+                actions=np.asarray(self._actions, dtype=np.int64),
+                timestamps=np.asarray(self._ts, dtype=np.float64),
+                done=done_flags,
+                score=np.asarray(self._score, dtype=np.float32),
+                confidence=np.asarray(self._conf, dtype=np.float32),
+                death_state=np.asarray(self._death, dtype="U16"),
+                meta=np.str_(json.dumps(meta)),
+            )
         tmp.replace(path)
         self.episode_paths.append(str(path))
         LOGGER.info("demo episode saved: %s (%d steps)", path, n)

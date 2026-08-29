@@ -609,6 +609,7 @@ class ControlGUI:
             ("q_mean", "Mean Q"), ("buffer", "Replay buffer"),
             ("learner_updates", "Learner updates"), ("cpu", "CPU %"),
             ("ram", "RAM (GB)"), ("profile", "Model profile"),
+            ("best", "Best (rolling)"),
         ]
         for i, (key, label) in enumerate(cols):
             r, c = divmod(i, 3)
@@ -803,6 +804,14 @@ class ControlGUI:
                 self.metric_vars["buffer"].set(
                     f"{int(d.get('buffer_size', 0))} ({d.get('buffer_mb', 0):.0f} MB)")
                 self.metric_vars["learner_updates"].set(str(int(d.get("learner_updates", 0))))
+                best = d.get("best_rolling", -1.0)
+                name = d.get("best_metric_name", "survival_s")
+                self.metric_vars["best"].set(
+                    "—" if best is None or best < 0 else f"{best:.1f} ({name})")
+            elif kind == "best_model":
+                d = msg.get("data") or msg
+                self.log(f"NEW BEST MODEL ({d.get('metric')}: rolling="
+                         f"{d.get('rolling', 0):.2f}, window={d.get('window')})")
             elif kind == "actor_stats":
                 d = msg["data"]
                 self.metric_vars["eff_fps"].set(f"{d.get('fps', 0):.1f}")

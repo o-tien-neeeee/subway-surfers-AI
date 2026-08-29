@@ -84,8 +84,19 @@ def run_evaluation(args: Any) -> int:
         cfg.input.dry_run = True
     n = max(1, getattr(args, "evaluate", 20))
     report = run_headless_evaluation(cfg, n)
+    baseline_path = getattr(args, "compare_baseline", "") or ""
+    if baseline_path:
+        try:
+            imported = report.merge_baseline(baseline_path)
+            LOGGER.info("imported %d baseline records from %s",
+                        imported, baseline_path)
+        except (OSError, ValueError) as exc:
+            LOGGER.error("could not load baseline %s: %s", baseline_path, exc)
     out = report.save(f"runs/evaluation_{time.strftime('%Y%m%d_%H%M%S')}.json")
     print(report.to_markdown())
+    if baseline_path and report.of_kind("human_baseline"):
+        cmp = report.compare()
+        print(f"\ncomparison: {cmp.get('verdict', 'n/a')}")
     print(f"\nreport written: {out}")
     print("NOTE: headless evaluation runs on the SYNTHETIC game. Real Poki-game")
     print("evaluation requires the target machine; until then all real-game")

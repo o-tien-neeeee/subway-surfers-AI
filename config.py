@@ -201,6 +201,10 @@ class SchedulerConfig:
     buffer_size: int = 1
     #: Load (0..1) above which the cadence uses the slower bound.
     slow_load_threshold: float = 0.75
+    #: Horizon-detector confidence (0..1) at/above which the cadence uses the
+    #: FAST bound even under high load — a brewing hazard outranks CPU thrift
+    #: (requirement §9: cadence depends on "CPU load AND confidence").
+    fast_confidence: float = 0.75
 
 
 @dataclass
@@ -255,6 +259,13 @@ class RLConfig:
     epsilon_decay_frames: int = 150_000
     checkpoint_every_updates: int = 500
     torch_threads: int = 1
+    #: Which actor-reported episode metric gates best_model.pth during ONLINE
+    #: training (requirement §12: "only when evaluation performance improves
+    #: according to the configured metric").  "survival_s" | "total_reward".
+    best_metric: str = "survival_s"
+    #: Best-model decisions use the rolling mean over this many finished
+    #: episodes (single episodes are too noisy to gate checkpoints on).
+    best_metric_window: int = 3
 
 
 @dataclass
@@ -357,6 +368,12 @@ class BotConfig:
             raise ConfigError("rl.gamma must be in (0, 1)")
         if self.rl.n_step < 1 or self.rl.n_step > 10:
             raise ConfigError("rl.n_step must be in [1, 10]")
+        if self.rl.best_metric not in ("survival_s", "total_reward"):
+            raise ConfigError(
+                "rl.best_metric must be 'survival_s' or 'total_reward'"
+            )
+        if not (1 <= self.rl.best_metric_window <= 50):
+            raise ConfigError("rl.best_metric_window must be in [1, 50]")
         if self.reward.reward_clip_min > 0 or self.reward.reward_clip_max <= 0:
             raise ConfigError("reward clip range must include 0 and positive max")
         if self.reward.hazard_bonus > self.reward.reward_clip_max:

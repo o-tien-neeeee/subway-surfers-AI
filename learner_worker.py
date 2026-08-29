@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import random
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -70,6 +71,16 @@ class Learner:
         self._publish_every_updates = 20
         self._last_buffer_save_update = 0
         self.bc_history: list[dict[str, Any]] = []
+        # -- online best-model tracking (requirement §12) ---------------- #
+        # The actor reports each finished episode through SharedCounters;
+        # the learner gates best_model.pth on the ROLLING MEAN of the
+        # configured metric over the last ``best_metric_window`` episodes.
+        self._episode_window: deque[float] = deque(
+            maxlen=max(1, cfg.rl.best_metric_window)
+        )
+        self._last_seen_episode_done_id = 0
+        self.best_metric_name = cfg.rl.best_metric
+        self.best_rolling: Optional[float] = None
         self._load_checkpoint()
 
     # ------------------------------------------------------------------ #
@@ -98,12 +109,66 @@ class Learner:
             try:
                 self.agent.load_payload(payload["agent"])
                 self.update_step = payload["agent"].get("update_count", 0)
-                LOGGER.info("checkpoint restored (updates=%d)", self.update_step)
+                # restore the persisted best-model gate so a restart cannot
+                # overwrite a better historical best_model.pth with a worse run
+                extra = payload.get("extra", {}) or {}
+                bm = extra.get("best_metric")
+                if bm is not None:
+                    self.ckpt.best_metric = float(bm)
+                    self.best_rolling = float(bm)
+                LOGGER.info("checkpoint restored (updates=%d, best=%s)",
+                            self.update_step, self.ckpt.best_metric)
             except Exception as exc:
                 LOGGER.error("checkpoint restore failed, fresh start:\n%s",
                              format_exception(exc))
         else:
             LOGGER.info("no checkpoint for profile %s; fresh networks", self.profile)
+
+    # ------------------------------------------------------------------ #
+    def _poll_episode_metric(self) -> Optional[float]:
+        """Consume actor-reported episode ends; maybe update best_model.pth.
+
+        Metric semantics (explicit, not "steps"-ambiguous): the metric is the
+        per-episode value the ACTOR measured in real time — ``survival_s`` or
+        ``total_reward`` (``rl.best_metric``).  The gate is the rolling mean
+        over the last ``rl.best_metric_window`` finished episodes.
+        """
+        done_id = int(self.counters.last_episode_done_id.value)
+        if done_id <= 0 or done_id == self._last_seen_episode_done_id:
+            return None
+        self._last_seen_episode_done_id = done_id
+        if self.cfg.rl.best_metric == "total_reward":
+            value = float(self.counters.last_episode_reward.value)
+        else:
+            value = float(self.counters.last_episode_survival_s.value)
+        if not np.isfinite(value) or value <= 0:
+            return None
+        self._episode_window.append(value)
+        rolling = float(sum(self._episode_window) / len(self._episode_window))
+        improved = self.ckpt.best_metric is None or rolling > self.ckpt.best_metric
+        self.best_rolling = rolling
+        if improved:
+            extra = {
+                "update_step": self.update_step,
+                "buffer_size": self.buffer.size,
+                "best_metric": rolling,
+                "best_metric_name": self.cfg.rl.best_metric,
+                "best_metric_window": list(self._episode_window),
+                "episode_id": done_id,
+            }
+            path = self.ckpt.save_model(self.agent.state_payload(), extra,
+                                        which="best", metric=rolling,
+                                        higher_is_better=True)
+            if path is not None:
+                LOGGER.info("new best model (%s rolling=%.2f, window=%s)",
+                            self.cfg.rl.best_metric, rolling,
+                            list(self._episode_window))
+                put_bounded(self.metrics_q, {
+                    "type": "best_model", "src": "learner",
+                    "metric": self.cfg.rl.best_metric,
+                    "rolling": rolling, "window": list(self._episode_window),
+                })
+        return rolling
 
     # ------------------------------------------------------------------ #
     def set_profile(self, profile: str) -> None:
@@ -186,6 +251,8 @@ class Learner:
             "epsilon": float(self.counters.epsilon.value),
             "env_frame_id": int(self.counters.env_frame_id.value),
             "perf": self.last_metrics,
+            "best_metric": self.ckpt.best_metric,
+            "best_metric_name": self.cfg.rl.best_metric,
         }
         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
         if self.update_step - self._last_buffer_save_update >= \
@@ -264,7 +331,9 @@ class Learner:
     # ------------------------------------------------------------------ #
     def shutdown_save(self) -> None:
         extra = {"update_step": self.update_step,
-                 "buffer_size": self.buffer.size, "shutdown": True}
+                 "buffer_size": self.buffer.size, "shutdown": True,
+                 "best_metric": self.ckpt.best_metric,
+                 "best_metric_name": self.cfg.rl.best_metric}
         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
         self.ckpt.buffer_save(self.buffer)
         LOGGER.info("shutdown save complete (updates=%d, buffer=%d)",
@@ -324,6 +393,8 @@ def learner_main(
             learner.events_paused = pause_event.is_set()
             if learner.can_train(now):
                 learner.train_one(now)
+            # 3.5 online best-model gate (actor-reported episode metrics)
+            learner._poll_episode_metric()
             # 4. metrics heartbeat
             if now - last_report >= cfg.perf.report_interval_s:
                 last_report = now
@@ -341,6 +412,11 @@ def learner_main(
                         "new_transitions": transitions_since_report,
                         "replay_sample_ms": learner.last_metrics.get("sample_ms", 0.0),
                         "update_ms": learner.last_metrics.get("update_ms", 0.0),
+                        "best_metric_name": learner.cfg.rl.best_metric,
+                        "best_rolling": (-1.0 if learner.best_rolling is None
+                                         else learner.best_rolling),
+                        "best_gate": (None if learner.ckpt.best_metric is None
+                                      else float(learner.ckpt.best_metric)),
                     },
                 })
                 transitions_since_report = 0

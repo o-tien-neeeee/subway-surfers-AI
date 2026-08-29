@@ -351,7 +351,9 @@ class BotActor:
                 int(cfg.death.anchor_fx * cfg.region.width),
                 int(cfg.death.anchor_fy * cfg.region.height),
             )
-        self.pre = ZonePreprocessor(cfg.perception, cfg.perception.horizon_frac, anchor_xy)
+        self.pre = ZonePreprocessor(cfg.perception, cfg.perception.horizon_frac,
+                                    anchor_xy,
+                                    require_anchor=cfg.death.anchor_set())
         self.horizon = HorizonDetector(cfg.horizon, cfg.perception.horizon_size)
         self.death = ColorAnchorDeathDetector(cfg.death) if cfg.death.anchor_set() else None
         self.reward_calc = SurvivalRewardCalculator(cfg.reward)
@@ -497,7 +499,8 @@ class BotActor:
 
         danger = hz.detected and hz.confidence >= 0.5
         self.counters.danger_flag.value = 1 if danger else 0
-        self.scheduler.set_load(self._cpu_load_estimate())
+        # §9: cadence adapts to CPU load AND horizon confidence together.
+        self.scheduler.set_signal(self._cpu_load_estimate(), hz.confidence)
         if self.scheduler.on_frame(danger=danger):
             self._decide(danger)
 
@@ -592,6 +595,10 @@ class BotActor:
                            "data": stats.to_dict()})
         LOGGER.info("episode %d ended (%s): %.1fs reward=%.2f",
                     stats.episode_id, reason, stats.survival_s, stats.total_reward)
+        # publish for the learner's online best-model gate (single writer: actor)
+        self.counters.last_episode_done_id.value = stats.episode_id
+        self.counters.last_episode_survival_s.value = float(stats.survival_s)
+        self.counters.last_episode_reward.value = float(stats.total_reward)
         self._episode_start_ts = 0.0
         self._action_step_at_episode_start = self.scheduler.action_step
 

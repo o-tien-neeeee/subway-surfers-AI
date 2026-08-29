@@ -11,11 +11,50 @@ Target machine: Windows 64-bit, i5-7200U (2C/4T), 12 GB RAM, Intel HD 620,
 Chrome.
 
 > **Honesty first.** Everything in this repo runs and is unit-tested headless
-> (340 tests, see §Testing). The bot has **not yet been run against the real
+> (403 tests, see §Testing). The bot has **not yet been run against the real
 > Poki game** — no real-game benchmark numbers exist yet, so every real-game
 > metric is labelled *not yet measured*. Nothing here is claimed to be
 > "superhuman", "frame-perfect", or "production-ready"; those labels require
 > the evaluation protocol in §Evaluation on the target machine.
+
+---
+
+## 0. What's new in this upgrade (v1.1)
+
+Continuing from the first complete build, this round closes the remaining
+specification gaps and hardens four subsystems — all verified by new tests
+(340 → 403):
+
+1. **Online best-model gating (§12).** `best_model.pth` used to be written
+   only by behaviour cloning. Now the actor reports every finished episode
+   (`survival_s`, `total_reward`) through shared counters and the learner
+   updates `best_model.pth` whenever the **rolling mean over
+   `rl.best_metric_window` (default 3) episodes** improves. The best value is
+   persisted inside the checkpoint so a restart can never overwrite a
+   historical best with a worse run. (`tests/test_best_model_tracking.py`)
+2. **Capture geometry-drift detection (§6).** A resolution/DPI change or a
+   window move silently shifts every calibrated coordinate. The capture
+   process now re-checks the virtual screen against the calibrated reference
+   every 5 s and warns (once per change) instead of failing silently.
+   (`tests/test_capture_geometry.py`)
+3. **Confidence-aware action cadence (§9).** The decision cadence now adapts
+   to CPU load **and** horizon-detector confidence together: a brewing hazard
+   (confidence ≥ `scheduler.fast_confidence`, default 0.75) selects the fast
+   bound even under high load — safety outranks CPU thrift.
+   (`tests/test_action_scheduler.py::TestConfidenceAwareCadence`)
+4. **Statistical evaluation upgrade (§15).** Comparisons now include a
+   tie-corrected **Mann-Whitney U** p-value and **bootstrap CIs** alongside
+   the CI-overlap rule, plus an **adaptive target** derived from the measured
+   baseline (baseline mean + 1σ, flagged provisional below 20 episodes).
+   `python app.py --evaluate N --compare-baseline <report.json>` imports a
+   saved report as the baseline set. (`tests/test_evaluation_stats.py`)
+
+Also fixed on the way: the demo recorder's atomic `.npz` write silently
+never created its temp file (numpy appends `.npz` to str filenames — now
+writes through a file object, covered by tests); the demo recorder and the
+actor no longer discard frames when the death anchor is not calibrated
+(`ZonePreprocessor(require_anchor=False)`); demo episodes now embed absolute
+screen geometry + keymap + calibration metadata.
 
 ---
 
@@ -129,7 +168,7 @@ subway-surfers-AI/
 ├── evaluation.py             # honest eval protocol + reports
 ├── evaluation_tool.py        # headless evaluation runner
 ├── requirements.txt · config.example.json · pytest.ini
-└── tests/                    # 11 test files, 340 tests
+└── tests/                    # 15 test files, 403 tests
 ```
 
 ---
@@ -141,9 +180,9 @@ Parameters/FLOPs/latency measured with `python profiling.py`
 
 | profile | params (exact) | FLOPs (MACs) | act. mem (train) | inference p50/p95 | update @ batch 32 |
 |---|---:|---:|---:|---:|---:|
-| `strict_lite` | **49 154** (≤ 80 000 ✓) | 2 627 616 | 2.06 MB | 1.33 / 1.96 ms | 62.5 ms |
-| `balanced_cpu` | **95 558** | 14 018 304 | 0.52 MB | 1.29 / 1.40 ms | 44.2 ms |
-| `quality_cpu` | **348 134** | 23 603 200 | 0.73 MB | 1.86 / 2.02 ms | 76.6 ms |
+| `strict_lite` | **49 154** (≤ 80 000 ✓) | 2 627 616 | 2.06 MB | 0.75 / 1.41 ms | 33.8 ms |
+| `balanced_cpu` | **95 558** | 14 018 304 | 0.52 MB | 0.46 / 0.53 ms | 23.8 ms |
+| `quality_cpu` | **348 134** | 23 603 200 | 0.73 MB | 0.73 / 0.89 ms | 36.7 ms |
 
 Design per profile (`models.py`):
 * **StrictLite** — 4 depthwise-separable blocks (32/48/64/128, stride 2/2/2/1)
@@ -177,7 +216,7 @@ py -3.11 -m venv .venv
 pip install -r requirements.txt
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU-only wheel
 python -m compileall .          # must exit clean
-python -m pytest -q             # 340 passed (headless, no display needed)
+python -m pytest -q             # 403 passed (headless, no display needed)
 python profiling.py             # re-measure on THIS machine
 python app.py                   # GUI
 ```
@@ -226,7 +265,7 @@ dry-run input, same three-process pipeline).
 
 ```bash
 python -m compileall .     # clean compile of every file
-python -m pytest -q        # 340 tests
+python -m pytest -q        # 403 tests
 python app.py --headless --steps 600       # end-to-end smoke (fake game)
 python app.py --evaluate 5                 # headless eval + honest report
 ```
@@ -234,13 +273,16 @@ python app.py --evaluate 5                 # headless eval + honest report
 Test coverage highlights: horizon detection & debounce; colour-anchor death
 ladder + false-positive flashes + respawn machine (timeout → FAILED, never
 clicks forever); reward clipping + pending-hazard logic + no-future-leak +
-reward-hacking bounds; action cadence/danger/expiry/duplicates; key release
-after backend exceptions + guardian force-release + focus gate; PER maths,
-NaN protection, eviction validation, persistence + corruption recovery;
-checkpoint atomicity, best-model policy, RNG-state round trip; lifecycle
-state machine; process startup/emergency-stop/idempotent shutdown;
-GUI-survives-worker-crash; stale-frame dropping; headless multi-process
-training pipeline; no bare excepts / silent passes / stubs / network calls.
+reward-hacking bounds; action cadence/danger/expiry/duplicates + confidence-
+aware cadence; key release after backend exceptions + guardian force-release
++ focus gate; PER maths, NaN protection, eviction validation, persistence +
+corruption recovery; checkpoint atomicity, best-model policy, RNG-state round
+trip, online best-model gating + restart protection; Mann-Whitney/bootstrap/
+adaptive-target statistics; capture geometry drift; recorder metadata +
+atomic npz writes; lifecycle state machine; process startup/emergency-stop/
+idempotent shutdown; GUI-survives-worker-crash; stale-frame dropping;
+headless multi-process training pipeline; no bare excepts / silent passes /
+stubs / network calls.
 
 ## 9. Profiling commands
 
@@ -257,9 +299,16 @@ python app.py --evaluate 20         # per-episode stats + system profile
 2. Evaluate the trained policy on **separate** episodes (ε fixed 0.05,
    learning paused), 20–50 episodes where practical.
 3. Reports (JSON + Markdown under `runs/`) contain mean/median/std/min/max/
-   95 % CI per metric, failure modes, and a **verdict** that only says
-   "statistically exceeds baseline" when the 95 % CIs don't overlap.
-4. Training performance, evaluation performance, human baseline, best single
+   95 % CI per metric, failure modes, and a **verdict**. The verdict says
+   "beats baseline" only when the 95 % CIs do not overlap **and** the
+   tie-corrected Mann-Whitney U p-value is < 0.05; suggestive-but-unproven
+   and not-improved outcomes are labelled as such.
+4. An **adaptive target** is derived from the measured baseline
+   (baseline mean + 1σ) and marked *provisional* until the baseline has
+   ≥ 20 episodes — no invented fixed targets.
+5. Compare a saved baseline report against a fresh evaluation with
+   `python app.py --evaluate 20 --compare-baseline runs/human_baseline.json`.
+6. Training performance, evaluation performance, human baseline, best single
    run and typical run are reported as separate numbers; "superhuman" is
    never printed as a claim, only as an explicitly unmet requirement.
 
@@ -298,7 +347,8 @@ python app.py --evaluate 20         # per-episode stats + system profile
 - [x] Five discrete actions; configurable keys; TTL, cooldown, duplicate
       suppression, buffering; guaranteed key release (guardian + watchdog +
       exception paths); dry-run mode; focus gate
-- [x] Adaptive cadence 2–4 frames / 1 in danger; separate counters
+- [x] Adaptive cadence 2–4 frames / 1 in danger, from CPU load AND horizon
+      confidence; separate counters
 - [x] PER (α/β, IS weights, sum-tree, NaN guards, eviction validation),
       n-step returns, lazy uint8 frame storage, atomic persistence with
       sha256 + `.corrupt` quarantine
@@ -309,12 +359,17 @@ python app.py --evaluate 20         # per-episode stats + system profile
       defined on env frames
 - [x] BC pretraining with episode-level split, class weighting, per-action
       accuracy; refuses insufficient data instead of faking it
-- [x] Checkpoints (best/latest/buffer) atomic + RNG states + git/config hash
+- [x] Checkpoints (best/latest/buffer) atomic + RNG states + git/config hash;
+      best_model.pth gated online by the rolling episode metric and
+      protected against regression across restarts
+- [x] Capture-side geometry-drift detection (resolution/DPI change → warning)
+- [x] Evaluation statistics: CI overlap + Mann-Whitney U + bootstrap CI +
+      adaptive baseline-derived target; `--compare-baseline` merging
 - [x] Lifecycle: 12 states, emergency stop, idempotent shutdown, GUI survives
       worker crashes, no stuck keys on any shutdown path
 - [x] No bare excepts / `except Exception: pass` / TODO stubs / network
       calls (AST-enforced tests)
-- [x] 340 automated tests green; `compileall` clean
+- [x] 403 automated tests green; `compileall` clean
 
 **Requires the real Poki game on the target machine (pending)**
 

@@ -211,7 +211,8 @@ class SharedCounters:
     """Cross-process counters and scalars the GUI/actor/learner share.
 
     Every field has exactly one writer to avoid races:
-    * actor:   env_frame_id, action_step, episode_id, epsilon, danger_flag
+    * actor:   env_frame_id, action_step, episode_id, epsilon, danger_flag,
+               last_episode_* (written once per finished episode)
     * learner: learner_update_step, beta, td_loss, buffer_size
     """
 
@@ -228,6 +229,10 @@ class SharedCounters:
         self.danger_flag = CTX.Value(ct.c_int, 0)
         self.death_flag = CTX.Value(ct.c_int, 0)
         self.profile = CTX.Array(ct.c_char, 32)  # active profile name
+        # -- best-model telemetry (actor writes, learner polls) ---------- #
+        self.last_episode_done_id = CTX.Value(ct.c_uint64, 0)
+        self.last_episode_survival_s = CTX.Value(ct.c_double, 0.0)
+        self.last_episode_reward = CTX.Value(ct.c_double, 0.0)
 
     def set_profile(self, name: str) -> None:
         raw = name.encode("ascii")[:31]
@@ -251,6 +256,9 @@ class SharedCounters:
             "danger": int(self.danger_flag.value),
             "dead": int(self.death_flag.value),
             "profile": self.get_profile(),
+            "last_episode_done_id": int(self.last_episode_done_id.value),
+            "last_episode_survival_s": float(self.last_episode_survival_s.value),
+            "last_episode_reward": float(self.last_episode_reward.value),
         }
 
 

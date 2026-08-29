@@ -387,6 +387,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="run behaviour cloning on a demos dir (headless)")
     parser.add_argument("--evaluate", type=int, default=0,
                         help="run N headless evaluation episodes")
+    parser.add_argument("--compare-baseline", default="",
+                        help="with --evaluate: import a saved report's records "
+                             "as the human-baseline comparison set")
     parser.add_argument("--record-demo", action="store_true",
                         help="start GUI in demo-recording mode")
     parser.add_argument("--report", default="runs/headless_report.json")

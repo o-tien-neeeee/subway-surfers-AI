@@ -16,12 +16,112 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 NOT_MEASURED = "not yet measured"
+
+#: Minimum evaluation episodes for a comparative claim (requirement §15:
+#: "At least 20-50 evaluation episodes where practical").
+MIN_EVAL_EPISODES = 20
+
+
+def mann_whitney_u(xs: list[float], ys: list[float]) -> dict[str, float]:
+    """Mann-Whitney U rank-sum test (no SciPy; normal approximation).
+
+    Returns ``{"u": U, "p": two_sided_p, "n": len(xs)+len(ys)}``.  Ties get
+    mid-ranks; the variance carries the tie correction.  Valid for n>=8-ish;
+    below that the p-value is still returned but flagged low-power via ``n``.
+    """
+    n1, n2 = len(xs), len(ys)
+    if n1 == 0 or n2 == 0:
+        return {"u": float("nan"), "p": 1.0, "n": n1 + n2}
+    pooled = [(v, 0) for v in xs] + [(v, 1) for v in ys]
+    pooled.sort(key=lambda t: t[0])
+    ranks = [0.0] * len(pooled)
+    i = 0
+    while i < len(pooled):
+        j = i
+        while j + 1 < len(pooled) and pooled[j + 1][0] == pooled[i][0]:
+            j += 1
+        mid = 0.5 * (i + j) + 1.0  # average rank, 1-based
+        for k in range(i, j + 1):
+            ranks[k] = mid
+        i = j + 1
+    r1 = sum(r for r, (_v, g) in zip(ranks, pooled) if g == 0)
+    u1 = r1 - n1 * (n1 + 1) / 2.0
+    u2 = n1 * n2 - u1
+    mu = n1 * n2 / 2.0
+    # tie-corrected variance
+    tie_terms = 0.0
+    i = 0
+    while i < len(pooled):
+        j = i
+        while j + 1 < len(pooled) and pooled[j + 1][0] == pooled[i][0]:
+            j += 1
+        t = j - i + 1
+        tie_terms += t ** 3 - t
+        i = j + 1
+    n = n1 + n2
+    var = (n1 * n2 / 12.0) * ((n + 1) - tie_terms / (n * (n - 1))) if n > 1 else 1.0
+    var = max(var, 1e-12)
+    z = (u1 - mu) / math.sqrt(var)
+    p = 2.0 * (1.0 - _normal_cdf(abs(z)))
+    return {"u": float(min(u1, u2)), "p": float(p), "n": n}
+
+
+def _normal_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bootstrap_ci(values: list[float], n_boot: int = 2000, seed: int = 0,
+                 statistic: str = "mean") -> dict[str, float]:
+    """Percentile bootstrap CI for the mean (or median) of ``values``.
+
+    Deterministic for a given seed; used alongside the analytic CI so small-n
+    results can be judged honestly.
+    """
+    if not values:
+        return {"lo": float("nan"), "hi": float("nan"), "stat": float("nan")}
+    fn = (lambda v: sum(v) / len(v)) if statistic == "mean" \
+        else (lambda v: sorted(v)[len(v) // 2])
+    point = fn(values)
+    if len(values) == 1:
+        return {"lo": point, "hi": point, "stat": point}
+    rng = random.Random(seed)
+    stats: list[float] = []
+    for _ in range(max(100, n_boot)):
+        sample = [values[rng.randrange(len(values))] for _ in range(len(values))]
+        stats.append(fn(sample))
+    stats.sort()
+    lo = stats[int(0.025 * (len(stats) - 1))]
+    hi = stats[int(0.975 * (len(stats) - 1))]
+    return {"lo": lo, "hi": hi, "stat": point}
+
+
+def define_target(baseline: dict[str, Any], margin_frac: float = 0.0) -> dict[str, Any]:
+    """Adaptive success target derived from a measured baseline (§15 step 3).
+
+    Target = baseline mean + 1 std (statistically "noticeably better than the
+    baseline's typical spread"), optionally inflated by ``margin_frac``.  With
+    fewer than MIN_EVAL_EPISODES baseline episodes the target is still produced
+    but flagged as provisional.
+    """
+    if baseline.get("status") != "ok":
+        return {"status": NOT_MEASURED,
+                "reason": "no baseline episodes recorded"}
+    target = baseline["mean"] + baseline["std"] * (1.0 + margin_frac)
+    return {
+        "status": "ok",
+        "metric": "survival_s",
+        "target": target,
+        "rule": "baseline_mean + 1*baseline_std",
+        "provisional": baseline.get("n", 0) < MIN_EVAL_EPISODES,
+        "baseline_n": baseline.get("n", 0),
+    }
 
 
 @dataclass
@@ -123,21 +223,63 @@ class EvaluationReport:
         upper_b = b["mean"] + b["ci95"]
         return bool(lower_a > upper_b)
 
+    def compare(self, kind_a: str = "eval", kind_b: str = "human_baseline",
+                metric: str = "survival_s") -> dict[str, Any]:
+        """Full statistical comparison of two episode sets on one metric.
+
+        Includes both significance views (CI overlap + Mann-Whitney U p) and
+        the adaptive target derived from the baseline set.
+        """
+        a = summarize(self._col(kind_a, metric))
+        b = summarize(self._col(kind_b, metric))
+        out: dict[str, Any] = {"metric": metric, "kind_a": kind_a,
+                               "kind_b": kind_b, "a": a, "b": b}
+        if a.get("status") != "ok" or b.get("status") != "ok":
+            out["verdict"] = NOT_MEASURED
+            return out
+        out["delta_mean"] = a["mean"] - b["mean"]
+        lower_a = a["mean"] - a["ci95"]
+        upper_b = b["mean"] + b["ci95"]
+        out["ci_overlap_clear"] = bool(lower_a > upper_b)
+        mwu = mann_whitney_u(self._col(kind_a, metric), self._col(kind_b, metric))
+        out["mann_whitney_p"] = mwu["p"]
+        out["mann_whitney_u"] = mwu["u"]
+        out["bootstrap"] = {
+            "a": bootstrap_ci(self._col(kind_a, metric)),
+            "b": bootstrap_ci(self._col(kind_b, metric)),
+        }
+        tgt = define_target(b)
+        out["target"] = tgt
+        out["meets_target"] = bool(a.get("status") == "ok" and tgt.get("status") == "ok"
+                                   and a["mean"] >= tgt["target"])
+        if out["ci_overlap_clear"] and mwu["p"] < 0.05:
+            out["verdict"] = (f"{kind_a} beats {kind_b} on {metric} "
+                              f"(CI-separated AND Mann-Whitney p={mwu['p']:.4f})")
+        elif out["ci_overlap_clear"]:
+            out["verdict"] = (f"{kind_a} ahead with non-overlapping CIs, but "
+                              f"rank-sum p={mwu['p']:.4f} >= 0.05 — treat as "
+                              f"suggestive, not proven")
+        else:
+            out["verdict"] = (f"no statistically-supported improvement of "
+                              f"{kind_a} over {kind_b} on {metric}")
+        return out
+
     def verdict(self) -> str:
         if not self.of_kind("eval"):
             return "NOT YET MEASURED: no evaluation episodes recorded."
         if not self.of_kind("human_baseline"):
             return ("Evaluation recorded, but no human baseline exists — "
                     "no comparative claim is made.")
-        beats = self.beats_baseline()
-        if beats is None:
-            return "Insufficient data for a statistical comparison."
-        if beats:
-            return ("Evaluation mean survival statistically exceeds the recorded "
-                    "baseline (non-overlapping 95% CIs). Still not 'superhuman' — "
-                    "see per-metric details before any strong claim.")
-        return ("Evaluation has NOT exceeded the recorded baseline. No "
-                "performance claim is made.")
+        n_eval = len(self.of_kind("eval"))
+        cmp = self.compare()
+        lines = [cmp["verdict"] + "."]
+        if n_eval < MIN_EVAL_EPISODES:
+            lines.append(f"(only {n_eval} evaluation episodes; target protocol "
+                         f"asks for >= {MIN_EVAL_EPISODES} before strong claims)")
+        lines.append("Even when statistically ahead of the recorded baseline, "
+                     "this is NOT a 'superhuman' claim — the baseline is the "
+                     "human who recorded it, under these window conditions only.")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
     def to_markdown(self) -> str:
@@ -171,6 +313,23 @@ class EvaluationReport:
         else:
             lines.append("- none recorded")
         lines.append("")
+        if self.of_kind("eval") and self.of_kind("human_baseline"):
+            cmp = self.compare()
+            lines.append("## Statistical comparison (eval vs human baseline, "
+                         "survival_s)")
+            lines.append(f"- delta mean: {cmp['delta_mean']:.2f}s")
+            lines.append(f"- 95% CIs separated: {cmp['ci_overlap_clear']}")
+            lines.append(f"- Mann-Whitney U p-value: {cmp['mann_whitney_p']:.4f} "
+                         f"(n={len(self.of_kind('eval')) + len(self.of_kind('human_baseline'))})")
+            tgt = cmp.get("target", {})
+            if tgt.get("status") == "ok":
+                lines.append(f"- adaptive target (baseline mean + 1 std): "
+                             f"{tgt['target']:.2f}s "
+                             f"({'provisional' if tgt.get('provisional') else 'final'}, "
+                             f"baseline n={tgt.get('baseline_n')})")
+                lines.append(f"- eval mean meets target: {cmp['meets_target']}")
+            lines.append(f"- verdict: {cmp['verdict']}")
+            lines.append("")
         lines.append(f"## Verdict\n\n{self.verdict()}")
         return "\n".join(lines)
 
@@ -194,6 +353,29 @@ class EvaluationReport:
         for r in data.get("records", []):
             rep.add(EpisodeRecord(**r))
         return rep
+
+    def merge_baseline(self, path: str | Path,
+                       kind: str = "human_baseline") -> int:
+        """Import records from a saved report as baseline episodes.
+
+        Used by ``app.py --evaluate N --compare-baseline runs/human.json``:
+        the comparison set and the training set must stay separate, so
+        imported records are re-labelled ``kind`` (default human_baseline)
+        instead of being mixed into the eval pool.
+        """
+        other = EvaluationReport.load(path)
+        count = 0
+        for rec in other.records:
+            self.add(EpisodeRecord(
+                episode_id=rec.episode_id, survival_s=rec.survival_s,
+                total_reward=rec.total_reward, steps=rec.steps,
+                env_frames=rec.env_frames, fps=rec.fps,
+                action_latency_p95_ms=rec.action_latency_p95_ms,
+                inference_p95_ms=rec.inference_p95_ms, score=rec.score,
+                kind=kind, ts=rec.ts,
+            ))
+            count += 1
+        return count
 
 
 def ablation_matrix() -> list[dict[str, str]]:

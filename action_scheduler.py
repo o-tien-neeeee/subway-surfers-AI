@@ -56,17 +56,35 @@ class ActionScheduler:
         self._last_executed: Optional[int] = None
         self._last_executed_ts = -1e9
         self._action_step = 0
+        self._last_load: float = 0.0
+        self._last_confidence: Optional[float] = None
 
     # ------------------------------------------------------------------ #
     # Load adaptation
     # ------------------------------------------------------------------ #
     def set_load(self, load01: float) -> None:
-        """Pick cadence from CPU load (0=idle, 1=saturated)."""
+        """Pick cadence from CPU load only (backward-compatible shim)."""
+        self.set_signal(load01, None)
+
+    def set_signal(self, load01: float, horizon_confidence: Optional[float]) -> None:
+        """Pick cadence from CPU load AND horizon confidence (requirement §9).
+
+        * high load  -> slow bound (protect the FPS budget),
+        * UNLESS the horizon detector is highly confident (a hazard is
+          brewing) -> fast bound anyway: safety outranks CPU thrift,
+        * low load   -> fast bound.
+        """
         lo, hi = self.cfg.min_decision_frames, self.cfg.max_decision_frames
-        if load01 >= self.cfg.slow_load_threshold:
+        if (horizon_confidence is not None
+                and horizon_confidence >= self.cfg.fast_confidence):
+            self._current_cadence = lo
+        elif load01 >= self.cfg.slow_load_threshold:
             self._current_cadence = hi
         else:
             self._current_cadence = lo
+        self._last_load = float(load01)
+        self._last_confidence = (None if horizon_confidence is None
+                                 else float(horizon_confidence))
 
     @property
     def cadence(self) -> int:
@@ -158,4 +176,7 @@ class ActionScheduler:
             "interrupts": s.interrupts,
             "cadence": self._current_cadence,
             "action_step": self._action_step,
+            "load": round(self._last_load, 3),
+            "confidence": (None if self._last_confidence is None
+                           else round(self._last_confidence, 3)),
         }

@@ -41,9 +41,17 @@
     "template_match_threshold": 0.8,
     "anchor_fx": -1.0,
     "anchor_fy": -1.0,
-    "anchor_baseline_rgb": [-1, -1, -1],
+    "anchor_baseline_rgb": [
+      -1,
+      -1,
+      -1
+    ],
     "anchor_baseline_std": -1.0,
-    "dead_sample_rgb": [-1, -1, -1]
+    "dead_sample_rgb": [
+      -1,
+      -1,
+      -1
+    ]
   },
   "region": {
     "left": 0,
@@ -59,7 +67,13 @@
     "dpi_scale": 1.0
   },
   "input": {
-    "keymap": { "0": "", "1": "left", "2": "right", "3": "up", "4": "down" },
+    "keymap": {
+      "0": "",
+      "1": "left",
+      "2": "right",
+      "3": "up",
+      "4": "down"
+    },
     "hold_ms": 60,
     "cooldown_ms": 110,
     "action_ttl_ms": 140,
@@ -74,7 +88,8 @@
     "max_decision_frames": 4,
     "danger_decision_frames": 1,
     "buffer_size": 1,
-    "slow_load_threshold": 0.75
+    "slow_load_threshold": 0.75,
+    "fast_confidence": 0.75
   },
   "reward": {
     "alive_per_frame": 0.02,
@@ -102,7 +117,7 @@
     "batch_size": 32,
     "learning_rate": 0.0001,
     "lr_schedule": "constant",
-    "lr_min": 0.00001,
+    "lr_min": 1e-05,
     "cosine_period_updates": 200000,
     "target_update_every": 1000,
     "grad_clip_norm": 10.0,
@@ -113,7 +128,9 @@
     "epsilon_end": 0.05,
     "epsilon_decay_frames": 150000,
     "checkpoint_every_updates": 500,
-    "torch_threads": 1
+    "torch_threads": 1,
+    "best_metric": "survival_s",
+    "best_metric_window": 3
   },
   "bc": {
     "epochs": 8,

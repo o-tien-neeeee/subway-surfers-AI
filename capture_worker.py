@@ -41,6 +41,35 @@ def _mss_grab_factory(monitor: dict[str, int]):
     return grab
 
 
+def virtual_screen_geometry() -> Optional[tuple[int, int]]:
+    """(width, height) of the virtual screen, or None when unavailable."""
+    try:
+        import mss
+
+        with mss.mss() as sct:
+            mon0 = sct.monitors[0]
+            return int(mon0["width"]), int(mon0["height"])
+    except Exception:  # no display / mss trouble: caller must tolerate None
+        return None
+
+
+def geometry_matches(region: Any, actual_w: Optional[int],
+                     actual_h: Optional[int]) -> Optional[bool]:
+    """Compare the current virtual screen against the calibrated one.
+
+    Returns True (same), False (changed — recalibration advised), or None
+    (cannot verify: no stored reference or no display).  Pure function so it
+    is unit-testable without a display.
+    """
+    if actual_w is None or actual_h is None:
+        return None
+    ref_w = int(getattr(region, "screen_width", 0) or 0)
+    ref_h = int(getattr(region, "screen_height", 0) or 0)
+    if ref_w <= 0 or ref_h <= 0:
+        return None
+    return actual_w == ref_w and actual_h == ref_h
+
+
 def _fake_grab_factory(cfg: BotConfig, action_q: Any):
     from environment import SyntheticGame
 
@@ -113,6 +142,12 @@ def capture_main(
     failures = 0
     last_report = time.monotonic()
     report_interval = max(1.0, cfg.perf.report_interval_s)
+    # geometry-drift detection (window move / resolution / DPI change):
+    # compare the virtual screen against the calibrated reference every 5 s
+    # and warn exactly once per change so the user can re-calibrate.
+    geometry_check_interval = 5.0
+    next_geometry_check = time.monotonic() + geometry_check_interval
+    last_geometry_state: Optional[bool] = None
     LOGGER.info("capture start: %s %dx%d+%d+%d @ %dfps", source,
                 cfg.region.width, cfg.region.height, cfg.region.left,
                 cfg.region.top, cfg.capture.target_fps)
@@ -167,6 +202,27 @@ def capture_main(
                 window_written = 0
                 window_start = now
                 last_report = now
+            if source != "fake" and now >= next_geometry_check:
+                next_geometry_check = now + geometry_check_interval
+                geo = virtual_screen_geometry()
+                state = geometry_matches(cfg.region, geo[0] if geo else None,
+                                         geo[1] if geo else None)
+                if state is not None and state != last_geometry_state:
+                    last_geometry_state = state
+                    if state is False:
+                        put_bounded(metrics_q, {
+                            "type": "log", "level": "warning", "src": "capture",
+                            "msg": (f"screen geometry changed: calibrated "
+                                    f"{cfg.region.screen_width}x"
+                                    f"{cfg.region.screen_height}, now "
+                                    f"{geo[0]}x{geo[1]} — re-run calibration "
+                                    f"(Step 1) or the region may be wrong"),
+                        })
+                    else:
+                        put_bounded(metrics_q, {
+                            "type": "log", "level": "info", "src": "capture",
+                            "msg": "screen geometry matches calibration again",
+                        })
     except Exception as exc:
         put_bounded(metrics_q, {"type": "error", "src": "capture",
                                 "error": f"{type(exc).__name__}: {exc}",
