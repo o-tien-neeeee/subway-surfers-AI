@@ -1,0 +1,16 @@
+# Core (all CPU-only; no CUDA required anywhere)
+torch>=2.0
+numpy>=1.24
+opencv-python>=4.8          # servers/CI may substitute opencv-python-headless
+pillow>=10.0
+mss>=9.0                    # screen capture
+
+# Input automation (Windows Chrome)
+pyautogui>=0.9.54           # mouse clicks (FAILSAFE enabled); lazy-imported
+pygetwindow>=0.0.9          # pyautogui focus helper
+pynput>=1.7.6               # keyboard press/release + global hotkeys; lazy-imported
+six>=1.16                   # pynput dependency (pinned for headless Linux CI)
+
+# Monitoring + testing
+psutil>=5.9
+pytest>=7.0

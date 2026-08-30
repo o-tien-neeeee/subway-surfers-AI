@@ -1,0 +1,13 @@
+# Runtime artifacts (never commit learned state or logs)
+checkpoints/
+demos/
+logs/
+runs/
+__pycache__/
+*.pyc
+.pytest_cache/
+config.json
+*.corrupt
+*.tmp
+.venv/
+venv/
