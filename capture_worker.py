@@ -140,6 +140,15 @@ def capture_main(
     window_written = 0
     window_start = time.monotonic()
     failures = 0
+    # DEEP-FIX: cfg.capture.grab_timeout_s was declared, documented as the
+    # budget for a single grab, and read by nothing in the repository.  It is
+    # now measured: a grab that overruns is counted and reported, and a
+    # sustained overrun is escalated as an error (mss grabs are blocking, so
+    # the honest response is to detect and report, not to pretend we can
+    # cancel them mid-call).
+    slow_grabs = 0
+    slow_grab_window = 0
+    slow_grab_warned = False
     last_report = time.monotonic()
     report_interval = max(1.0, cfg.perf.report_interval_s)
     # geometry-drift detection (window move / resolution / DPI change):
@@ -172,6 +181,20 @@ def capture_main(
                 next_t = time.monotonic()
                 continue
             failures = 0
+            grab_ms = (time.monotonic() - t0) * 1000.0
+            if grab_ms > cfg.capture.grab_timeout_s * 1000.0:
+                slow_grabs += 1
+                slow_grab_window += 1
+                if not slow_grab_warned and slow_grab_window >= 30:
+                    slow_grab_warned = True
+                    put_bounded(metrics_q, {
+                        "type": "log", "level": "warning", "src": "capture",
+                        "msg": (f"{slow_grab_window} screen grabs exceeded "
+                                f"capture.grab_timeout_s="
+                                f"{cfg.capture.grab_timeout_s:.2f}s "
+                                f"(last {grab_ms:.0f} ms) — the effective FPS "
+                                f"will fall below the target"),
+                    })
             ts = time.monotonic()
             if image is not None and ring.write(image, frame_id, ts):
                 written_total += 1
@@ -196,10 +219,13 @@ def capture_main(
                         "written": written_total,
                         "frame_id": frame_id,
                         "failures": failures,
-                        "last_grab_ms": (time.monotonic() - t0) * 1000.0,
+                        "last_grab_ms": grab_ms,
+                        "slow_grabs": slow_grabs,
+                        "slow_grabs_window": slow_grab_window,
                     },
                 })
                 window_written = 0
+                slow_grab_window = 0
                 window_start = now
                 last_report = now
             if source != "fake" and now >= next_geometry_check:

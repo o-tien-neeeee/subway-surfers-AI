@@ -26,16 +26,12 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import ctypes as ct
-import struct
-import time
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 CTX = mp.get_context("spawn")
-
-UINT64_MAX = 2 ** 64 - 1
 
 
 @dataclass(frozen=True)
@@ -134,6 +130,28 @@ class SharedFrameRing:
         return self.slots * h * w * c
 
 
+#: Bytes reserved for the published weight-layout fingerprint.
+_FINGERPRINT_BYTES = 64
+
+
+def layout_fingerprint(module) -> str:
+    """Stable identity of a module's parameter *layout* (shapes, in order).
+
+    # DEEP-FIX: the flat weight vector carries no schema.  Before this, the
+    # actor blindly consumed the first ``sum(p.numel())`` floats of whatever
+    # the learner published, so an actor running profile A against a learner
+    # running profile B silently loaded a meaningless prefix of B's vector
+    # (verified: quality_cpu -> strict_lite overwrote a (4,1,3,3) conv with
+    # the leading bytes of a (48,4,8,8) conv, with no error anywhere).  The
+    # fingerprint makes that mismatch detectable instead of silent.
+    """
+    import hashlib
+
+    desc = "|".join(",".join(str(int(d)) for d in tuple(p.shape))
+                    for p in module.parameters())
+    return hashlib.sha256(desc.encode("ascii")).hexdigest()[:32]
+
+
 class SharedWeights:
     """Flat float32 parameter vector in shared memory for actor/learner sync.
 
@@ -143,43 +161,77 @@ class SharedWeights:
     both sides); a torn read is impossible because the actor copies either
     the old or the new version consistently — we verify the version again
     after copying and retry on a mid-copy publish.
+
+    A layout fingerprint travels with the vector so a reader whose module
+    shape does not match the published layout refuses the copy instead of
+    silently mis-aligning every tensor (see :func:`layout_fingerprint`).
     """
 
-    def __init__(self, size: int) -> None:
+    def __init__(self, size: int, max_retries: int = 64) -> None:
         if size <= 0:
             raise ValueError("SharedWeights size must be positive")
         self.size = size
+        self.max_retries = max_retries
         self._arr = CTX.Array(ct.c_float, size)
         self._version = CTX.Value(ct.c_uint64, 0)
+        # DEEP-FIX: layout identity of the last successful publish ("" = none).
+        self._layout = CTX.Array(ct.c_char, _FINGERPRINT_BYTES)
+        self._torn_reads = CTX.Value(ct.c_uint64, 0)
 
-    def publish(self, flat: np.ndarray) -> None:
-        """Write a flat parameter vector (may be shorter than the buffer —
-        the buffer is sized for the largest profile and each profile uses a
-        prefix; ``unflatten_into`` consumes exactly as many floats as the
-        module has parameters)."""
+    def publish(self, flat: np.ndarray, fingerprint: str = "") -> None:
+        """Write a flat parameter vector plus its layout fingerprint.
+
+        The buffer is sized for the largest profile, so a smaller profile
+        legitimately publishes a prefix; the tail is zeroed and the
+        fingerprint records exactly which layout the prefix represents.
+        """
         vec = flat.astype(np.float32).reshape(-1)
         if vec.size > self.size:
             raise ValueError(
                 f"weights size {vec.size} exceeds shared buffer {self.size}"
             )
+        if not np.all(np.isfinite(vec)):
+            # DEEP-FIX: a NaN/inf blow-up in the learner used to be published
+            # straight into the actor, which then pressed keys forever with a
+            # poisoned policy.  Refuse to publish non-finite weights.
+            raise ValueError("refusing to publish non-finite weights")
         arr = np.frombuffer(self._arr.get_obj(), dtype=np.float32)
         arr[: vec.size] = vec
         if vec.size < self.size:
             arr[vec.size :] = 0.0
+        # DEEP-FIX: write the layout BEFORE the version bump so a reader that
+        # observes the new version always observes the matching fingerprint.
+        raw = str(fingerprint).encode("ascii")[: _FINGERPRINT_BYTES - 1]
+        self._layout.value = raw + b"\x00" * (_FINGERPRINT_BYTES - len(raw))
         self._version.value += 1
+
+    def fingerprint(self) -> str:
+        raw = bytes(self._layout.raw)
+        return raw.split(b"\x00", 1)[0].decode("ascii", errors="replace")
 
     def version(self) -> int:
         return int(self._version.value)
 
-    def copy_out(self) -> np.ndarray:
-        """Return a private copy of the current weights."""
-        for _ in range(8):
+    def torn_reads(self) -> int:
+        return int(self._torn_reads.value)
+
+    def copy_out(self) -> Optional[np.ndarray]:
+        """Return a private copy of the current weights (None if contended).
+
+        # DEEP-FIX: the old implementation returned a *possibly torn* copy
+        # after 8 failed attempts with a comment telling the caller to log
+        # it — and no caller did.  Returning None makes contention explicit
+        # and lets the actor keep its last known-good weights.
+        """
+        for _ in range(self.max_retries):
             v0 = self._version.value
             arr = np.frombuffer(self._arr.get_obj(), dtype=np.float32)
             out = arr.copy()
             if self._version.value == v0:
                 return out
-        return out  # extremely contended; accept possibly-torn copy (log caller)
+        with self._torn_reads.get_lock():
+            self._torn_reads.value += 1
+        return None
 
 
 def flatten_state_dict(state_dict: dict) -> np.ndarray:
@@ -188,23 +240,37 @@ def flatten_state_dict(state_dict: dict) -> np.ndarray:
     return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
 
-def unflatten_into(module, flat: np.ndarray) -> None:
-    """Write a flat vector back into ``module``'s parameters (in-place)."""
+def module_param_count(module) -> int:
+    return int(sum(p.numel() for p in module.parameters()))
+
+
+def unflatten_into(module, flat: np.ndarray) -> int:
+    """Write a flat vector back into ``module``'s parameters (in-place).
+
+    # DEEP-FIX: this used to consume a blind prefix of ``flat`` with no
+    # validation, which is exactly how a profile mismatch between the actor
+    # and the learner turned into silent garbage weights.  The length is now
+    # checked against the module's own parameter count.
+    """
     import torch
 
+    if flat is None:
+        raise ValueError("no weight vector to unflatten")
+    vec = np.asarray(flat).reshape(-1)
+    need = module_param_count(module)
+    if vec.size < need:
+        raise ValueError(
+            f"weight vector too short for this module: have {vec.size}, "
+            f"need {need} (profile mismatch?)"
+        )
     offset = 0
     with torch.no_grad():
         for p in module.parameters():
             n = p.numel()
-            chunk = flat[offset : offset + n].reshape(p.shape)
-            p.copy_(torch.from_numpy(chunk.astype(np.float32)))
+            chunk = vec[offset : offset + n].reshape(p.shape)
+            p.copy_(torch.from_numpy(np.ascontiguousarray(chunk, dtype=np.float32)))
             offset += n
-
-
-def torch_no_grad():
-    import torch
-
-    return torch.no_grad()
+    return offset
 
 
 class SharedCounters:
@@ -242,6 +308,49 @@ class SharedCounters:
         raw = bytes(self.profile.raw)
         return raw.split(b"\x00", 1)[0].decode("ascii", errors="replace")
 
+    # -- best-model telemetry (single writer: the actor) ---------------- #
+    def publish_episode_result(self, episode_id: int, survival_s: float,
+                               total_reward: float) -> None:
+        """Publish one finished episode as a three-phase seqlock write.
+
+        # DEEP-FIX: the fields used to be written id-FIRST.  The learner also
+        # read the id first, so it could observe a new id and then read the
+        # *previous* episode's survival/reward — three independent shared
+        # values are not an atomic record.
+        #
+        # Writing the payload first and the id last is NOT enough on its own:
+        # a reader that sampled the id *before* this publish, then read the
+        # new payload, would re-check the id and still find the old one, so
+        # its "consistency" check passed on a torn pair (reproduced: id=2217
+        # paired with survival=2218.0).  A real seqlock invalidates *before*
+        # touching the payload, so any reader whose window overlaps the write
+        # sees the invalid marker on one of its two id reads and backs off.
+        """
+        # 1. invalidate -- 0 is the "no episode / in progress" marker that
+        #    read_episode_result() already treats as "nothing to report".
+        self.last_episode_done_id.value = 0
+        # 2. payload
+        self.last_episode_survival_s.value = float(survival_s)
+        self.last_episode_reward.value = float(total_reward)
+        # 3. commit -- publishing the id last makes the record visible.
+        self.last_episode_done_id.value = int(episode_id)
+
+    def read_episode_result(self, last_seen_id: int) -> Optional[dict[str, float]]:
+        """Read the newest episode newer than ``last_seen_id`` (None if none).
+
+        Returns ``{"episode_id", "survival_s", "total_reward"}`` only when the
+        id is stable across the payload read (seqlock-style consistency).
+        """
+        done_id = int(self.last_episode_done_id.value)
+        if done_id <= 0 or done_id == last_seen_id:
+            return None
+        survival = float(self.last_episode_survival_s.value)
+        reward = float(self.last_episode_reward.value)
+        if int(self.last_episode_done_id.value) != done_id:
+            return None  # writer moved on mid-read; the next poll catches it
+        return {"episode_id": done_id, "survival_s": survival,
+                "total_reward": reward}
+
     def snapshot(self) -> dict[str, float]:
         return {
             "env_frame_id": int(self.env_frame_id.value),
@@ -276,16 +385,3 @@ def make_events() -> dict:
         "pause_learning": CTX.Event(),  # pause learner only (death/respawn)
         "death": CTX.Event(),         # death confirmed by actor
     }
-
-
-def pack_frame_header(frame_id: int, ts: float) -> bytes:
-    return struct.pack("<Qd", frame_id & UINT64_MAX, ts)
-
-
-def unpack_frame_header(blob: bytes) -> tuple[int, float]:
-    fid, ts = struct.unpack("<Qd", blob[:16])
-    return int(fid), float(ts)
-
-
-def monotonic() -> float:
-    return time.monotonic()

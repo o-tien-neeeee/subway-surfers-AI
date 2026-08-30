@@ -11,7 +11,7 @@ Target machine: Windows 64-bit, i5-7200U (2C/4T), 12 GB RAM, Intel HD 620,
 Chrome.
 
 > **Honesty first.** Everything in this repo runs and is unit-tested headless
-> (403 tests, see §Testing). The bot has **not yet been run against the real
+> (449 tests, see §Testing). The bot has **not yet been run against the real
 > Poki game** — no real-game benchmark numbers exist yet, so every real-game
 > metric is labelled *not yet measured*. Nothing here is claimed to be
 > "superhuman", "frame-perfect", or "production-ready"; those labels require
@@ -23,7 +23,7 @@ Chrome.
 
 Continuing from the first complete build, this round closes the remaining
 specification gaps and hardens four subsystems — all verified by new tests
-(340 → 403):
+(340 → 403 → 449 after the deep-fix pass):
 
 1. **Online best-model gating (§12).** `best_model.pth` used to be written
    only by behaviour cloning. Now the actor reports every finished episode
@@ -168,7 +168,7 @@ subway-surfers-AI/
 ├── evaluation.py             # honest eval protocol + reports
 ├── evaluation_tool.py        # headless evaluation runner
 ├── requirements.txt · config.example.json · pytest.ini
-└── tests/                    # 15 test files, 403 tests
+└── tests/                    # 16 test files, 449 tests
 ```
 
 ---
@@ -216,7 +216,7 @@ py -3.11 -m venv .venv
 pip install -r requirements.txt
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU-only wheel
 python -m compileall .          # must exit clean
-python -m pytest -q             # 403 passed (headless, no display needed)
+python -m pytest -q             # 449 passed (headless, no display needed)
 python profiling.py             # re-measure on THIS machine
 python app.py                   # GUI
 ```
@@ -265,7 +265,7 @@ dry-run input, same three-process pipeline).
 
 ```bash
 python -m compileall .     # clean compile of every file
-python -m pytest -q        # 403 tests
+python -m pytest -q        # 449 tests
 python app.py --headless --steps 600       # end-to-end smoke (fake game)
 python app.py --evaluate 5                 # headless eval + honest report
 ```
@@ -369,7 +369,7 @@ python app.py --evaluate 20         # per-episode stats + system profile
       worker crashes, no stuck keys on any shutdown path
 - [x] No bare excepts / `except Exception: pass` / TODO stubs / network
       calls (AST-enforced tests)
-- [x] 403 automated tests green; `compileall` clean
+- [x] 449 automated tests green; `compileall` clean
 
 **Requires the real Poki game on the target machine (pending)**
 

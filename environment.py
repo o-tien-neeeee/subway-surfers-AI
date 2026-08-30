@@ -291,6 +291,19 @@ class GameEnvironment:
     def respawn(self) -> None:
         self.game.respawn()
         self.detector.reset()
+        # DEEP-FIX: this only reset the game and the death detector.  The
+        # reward calculator kept _episode_dead=True, so the -10 death penalty
+        # was applied on the FIRST death of the process and never again
+        # (verified: death #1 -> -10.0, death #2 -> 0.0).  Every later
+        # episode in a headless training/eval run was therefore trained
+        # without a death signal.  The n-step window and the frame stack are
+        # episode-scoped too and must not leak across the boundary.
+        self.episode += 1
+        self.steps = 0
+        self.reward_calc.begin_episode(self._t)
+        self.nstep.clear()
+        self._env_ids.clear()
+        self._last_action = NOOP
 
 
 # --------------------------------------------------------------------- #
@@ -335,6 +348,7 @@ class BotActor:
         input_backend: str = "auto",
         action_out_q: Any = None,
         seed: int = 0,
+        cmd_q: Any = None,
     ) -> None:
         self.cfg = cfg
         self.ring = ring
@@ -344,6 +358,9 @@ class BotActor:
         self.shared_weights = shared_weights
         self.counters = counters
         self.action_out_q = action_out_q  # fake-game action channel (headless)
+        # DEEP-FIX: the learner's command queue.  Without it the actor had no
+        # way to tell the learner anything (see _downgrade).
+        self.cmd_q = cmd_q
 
         anchor_xy = None
         if cfg.death.anchor_set():
@@ -388,7 +405,11 @@ class BotActor:
         self._duplicate_frames = 0
         self._env_ids: deque[int] = deque(maxlen=cfg.perception.frame_stack)
         self._episode_reward = 0.0
-        self._episode_start_ts = 0.0
+        # DEEP-FIX: this was a float sentinel (0.0) meaning "no episode in
+        # progress", so a legitimate frame timestamp of exactly 0.0 would
+        # make the actor believe no episode had started and _end_episode()
+        # would return without publishing anything.  None cannot collide.
+        self._episode_start_ts: Optional[float] = None
         self._episode_frames = 0
         self._last_load_check = time.monotonic()
         self._perf_violation_since: Optional[float] = None
@@ -483,7 +504,7 @@ class BotActor:
             return
 
         # fresh episode: seed the stack with this frame (no stale pixels)
-        if self._episode_start_ts == 0.0:
+        if self._episode_start_ts is None:
             self.stack.reset(z.ground_gray)
             self._env_ids = deque([z.frame_id] * self.cfg.perception.frame_stack,
                                   maxlen=self.cfg.perception.frame_stack)
@@ -541,9 +562,21 @@ class BotActor:
         if not self.input.focus_gate():
             self.scheduler.interrupt()
             return
-        t0 = time.perf_counter()
+        # DEEP-FIX: t0 was time.perf_counter() while t_frame is a
+        # time.monotonic() timestamp written by the CAPTURE process, and the
+        # two were subtracted from each other.  On Linux both clocks share an
+        # origin so it happened to work; on Windows (the target platform)
+        # perf_counter is QueryPerformanceCounter and monotonic is
+        # GetTickCount64, so `t0 - t_frame` is an arbitrary offset -- feeding
+        # a p95 that then drives the automatic profile downgrader.  Worse,
+        # LatencyMeter.observe_ms() silently discards negative samples, so a
+        # negative offset did not just bias the number, it deleted most of
+        # the distribution.  One clock, and the queueing term is clamped.
+        t0 = time.monotonic()
         ev = self.input.press_action(planned.action, created_ts=planned.created_ts)
-        self.action_ms.observe_ms((time.perf_counter() - t0) * 1000.0 + 1000.0 * (t0 - t_frame))
+        press_ms = (time.monotonic() - t0) * 1000.0
+        queue_ms = max(0.0, (t0 - t_frame) * 1000.0)
+        self.action_ms.observe_ms(press_ms + queue_ms)
         if ev.pressed or planned.action == NOOP:
             self._last_action = planned.action
             if self.action_out_q is not None:
@@ -556,11 +589,32 @@ class BotActor:
             put_bounded(self.transition_q, tr)
 
     def _flush_transitions(self, final: bool) -> None:
-        # emit anything still pending in the n-step window as terminal steps
+        """Flush the n-step window on shutdown.
+
+        # DEEP-FIX: two problems here.  (a) ``self.stack.get()`` raises
+        RuntimeError when the stack was never seeded (a shutdown before the
+        # first valid frame), which turned a clean exit into an actor crash
+        # report.  (b) An empty ``_env_ids`` produced a 0-length env-id tuple
+        # for a 4-frame stack, which the replay buffer only rejected later,
+        # at sample time.
+        """
+        if not self.nstep.pending:
+            return
+        if len(self._env_ids) < self.cfg.perception.frame_stack:
+            LOGGER.warning(
+                "discarding %d pending n-step step(s): the observation stack "
+                "was never seeded (shutdown before the first valid frame)",
+                self.nstep.pending)
+            self.nstep.clear()
+            return
+        try:
+            obs = self.stack.get()
+        except RuntimeError as exc:
+            LOGGER.warning("cannot flush transitions (%s)", exc)
+            self.nstep.clear()
+            return
         while self.nstep.pending:
-            leftover = self.nstep.push(self.stack.get(), tuple(self._env_ids),
-                                       NOOP, 0.0, True)
-            for tr in leftover:
+            for tr in self.nstep.push(obs, tuple(self._env_ids), NOOP, 0.0, True):
                 put_bounded(self.transition_q, tr)
 
     # ------------------------------------------------------------------ #
@@ -577,9 +631,13 @@ class BotActor:
         self._episode_stats_frames0 = self.counters.env_frame_id.value
 
     def _end_episode(self, reason: str) -> None:
-        if self._episode_start_ts == 0.0:
+        if self._episode_start_ts is None:
             return
-        survival = time.monotonic() - self._episode_start_ts
+        # _episode_start_ts is a capture-process time.monotonic() value; the
+        # monotonic clock is system-wide on both Linux and Windows so the
+        # subtraction is meaningful across processes, but it is clamped so a
+        # clock adjustment cannot publish a negative survival time.
+        survival = max(0.0, time.monotonic() - self._episode_start_ts)
         stats = ActorEpisodeStats(
             episode_id=int(self.counters.episode_id.value),
             survival_s=survival,
@@ -595,11 +653,18 @@ class BotActor:
                            "data": stats.to_dict()})
         LOGGER.info("episode %d ended (%s): %.1fs reward=%.2f",
                     stats.episode_id, reason, stats.survival_s, stats.total_reward)
-        # publish for the learner's online best-model gate (single writer: actor)
-        self.counters.last_episode_done_id.value = stats.episode_id
-        self.counters.last_episode_survival_s.value = float(stats.survival_s)
-        self.counters.last_episode_reward.value = float(stats.total_reward)
-        self._episode_start_ts = 0.0
+        # Publish for the learner's online best-model gate (single writer:
+        # actor).  DEEP-FIX: go through the ordered helper -- payload first,
+        # id last -- instead of writing the id first and letting the learner
+        # pair a new id with the previous episode's numbers.
+        if hasattr(self.counters, "publish_episode_result"):
+            self.counters.publish_episode_result(
+                stats.episode_id, stats.survival_s, stats.total_reward)
+        else:  # pragma: no cover - test doubles without the helper
+            self.counters.last_episode_survival_s.value = float(stats.survival_s)
+            self.counters.last_episode_reward.value = float(stats.total_reward)
+            self.counters.last_episode_done_id.value = stats.episode_id
+        self._episode_start_ts = None
         self._action_step_at_episode_start = self.scheduler.action_step
 
     # ------------------------------------------------------------------ #
@@ -695,8 +760,28 @@ class BotActor:
             import psutil
 
             return min(1.0, psutil.cpu_percent(interval=None) / 100.0)
-        except Exception:
+        except Exception as exc:
+            # DEEP-FIX: this swallowed the reason entirely.  Returning a
+            # neutral 0.5 is still the right fallback, but the first failure
+            # is logged so a missing/broken psutil is visible instead of
+            # silently pinning the cadence to the middle of its range.
+            if not self._psutil_warned:
+                self._psutil_warned = True
+                LOGGER.warning("psutil unavailable (%s: %s); cadence will use "
+                               "a neutral 0.5 load estimate",
+                               type(exc).__name__, exc)
             return 0.5
+
+    _psutil_warned: bool = False
+    _ram_violation_since: Optional[float] = None
+
+    def _working_set_gb(self) -> float:
+        try:
+            import psutil
+
+            return psutil.Process().memory_info().rss / (1024 ** 3)
+        except Exception:
+            return 0.0
 
     def _maybe_perf_check(self) -> None:
         now = time.monotonic()
@@ -716,6 +801,32 @@ class BotActor:
         else:
             self._perf_violation_since = None
 
+        # DEEP-FIX: cfg.perf.max_working_set_gb was declared and documented
+        # ("keep total usage < 4 GB") but read by nothing.  The bot process's
+        # own working set is now checked against it, and a sustained overrun
+        # is reported once so the operator sees the memory pressure before
+        # Windows starts paging and the capture FPS collapses.
+        limit_gb = float(self.cfg.perf.max_working_set_gb)
+        if limit_gb > 0:
+            rss_gb = self._working_set_gb()
+            if rss_gb > limit_gb:
+                if self._ram_violation_since is None:
+                    self._ram_violation_since = now
+                elif (now - self._ram_violation_since
+                      >= self.cfg.perf.downgrade_window_s
+                      and not self._ram_warned):
+                    self._ram_warned = True
+                    self._put_log(
+                        "warning",
+                        f"WORKING SET {rss_gb:.2f} GB exceeds "
+                        f"perf.max_working_set_gb={limit_gb:.2f} GB — reduce "
+                        f"per.capacity or the capture region size")
+            else:
+                self._ram_violation_since = None
+                self._ram_warned = False
+
+    _ram_warned: bool = False
+
     def _downgrade(self, p95: float, fps: float) -> None:
         lighter = self.cfg.profile_downgrade()
         if lighter is None:
@@ -734,7 +845,20 @@ class BotActor:
         model = DuelingDQN.from_profile(lighter, self.cfg.perception.frame_stack,
                                         self.cfg.perception.ground_size)
         self.policy = InferencePolicy(model, seed=self.cfg.seed)
-        put_bounded(self.transition_q, {"__cmd__": "set_profile", "profile": lighter})
+        # DEEP-FIX: this notice used to go ONLY to transition_q, which the
+        # learner never inspects for commands -- Learner.add_transitions()
+        # drops anything that is not an NStepTransition, and the whole repo
+        # contained exactly one reference to "__cmd__" (this line).  The
+        # learner therefore kept training the heavy profile while the actor
+        # ran the light one, and because unflatten_into() consumed a blind
+        # prefix of the flat vector the actor silently loaded garbage weights
+        # (verified: a (4,1,3,3) conv overwritten from a (48,4,8,8) conv).
+        # The command now goes to the learner's real command queue, and the
+        # actor refuses mismatched weight vectors until the switch lands.
+        notice = {"__cmd__": "set_profile", "profile": lighter}
+        if self.cmd_q is not None:
+            put_bounded(self.cmd_q, {"cmd": "set_profile", "profile": lighter})
+        put_bounded(self.transition_q, notice)  # redundant path; idempotent
         self._perf_violation_since = time.monotonic()
 
     # ------------------------------------------------------------------ #
@@ -754,8 +878,8 @@ class BotActor:
                 "scheduler": self.scheduler.snapshot(),
                 "epsilon": float(self.counters.epsilon.value),
                 "episode_reward": self._episode_reward,
-                "survival_s": (now - self._episode_start_ts)
-                if self._episode_start_ts else 0.0,
+                "survival_s": (max(0.0, now - self._episode_start_ts)
+                               if self._episode_start_ts is not None else 0.0),
                 "profile": self._profile,
                 "held_keys": self.input.pressed_names(),
                 "horizon": {"score": self.horizon._ewma,

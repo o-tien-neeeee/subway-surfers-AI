@@ -38,7 +38,14 @@ from ipc import (
     bounded_queue,
     make_events,
 )
-from logging_utils import drain, format_exception, get_logger, setup_logging
+from logging_utils import (
+    close_queue_safely,
+    drain,
+    format_exception,
+    get_logger,
+    quarantine_queue,
+    setup_logging,
+)
 from models import PROFILES, weight_size_for_profile
 
 LOGGER = get_logger("app")
@@ -110,7 +117,7 @@ class BotApplication:
             args=(self.cfg, self.ring, self.events, self.transition_q,
                   self.metrics_q, self.shared_weights, self.counters,
                   self.input_backend, self.action_q, self.cfg.seed,
-                  str(self.cfg.paths.logs_dir)),
+                  str(self.cfg.paths.logs_dir), self.cmd_q),
         )
         self.actor_proc.start()
         if with_learner:
@@ -135,7 +142,8 @@ class BotApplication:
 
     @staticmethod
     def _actor_entry(cfg, ring, events, transition_q, metrics_q, shared_weights,
-                     counters, input_backend, action_q, seed, log_dir) -> None:
+                     counters, input_backend, action_q, seed, log_dir,
+                     cmd_q=None) -> None:
         from environment import BotActor
         from safety_watchdog import SafetyWatchdog
 
@@ -144,7 +152,8 @@ class BotApplication:
 
         set_cpu_threads(1)
         actor = BotActor(cfg, ring, events, transition_q, metrics_q,
-                         shared_weights, counters, input_backend, action_q, seed)
+                         shared_weights, counters, input_backend, action_q, seed,
+                         cmd_q=cmd_q)
         # Independent safety layer inside the actor process: emergency stop,
         # focus loss, capture stalls and stuck keys — all with authority over
         # the learner's pause event.
@@ -194,7 +203,9 @@ class BotApplication:
         }
 
     def drain_metrics(self, limit: int = 256) -> list[dict]:
-        return drain(self.metrics_q, limit)
+        # DEEP-FIX: timeout-guarded.  This runs on the Tk polling path, so a
+        # queue poisoned by a killed worker used to freeze the whole GUI.
+        return drain(self.metrics_q, limit, timeout_s=1.0)
 
     # ------------------------------------------------------------------ #
     def shutdown(self, timeout_s: float = 12.0) -> None:
@@ -220,14 +231,38 @@ class BotApplication:
                 LOGGER.error("%s did not exit in time; terminating", name)
                 proc.terminate()
                 proc.join(timeout=2.0)
+                # DEEP-FIX: a terminated worker may have left a half-written
+                # message in a queue it could write to.  Quarantine exactly
+                # those queues before the final drain, or the drain blocks
+                # forever inside Connection._recv().  Quarantining all four
+                # unconditionally would also throw away healthy channels
+                # (e.g. killing the capture worker does not corrupt the
+                # transition queue, which only the actor writes).
+                for q in self._queues_written_by(name):
+                    quarantine_queue(q, f"{name} worker was terminated")
         # final drain so buffered metrics/logs are not lost
         self._drain_all_queues()
+        for q in (self.metrics_q, self.transition_q, self.cmd_q, self.action_q):
+            close_queue_safely(q)
         self._started = False
         LOGGER.info("shutdown complete")
 
+    def _queues_written_by(self, worker: str) -> list:
+        """Queues a given worker can put() into (see start() wiring)."""
+        writers = {
+            "capture": [self.metrics_q],
+            "actor": [self.metrics_q, self.transition_q, self.action_q,
+                      self.cmd_q],
+            "learner": [self.metrics_q],
+        }
+        return writers.get(worker, [self.metrics_q, self.transition_q,
+                                    self.action_q, self.cmd_q])
+
     def _drain_all_queues(self) -> None:
+        # DEEP-FIX: timeout-guarded, and any queue that cannot be read is
+        # quarantined so the next pass skips it instead of blocking again.
         for q in (self.metrics_q, self.transition_q, self.cmd_q, self.action_q):
-            drain(q, limit=256)
+            drain(q, limit=256, timeout_s=1.0)
 
     # ------------------------------------------------------------------ #
     # Headless run (CI smoke test / profiling)

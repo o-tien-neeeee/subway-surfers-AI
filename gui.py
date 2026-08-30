@@ -784,11 +784,29 @@ class ControlGUI:
     def _tick(self) -> None:
         try:
             self._update_preview()
+            # DEEP-FIX: the demo recorder was constructed with a frame reader
+            # and then never pumped, so every episode saved 0 frames.  The Tk
+            # loop is the only correct place to do it: it is the main thread,
+            # it already runs at a bounded rate, and it never blocks on I/O
+            # longer than a few ring reads.
+            self._pump_demo_recorder()
             self._poll_metrics()
             self._check_workers()
         except Exception as exc:
             self.log(f"gui tick error: {exc}")
         self.root.after(self.POLL_MS, self._tick)
+
+    def _pump_demo_recorder(self) -> None:
+        rec = self._demo_recorder
+        if rec is None or not rec.recording:
+            return
+        try:
+            got = rec.pump(max_frames=4)
+        except Exception as exc:
+            self.log(f"demo pump error: {type(exc).__name__}: {exc}")
+            return
+        if got:
+            self.metric_vars["episode_id"].set(f"demo frames: {rec.frame_count()}")
 
     def _poll_metrics(self) -> None:
         if self.app is None:
@@ -872,8 +890,13 @@ class ControlGUI:
             self._set_state(BotState.PAUSED)
             self.status_var.set("Learner crashed — gameplay paused. Check logs.")
         if not alive["actor"]:
-            self.log("actor process died — stop and restart required")
-            self._set_state(BotState.ERROR)
+            # DEEP-FIX: this branch had no state guard, so after an actor
+            # crash it fired on every 150 ms tick forever (~7 identical log
+            # lines per second, and the status strip was rewritten just as
+            # often).  Report once by moving to ERROR, which is not RUNNING.
+            if self.sm.state is BotState.RUNNING or self.sm.state is BotState.PAUSED:
+                self.log("actor process died — stop and restart required")
+                self._set_state(BotState.ERROR)
             self.status_var.set("Actor crashed — press Stop, then Start again.")
 
     # ------------------------------------------------------------------ #

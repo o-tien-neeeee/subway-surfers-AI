@@ -45,26 +45,54 @@ class KeyboardTap:
         self.on_release = on_release
         self._listener = None
         self.available = False
+        self._keyboard = None
+        self._build_listener()
+
+    def _build_listener(self) -> bool:
+        """Create a fresh pynput listener; False when no input system exists.
+
+        # DEEP-FIX: the listener used to be built once in __init__ and
+        # ``stop()`` set ``self._listener = None``.  ``start()`` then did
+        # nothing for every later episode, so episode 1 recorded the human's
+        # keys and episodes 2..N silently recorded NOOP for every frame --
+        # verified with a stub listener (start() -> no-op, _listener stays
+        # None).  A dataset of all-NOOP demos trains a policy that never
+        # dodges, and nothing downstream reports it.  pynput listeners are
+        # single-use, so a stopped one must be rebuilt.
+        """
+        if self._keyboard is None:
+            try:
+                from pynput import keyboard
+
+                self._keyboard = keyboard
+            except Exception as exc:
+                LOGGER.warning("keyboard listener unavailable: %s (%s) — "
+                               "demos will record NOOP only",
+                               type(exc).__name__, exc)
+                self.available = False
+                return False
+
+        def _press(key):
+            name = self._key_name(key)
+            if name:
+                self.on_press(name)
+
+        def _release(key):
+            name = self._key_name(key)
+            if name:
+                self.on_release(name)
+
         try:
-            from pynput import keyboard
-
-            def _press(key):
-                name = self._key_name(key)
-                if name:
-                    self.on_press(name)
-
-            def _release(key):
-                name = self._key_name(key)
-                if name:
-                    self.on_release(name)
-
-            self._listener = keyboard.Listener(on_press=_press, on_release=_release)
-            self._keyboard = keyboard
+            self._listener = self._keyboard.Listener(
+                on_press=_press, on_release=_release)
             self.available = True
+            return True
         except Exception as exc:
-            LOGGER.warning("keyboard listener unavailable: %s (%s) — "
-                           "demos will record NOOP only",
+            LOGGER.warning("could not create a keyboard listener: %s (%s)",
                            type(exc).__name__, exc)
+            self._listener = None
+            self.available = False
+            return False
 
     @staticmethod
     def _key_name(key) -> Optional[str]:
@@ -74,9 +102,14 @@ class KeyboardTap:
             return str(key.name).lower()
         return None
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        """(Re)create and start the listener; True when keys will be seen."""
+        if self._listener is None:
+            self._build_listener()
         if self._listener is not None:
             self._listener.start()
+            return True
+        return False
 
     def stop(self) -> None:
         """Unregister hooks (requirement: no leftover listeners)."""
@@ -138,6 +171,11 @@ class DemoRecorder:
     def recording(self) -> bool:
         return self._recording
 
+    def frame_count(self) -> int:
+        """Rows recorded so far in the open episode (thread-safe)."""
+        with self._lock:
+            return len(self._frames)
+
     def start(self) -> bool:
         if self._recording:
             return False
@@ -150,8 +188,15 @@ class DemoRecorder:
         self._current_action = NOOP
         self._recording = True
         self._stop_requested.clear()
-        self._tap.start()
-        LOGGER.info("demo recording started")
+        # DEEP-FIX: surface a missing keyboard hook loudly.  Previously a
+        # headless machine logged one warning at construction and then
+        # happily recorded an all-NOOP episode that looked perfectly valid.
+        keys_ok = self._tap.start()
+        LOGGER.info("demo recording started (keyboard hook %s)",
+                    "active" if keys_ok else "UNAVAILABLE — NOOP only")
+        if not keys_ok:
+            LOGGER.warning("no keyboard hook: this episode will contain NOOP "
+                           "actions only and is not useful for BC")
         return True
 
     def stop(self, done: bool = True) -> Optional[str]:
@@ -160,7 +205,29 @@ class DemoRecorder:
             return None
         self._recording = False
         self._tap.stop()
-        n = len(self._frames)
+        # DEEP-FIX: tick() appends to these lists from the capture pump while
+        # stop() reads them from the GUI thread; _recording=False is not a
+        # barrier for a tick already in flight, so np.stack() could observe a
+        # different length than the action/timestamp arrays.  Snapshot
+        # everything under the same lock and verify the columns agree.
+        with self._lock:
+            frames = list(self._frames)
+            actions = list(self._actions)
+            ts = list(self._ts)
+            conf = list(self._conf)
+            death = list(self._death)
+            score = list(self._score)
+        lengths = {len(frames), len(actions), len(ts), len(conf),
+                   len(death), len(score)}
+        if len(lengths) != 1:
+            LOGGER.error(
+                "demo episode columns disagree (%s); truncating to the "
+                "shortest so the saved file stays internally consistent",
+                sorted(lengths))
+            n_min = min(lengths)
+            frames, actions, ts = frames[:n_min], actions[:n_min], ts[:n_min]
+            conf, death, score = conf[:n_min], death[:n_min], score[:n_min]
+        n = len(frames)
         if n == 0:
             LOGGER.warning("demo recording stopped with 0 frames; nothing saved")
             return None
@@ -183,22 +250,33 @@ class DemoRecorder:
             "respawn_calibrated": self.cfg.input.respawn_set(),
             "recorded_at": time.time(),
         }
-        path = self.out_dir / (
-            "episode_" + time.strftime("%Y%m%d_%H%M%S") + ".npz"
-        )
+        # DEEP-FIX: %Y%m%d_%H%M%S has one-second resolution, so two episodes
+        # finished in the same second overwrote each other.  Add a monotonic
+        # counter (and keep scanning for a free name) so history is never lost.
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        seq = 0
+        while True:
+            name = f"episode_{stamp}" + (f"_{seq:02d}" if seq else "") + ".npz"
+            path = self.out_dir / name
+            if not path.exists():
+                break
+            seq += 1
+            if seq > 999:  # pragma: no cover - defensive
+                path = self.out_dir / f"episode_{stamp}_{time.time_ns()}.npz"
+                break
         tmp = path.with_suffix(".npz.tmp")
         # NOTE: pass an open file object — numpy silently appends ".npz" to a
         # str filename, which would leave the atomic tmp file never created.
         with open(tmp, "wb") as fh:
             np.savez_compressed(
                 fh,
-                frames=np.stack(self._frames).astype(np.uint8),
-                actions=np.asarray(self._actions, dtype=np.int64),
-                timestamps=np.asarray(self._ts, dtype=np.float64),
+                frames=np.stack(frames).astype(np.uint8),
+                actions=np.asarray(actions, dtype=np.int64),
+                timestamps=np.asarray(ts, dtype=np.float64),
                 done=done_flags,
-                score=np.asarray(self._score, dtype=np.float32),
-                confidence=np.asarray(self._conf, dtype=np.float32),
-                death_state=np.asarray(self._death, dtype="U16"),
+                score=np.asarray(score, dtype=np.float32),
+                confidence=np.asarray(conf, dtype=np.float32),
+                death_state=np.asarray(death, dtype="U16"),
                 meta=np.str_(json.dumps(meta)),
             )
         tmp.replace(path)
@@ -208,21 +286,53 @@ class DemoRecorder:
 
     # ------------------------------------------------------------------ #
     def tick(self, frame, death_state: str = "ALIVE", confidence: float = 0.0,
-             score: float = 0.0) -> None:
-        """Consume one frame while recording (called from the capture pump)."""
+             score: float = 0.0) -> bool:
+        """Consume one frame while recording; True when a row was appended."""
         if not self._recording or frame is None:
-            return
+            return False
         z = self.pre.process(frame.image, frame.frame_id, frame.ts)
         if not z.valid or z.ground_gray is None:
-            return
+            return False
+        # DEEP-FIX: every column is appended under the same lock so a
+        # concurrent stop() can never see a ragged episode.
         with self._lock:
-            action = self._current_action
-        self._frames.append(z.ground_gray)
-        self._actions.append(int(action))
-        self._ts.append(float(frame.ts))
-        self._death.append(str(death_state))
-        self._conf.append(float(confidence))
-        self._score.append(float(score))
+            if not self._recording:
+                return False
+            self._frames.append(np.ascontiguousarray(z.ground_gray))
+            self._actions.append(int(self._current_action))
+            self._ts.append(float(frame.ts))
+            self._death.append(str(death_state))
+            self._conf.append(float(confidence))
+            self._score.append(float(score))
+        return True
+
+    def pump(self, max_frames: int = 4) -> int:
+        """Pull up to ``max_frames`` from ``read_frame`` and record them.
+
+        # DEEP-FIX: ``read_frame`` was stored by __init__ and never called by
+        # anything in the repository -- grep shows ``.tick(`` only in
+        # environment.py (FpsMeter), evaluation_tool.py and the recorder's own
+        # unit tests.  The GUI wired a ring reader into the constructor and
+        # nothing ever pumped it, so every recorded episode had 0 frames and
+        # stop() always reported "nothing saved": behaviour cloning had no
+        # data source at all.  The GUI now calls this from its Tk polling
+        # loop, which is the only thread allowed to touch widgets.
+        """
+        if not self._recording or self.read_frame is None:
+            return 0
+        count = 0
+        while count < max_frames:
+            try:
+                frame = self.read_frame()
+            except Exception as exc:
+                LOGGER.warning("demo frame read failed: %s (%s)",
+                               type(exc).__name__, exc)
+                return count
+            if frame is None:
+                break
+            if self.tick(frame):
+                count += 1
+        return count
 
     def dispose(self) -> None:
         self._tap.stop()

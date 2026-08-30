@@ -33,7 +33,12 @@ from typing import Any, Iterable, Optional
 import numpy as np
 
 from config import PERConfig
-from logging_utils import CorruptFileError, integrity_pickle_load, integrity_pickle_save
+from logging_utils import (
+    CorruptFileError,
+    get_logger,
+    integrity_pickle_load,
+    integrity_pickle_save,
+)
 
 
 class SumTree:
@@ -235,7 +240,9 @@ class NStepBuilder:
             obs=head["stack"],
             next_obs=nxt["stack"],
             action=head["a"],
-            reward=float(r) if not terminal else float(r),
+            # DEEP-FIX: was `float(r) if not terminal else float(r)` — both
+            # branches identical, i.e. dead code that read like a real choice.
+            reward=float(r),
             done=bool(terminal),
             span=span if not terminal else span + 1,
             gamma_pow=self.gamma ** (span if not terminal else span + 1),
@@ -313,11 +320,20 @@ class PrioritizedReplayBuffer:
                 return False
         return True
 
+    def _first_valid_index(self) -> Optional[int]:
+        """Lowest index whose frames are still resident (substitution target)."""
+        for i, t in enumerate(self.transitions[: self.size]):
+            if t is not None and self._valid(t):
+                return i
+        return None
+
     def sample(self, batch_size: int, beta: float,
                rng: Optional[np.random.Generator] = None,
                max_replace_rounds: int = 3) -> dict[str, Any]:
         if self.size == 0:
             raise IndexError("empty replay buffer")
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         rng = rng or np.random.default_rng()
         total = self.tree.total()
         if total <= 0:
@@ -344,18 +360,47 @@ class PrioritizedReplayBuffer:
                 repl = rng.integers(0, self.size, size=len(bad))
             leaf_idx[bad] = repl
 
-        trs = [self.transitions[int(i)] for i in leaf_idx]
-        trs = [t if t is not None else self.transitions[0] for t in trs]
+        # DEEP-FIX: whatever is still invalid after the rounds is substituted
+        # with a *validated* index, and the substitution is written back into
+        # the returned index array.  The old code swapped the transition but
+        # kept the stale index, so (a) the importance-sampling weight was
+        # computed for a transition that was not in the batch and (b) the
+        # caller's ``update_priorities(indices, td)`` wrote that sample's TD
+        # error onto an unrelated buffer slot — silently corrupting the
+        # priority structure on every eviction.
+        indices = np.empty(batch_size, dtype=np.int64)
+        trs: list[Transition] = []
+        fallback: Optional[int] = None
+        for j in range(batch_size):
+            i = int(leaf_idx[j])
+            t = self.transitions[i]
+            if t is None or not self._valid(t):
+                if fallback is None:
+                    fallback = self._first_valid_index()
+                    if fallback is None:
+                        raise IndexError(
+                            "replay buffer holds no frame-resident transition "
+                            "(frame store evicted every reference)")
+                self.evicted_refs += 1
+                i = fallback
+                t = self.transitions[i]
+            indices[j] = i
+            trs.append(t)
+
         obs = np.stack([np.stack([self.frames.frames[s] for s in t.obs_ids], axis=0)
                         for t in trs])
         next_obs = np.stack([np.stack([self.frames.frames[s] for s in t.next_ids], axis=0)
                              for t in trs])
-        probs = self.priorities[leaf_idx] / max(total, 1e-12)
+        probs = self.priorities[indices] / max(total, 1e-12)
         min_p = self.tree.min_leaf() / max(total, 1e-12)
         weights = np.power(np.maximum(probs, 1e-12) / max(min_p, 1e-12), -beta)
         weights = weights / max(float(weights.max()), 1e-12)
+        if not np.all(np.isfinite(weights)):
+            # DEEP-FIX: a degenerate priority table must not inject NaN into
+            # the loss (and from there into every weight of the network).
+            weights = np.ones_like(weights)
         return {
-            "indices": leaf_idx.astype(np.int64),
+            "indices": indices.astype(np.int64),
             "weights": weights.astype(np.float32),
             "obs": obs,
             "next_obs": next_obs,
@@ -370,9 +415,27 @@ class PrioritizedReplayBuffer:
         td = np.abs(np.asarray(td_errors, dtype=np.float64))
         td = np.where(np.isfinite(td), td, 0.0)
         prios = td + self._eps
-        if prios.size:
-            self.max_priority = max(self.max_priority, float(prios.max()))
-        idx = np.asarray(indices, dtype=np.int64)
+        idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+        # DEEP-FIX: the batch and its TD vector must be the same length, and
+        # an out-of-range index must be dropped rather than silently writing
+        # through numpy's negative indexing (idx=-1 used to hit the LAST slot).
+        if prios.size != idx.size:
+            raise ValueError(
+                f"update_priorities got {idx.size} indices but {prios.size} "
+                f"td errors — priorities would be attributed to the wrong slots")
+        if idx.size == 0:
+            return
+        in_range = (idx >= 0) & (idx < self.capacity)
+        if not in_range.all():
+            dropped = int((~in_range).sum())
+            get_logger("replay").warning(
+                "dropping %d out-of-range priority update(s) [%d, %d]",
+                dropped, int(idx.min()), int(idx.max()))
+            idx = idx[in_range]
+            prios = prios[in_range]
+            if idx.size == 0:
+                return
+        self.max_priority = max(self.max_priority, float(prios.max()))
         self.tree.update_batch(idx, prios ** self.cfg.alpha)
         self.priorities[idx] = prios ** self.cfg.alpha
 
@@ -421,42 +484,92 @@ class PrioritizedReplayBuffer:
     @classmethod
     def load(cls, path: str, cfg: PERConfig, frame_size: int = 84,
              gamma: float = 0.99) -> "PrioritizedReplayBuffer":
-        """Load or raise CorruptFileError (file already renamed .corrupt)."""
+        """Load or raise CorruptFileError (file already renamed .corrupt).
+
+        # DEEP-FIX: every shape is validated against the destination *before*
+        # anything is assigned.  The old code did ``buf.frames.frames[:] =
+        # payload["frames"]`` after clamping ``cap`` to the configured
+        # capacity, so a buffer saved with a larger ``per.capacity`` raised a
+        # raw ``ValueError: could not broadcast input array from shape
+        # (4064,84,84) into shape (564,84,84)`` — not a CorruptFileError, so
+        # the operator got an opaque numpy message instead of "your config
+        # capacity no longer matches the saved buffer".
+        """
         payload = integrity_pickle_load(path)
         if not isinstance(payload, dict) or "frames" not in payload \
                 or "transitions" not in payload:
             raise CorruptFileError(f"{path}: unexpected payload layout")
-        buf = cls(cfg, frame_size=frame_size, gamma=gamma)
-        cap = int(payload["capacity"])
+        for key in ("capacity", "size", "pos", "frame_cursor", "frame_written",
+                    "max_priority", "frame_env_ids", "priorities"):
+            if key not in payload:
+                raise CorruptFileError(f"{path}: missing field {key!r}")
+
         frames = np.asarray(payload["frames"], dtype=np.uint8)
-        if frames.shape[1] != frame_size:
+        env_ids = np.asarray(payload["frame_env_ids"], dtype=np.int64)
+        if frames.ndim != 3 or frames.shape[1:] != (frame_size, frame_size):
             raise CorruptFileError(
-                f"{path}: frame size {frames.shape[1]} != configured {frame_size}"
-            )
-        if cap > cfg.capacity:
-            cap = cfg.capacity  # never exceed the configured memory bound
-        buf._reinit(cap, frames.shape[1])
-        buf.frames.frames[:] = payload["frames"]
-        buf.frames.env_ids[:] = np.asarray(payload["frame_env_ids"], dtype=np.int64)
+                f"{path}: frame shape {frames.shape} != "
+                f"[N,{frame_size},{frame_size}]")
+        if env_ids.shape[0] != frames.shape[0]:
+            raise CorruptFileError(
+                f"{path}: {env_ids.shape[0]} frame ids for {frames.shape[0]} frames")
+        cap = int(payload["capacity"])
+        # FrameStore always allocates capacity + 64 slots; use that as the
+        # cross-check so a truncated file cannot pass silently.
+        if frames.shape[0] != cap + 64:
+            raise CorruptFileError(
+                f"{path}: frame store holds {frames.shape[0]} rows but the "
+                f"header claims capacity {cap} (expected {cap + 64})")
+        if cap != cfg.capacity:
+            raise CorruptFileError(
+                f"{path}: saved with per.capacity={cap} but the config asks for "
+                f"{cfg.capacity}; restore per.capacity={cap} to reuse this "
+                f"buffer (refusing to silently discard or truncate history)")
+        prios = np.asarray(payload["priorities"], dtype=np.float64)
+        if prios.shape[0] != cap:
+            raise CorruptFileError(
+                f"{path}: {prios.shape[0]} priorities for capacity {cap}")
+        raw_transitions = list(payload["transitions"])
+        if len(raw_transitions) != cap:
+            raise CorruptFileError(
+                f"{path}: {len(raw_transitions)} transition slots for capacity {cap}")
+
+        buf = cls(cfg, frame_size=frame_size, gamma=gamma)
+        buf.frames.frames[:] = frames
+        buf.frames.env_ids[:] = env_ids
         buf.frames.cursor = int(payload["frame_cursor"]) % buf.frames.capacity
         buf.frames.written = int(payload["frame_written"])
         buf.size = min(int(payload["size"]), cap)
         buf.pos = int(payload["pos"]) % cap
         buf.filled_once = bool(payload["filled_once"])
-        buf.max_priority = float(payload["max_priority"])
-        for i, raw in enumerate(payload["transitions"][: buf.size]):
+        max_prio = float(payload["max_priority"])
+        buf.max_priority = max_prio if np.isfinite(max_prio) and max_prio > 0 else 1.0
+        for i, raw in enumerate(raw_transitions[: buf.size]):
             if raw is None:
                 continue
-            (obs_ids, next_ids, oe, ne, action, reward, done, span, gpow) = raw
-            buf.transitions[i] = Transition(
-                tuple(obs_ids), tuple(next_ids), tuple(oe), tuple(ne),
-                int(action), float(reward), bool(done), int(span), float(gpow),
-            )
-        prios = np.asarray(payload["priorities"], dtype=np.float64)[:cap]
-        buf.priorities[:cap] = prios
+            try:
+                (obs_ids, next_ids, oe, ne, action, reward, done, span, gpow) = raw
+                t = Transition(
+                    tuple(int(v) for v in obs_ids), tuple(int(v) for v in next_ids),
+                    tuple(int(v) for v in oe), tuple(int(v) for v in ne),
+                    int(action), float(reward), bool(done), int(span), float(gpow),
+                )
+                t.validate()
+            except (ValueError, TypeError) as exc:
+                # DEEP-FIX: one malformed slot must not discard the whole
+                # buffer; the slot is dropped and sampling already re-validates
+                # frame residency for everything it hands out.
+                get_logger("replay").warning(
+                    "%s: dropping transition slot %d (%s)", path, i, exc)
+                continue
+            buf.transitions[i] = t
+        buf.priorities[:cap] = np.nan_to_num(prios, nan=0.0, posinf=0.0, neginf=0.0)
         # priorities[] are stored ALREADY alpha-powered (see add_nstep);
         # rebuilding must not power them a second time.
         buf.tree.rebuild_from(buf.priorities, filled=buf.size)
+        get_logger("replay").info(
+            "buffer restored from %s: size=%d pos=%d frames=%d",
+            path, buf.size, buf.pos, buf.frames.written)
         return buf
 
     def _reinit(self, capacity: int, frame_size: int) -> None:

@@ -14,6 +14,7 @@ import logging
 import logging.handlers
 import pickle  # noqa: S403 - only used for our own local buffer files
 import sys
+import threading
 import traceback
 import types
 from pathlib import Path
@@ -104,8 +105,51 @@ def put_bounded(queue: Any, item: Any, name: str = "queue") -> bool:
         return False
 
 
-def drain(queue: Any, limit: int = 256) -> list[Any]:
-    """Non-blocking drain of up to ``limit`` items from a queue."""
+def drain(queue: Any, limit: int = 256, timeout_s: Optional[float] = None) -> list[Any]:
+    """Non-blocking drain of up to ``limit`` items from a queue.
+
+    # DEEP-FIX: ``multiprocessing.Queue`` is NOT safe to read after one of
+    # its writer processes has been killed.  The writer pickles each item
+    # into the pipe as a 4-byte length prefix plus the payload; a SIGTERM in
+    # the middle leaves the prefix without the payload.  ``get_nowait()``
+    # then reads the prefix and blocks inside ``Connection._recv()`` waiting
+    # for bytes that will never arrive — and because the *parent* also holds
+    # the queue's write end open, no EOF is ever delivered, so the read
+    # blocks forever.  Verified: ``tests/test_shutdown.py::
+    # TestWorkerCrashResilience::test_gui_side_survives_actor_crash`` hung
+    # for 600 s here, and a minimal parent/child repro hangs identically.
+    # That wedged ``BotApplication.shutdown()`` and the Tk polling loop, i.e.
+    # exactly the "GUI survives a worker crash" guarantee.
+    #
+    # With ``timeout_s`` set, the drain runs on a throwaway daemon thread and
+    # the queue is quarantined if the thread does not return, so a poisoned
+    # pipe can never block the caller again.  The default (``None``) keeps the
+    # original zero-overhead inline path for hot loops that own their writer.
+    """
+    if timeout_s is None:
+        return _drain_inline(queue, limit)
+    if _queue_is_poisoned(queue):
+        return []
+    box: dict[str, list[Any]] = {}
+
+    def _work() -> None:
+        try:
+            box["items"] = _drain_inline(queue, limit)
+        except Exception as exc:  # pragma: no cover - defensive
+            _poison_queue(queue, f"drain raised {type(exc).__name__}")
+            box["items"] = []
+
+    worker = threading.Thread(target=_work, daemon=True, name="queue-drain")
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
+        _poison_queue(queue, f"read blocked > {timeout_s:.2f}s "
+                             "(a writer process died mid-put)")
+        return box.get("items", [])
+    return box.get("items", [])
+
+
+def _drain_inline(queue: Any, limit: int) -> list[Any]:
     import queue as _queue
 
     items: list[Any] = []
@@ -114,9 +158,48 @@ def drain(queue: Any, limit: int = 256) -> list[Any]:
             items.append(queue.get_nowait())
         except _queue.Empty:
             break
-        except (EOFError, BrokenPipeError, ConnectionError):
+        except (EOFError, BrokenPipeError, ConnectionError, OSError, ValueError):
+            # DEEP-FIX: a closed/broken queue also surfaces as OSError and
+            # ValueError ("handle out of range") once it has been closed.
             break
     return items
+
+
+#: Queues whose reader is known to be wedged (id() -> reason).
+_POISONED_QUEUES: dict[int, str] = {}
+_POISON_LOCK = threading.Lock()
+
+
+def _poison_queue(queue: Any, reason: str) -> None:
+    with _POISON_LOCK:
+        _POISONED_QUEUES[id(queue)] = reason
+    logging.getLogger("ssbot.ipc").error(
+        "queue %s quarantined: %s — further reads are skipped so the "
+        "process cannot deadlock", getattr(queue, "name", id(queue)), reason,
+    )
+
+
+def _queue_is_poisoned(queue: Any) -> bool:
+    with _POISON_LOCK:
+        return id(queue) in _POISONED_QUEUES
+
+
+def quarantine_queue(queue: Any, reason: str = "writer process terminated") -> None:
+    """Explicitly mark a queue unreadable (call after terminating a worker)."""
+    _poison_queue(queue, reason)
+
+
+def close_queue_safely(queue: Any) -> None:
+    """Close a queue we own without raising (used on shutdown)."""
+    for meth in ("cancel_join_thread", "close"):
+        fn = getattr(queue, meth, None)
+        if fn is None:
+            continue
+        try:
+            fn()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logging.getLogger("ssbot.ipc").debug(
+                "%s failed: %s", meth, exc)
 
 
 # --------------------------------------------------------------------- #

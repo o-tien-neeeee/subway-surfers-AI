@@ -25,9 +25,10 @@ observations cannot leak between train and validation.
 from __future__ import annotations
 
 import json
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -85,37 +86,96 @@ class ValidationReport:
         return "\n".join(lines)
 
 
+class EpisodeLoadError(RuntimeError):
+    """A demo file exists but cannot be turned into an :class:`Episode`."""
+
+
 def load_episode(path: str | Path) -> Episode:
+    """Load one ``.npz`` episode, raising :class:`EpisodeLoadError` if unusable.
+
+    # DEEP-FIX: a missing key raised a bare KeyError straight out of
+    # ``validate_directory``, so ONE malformed file in ``demos/`` aborted the
+    # entire behaviour-cloning run (``Learner.pretrain`` has no per-file
+    # isolation).  Every failure is now a typed error the caller can turn
+    # into an "invalid episode" report row.
+    """
     p = Path(path)
-    data = np.load(str(p), allow_pickle=False)
-    frames = np.asarray(data["frames"], dtype=np.uint8)
-    actions = np.asarray(data["actions"], dtype=np.int64)
-    ts = np.asarray(data["timestamps"], dtype=np.float64)
-    done = np.asarray(data["done"], dtype=bool)
+    try:
+        data = np.load(str(p), allow_pickle=False)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise EpisodeLoadError(f"{p}: not a readable .npz ({exc})") from exc
+    missing = [k for k in ("frames", "actions", "timestamps", "done")
+               if k not in data]
+    if missing:
+        raise EpisodeLoadError(f"{p}: missing required arrays {missing}")
+    try:
+        frames = np.asarray(data["frames"], dtype=np.uint8)
+        actions = np.asarray(data["actions"], dtype=np.int64)
+        ts = np.asarray(data["timestamps"], dtype=np.float64)
+        done = np.asarray(data["done"], dtype=bool)
+    except (ValueError, TypeError) as exc:
+        raise EpisodeLoadError(f"{p}: unreadable array dtype ({exc})") from exc
+    n = int(frames.shape[0]) if frames.ndim >= 1 else 0
+    # DEEP-FIX: ragged columns used to survive loading and were only noticed
+    # (if at all) by the validator comparing against frames' length.
+    for name, arr in (("actions", actions), ("timestamps", ts), ("done", done)):
+        if arr.shape[0] != n:
+            raise EpisodeLoadError(
+                f"{p}: {name} has {arr.shape[0]} rows but frames has {n}")
     meta = {}
     if "meta" in data:
         try:
             meta = json.loads(str(data["meta"]))
         except (ValueError, TypeError):
             meta = {}
+
+    def optional(key: str, dtype):
+        if key not in data:
+            return None
+        arr = np.asarray(data[key], dtype=dtype)
+        return arr if arr.shape[0] == n else None
+
     return Episode(
         path=str(p),
         frames=frames,
         actions=actions,
         timestamps=ts,
         done=done,
-        score=np.asarray(data["score"], dtype=np.float32) if "score" in data else None,
+        score=optional("score", np.float32),
         death_state=(np.asarray(data["death_state"]).astype(str)
-                     if "death_state" in data else None),
-        confidence=(np.asarray(data["confidence"], dtype=np.float32)
-                    if "confidence" in data else None),
+                     if "death_state" in data
+                     and np.asarray(data["death_state"]).shape[0] == n else None),
+        confidence=optional("confidence", np.float32),
         meta=meta,
     )
 
 
 def load_episodes(directory: str | Path) -> list[Episode]:
+    """Load every ``*.npz`` in a directory.
+
+    # DEEP-FIX: an unreadable file no longer aborts the whole load; it is
+    # reported through :func:`validate_directory` as an invalid episode so
+    # the operator sees WHICH file is broken and BC continues with the rest.
+    """
     root = Path(directory)
-    return [load_episode(p) for p in sorted(root.glob("*.npz"))]
+    out: list[Episode] = []
+    for path in sorted(root.glob("*.npz")):
+        try:
+            out.append(load_episode(path))
+        except EpisodeLoadError as exc:
+            _LOAD_ERRORS[str(path)] = str(exc)
+    return out
+
+
+#: path -> reason, for files that could not be parsed at all.
+_LOAD_ERRORS: dict[str, str] = {}
+
+
+def take_load_errors() -> dict[str, str]:
+    """Return and clear the accumulated per-file load failures."""
+    errs = dict(_LOAD_ERRORS)
+    _LOAD_ERRORS.clear()
+    return errs
 
 
 def validate_episode(ep: Episode, target_fps: float = 30.0,
@@ -169,8 +229,14 @@ def validate_episode(ep: Episode, target_fps: float = 30.0,
 
 def validate_directory(directory: str | Path, target_fps: float = 30.0
                        ) -> tuple[list[Episode], list[ValidationReport]]:
+    _LOAD_ERRORS.clear()
     eps = load_episodes(directory)
     reps = [validate_episode(e, target_fps) for e in eps]
+    # DEEP-FIX: files that could not even be parsed are surfaced as invalid
+    # reports instead of vanishing (or crashing the caller).
+    for path, reason in take_load_errors().items():
+        reps.append(ValidationReport(path=path, ok=False,
+                                     errors=[reason], n_steps=0))
     return eps, reps
 
 

@@ -34,20 +34,42 @@ def make_learner(tmp_path, best_metric: str = "survival_s",
 
 def report_episode(counters: SharedCounters, episode_id: int,
                    survival_s: float, reward: float) -> None:
-    counters.last_episode_done_id.value = episode_id
-    counters.last_episode_survival_s.value = survival_s
-    counters.last_episode_reward.value = reward
+    # DEEP-FIX: publish through the ordered helper (payload first, id last)
+    # exactly as BotActor does, so these tests exercise the real protocol
+    # instead of the racy id-first ordering they used to encode.
+    counters.publish_episode_result(episode_id, survival_s, reward)
 
 
 class TestBestModelTracking:
-    def test_first_episode_saves_best(self, tmp_path) -> None:
-        learner, counters = make_learner(tmp_path)
+    def test_best_needs_a_full_window_before_the_first_save(self, tmp_path) -> None:
+        """DEEP-FIX (behaviour change, deliberate).
+
+        The gate used to open on the VERY FIRST finished episode, crowning
+        best_model.pth from a "rolling mean" of a single sample.  The
+        documented rule is a rolling mean over ``rl.best_metric_window``
+        episodes, so the window must be full first.
+        """
+        learner, counters = make_learner(tmp_path, window=3)
+        best_path = tmp_path / "checkpoints" / "strict_lite" / "best_model.pth"
         assert learner.ckpt.best_metric is None
         report_episode(counters, 1, survival_s=5.0, reward=3.0)
-        rolling = learner._poll_episode_metric()
-        assert rolling == pytest.approx(5.0)
+        assert learner._poll_episode_metric() == pytest.approx(5.0)
+        assert learner.ckpt.best_metric is None, "one episode is not a window"
+        assert not best_path.exists()
+        report_episode(counters, 2, survival_s=7.0, reward=4.0)
+        learner._poll_episode_metric()
+        assert learner.ckpt.best_metric is None
+        assert not best_path.exists()
+        report_episode(counters, 3, survival_s=9.0, reward=5.0)
+        assert learner._poll_episode_metric() == pytest.approx(7.0)
+        assert learner.ckpt.best_metric == pytest.approx(7.0)
+        assert best_path.exists()
+
+    def test_window_of_one_still_saves_immediately(self, tmp_path) -> None:
+        learner, counters = make_learner(tmp_path, window=1)
+        report_episode(counters, 1, survival_s=5.0, reward=3.0)
+        assert learner._poll_episode_metric() == pytest.approx(5.0)
         assert learner.ckpt.best_metric == pytest.approx(5.0)
-        assert (tmp_path / "checkpoints" / "strict_lite" / "best_model.pth").exists()
 
     def test_rolling_mean_gates_saving(self, tmp_path) -> None:
         learner, counters = make_learner(tmp_path, window=3)
@@ -55,17 +77,22 @@ class TestBestModelTracking:
         assert learner._poll_episode_metric() == pytest.approx(10.0)
         report_episode(counters, 2, 12.0, 7.0)
         assert learner._poll_episode_metric() == pytest.approx(11.0)
-        best_after_two = learner.ckpt.best_metric
-        # episode 3: rolling mean (10+12+4)/3 = 8.67 < 11 -> best NOT updated
+        # DEEP-FIX: the window is not full yet, so nothing is written.
+        assert learner.ckpt.best_metric is None
+        # episode 3 fills the window: (10+12+4)/3 = 8.67 -> first best
         report_episode(counters, 3, 4.0, 2.0)
         learner._poll_episode_metric()
-        assert learner.ckpt.best_metric == best_after_two
-        # episode 4: window now [12, 4, 14] -> mean 10.0 < 11 -> still refused
+        assert learner.ckpt.best_metric == pytest.approx(26.0 / 3.0)
+        # episode 4: window [12, 4, 14] -> mean 10.0 > 8.67 -> updated
         report_episode(counters, 4, 14.0, 9.0)
         learner._poll_episode_metric()
-        assert learner.ckpt.best_metric == best_after_two
-        # episode 5: window [4, 14, 20] -> mean 12.67 > 11 -> updated
+        assert learner.ckpt.best_metric == pytest.approx(10.0)
+        # episode 5: window [4, 14, 20] -> mean 12.67 > 10 -> updated
         report_episode(counters, 5, 20.0, 12.0)
+        learner._poll_episode_metric()
+        assert learner.ckpt.best_metric == pytest.approx(38.0 / 3.0)
+        # episode 6: window [14, 20, 1] -> mean 11.67 < 12.67 -> refused
+        report_episode(counters, 6, 1.0, 0.5)
         learner._poll_episode_metric()
         assert learner.ckpt.best_metric == pytest.approx(38.0 / 3.0)
 
@@ -90,23 +117,27 @@ class TestBestModelTracking:
 
     def test_best_survives_restart_without_regression(self, tmp_path) -> None:
         learner1, counters1 = make_learner(tmp_path)
-        report_episode(counters1, 1, 25.0, 15.0)
-        learner1._poll_episode_metric()
+        # DEEP-FIX: three episodes are needed to fill the default window of 3
+        # before the first best_model.pth can be written.
+        for i, surv in enumerate((25.0, 25.0, 25.0), start=1):
+            report_episode(counters1, i, surv, 15.0)
+            learner1._poll_episode_metric()
         best_v1 = learner1.ckpt.best_metric
+        assert best_v1 == pytest.approx(25.0)
         # simulate a restart: a fresh Learner over the same checkpoint dir
         learner2, counters2 = make_learner(tmp_path)
         assert learner2.ckpt.best_metric == pytest.approx(best_v1)
         # a WORSE episode after the restart must not overwrite the best
-        report_episode(counters2, 2, 3.0, 1.0)
+        report_episode(counters2, 4, 3.0, 1.0)
         learner2._poll_episode_metric()
         assert learner2.ckpt.best_metric == pytest.approx(best_v1)
-        report_episode(counters2, 3, 30.0, 18.0)
+        report_episode(counters2, 5, 30.0, 18.0)
         learner2._poll_episode_metric()
-        assert learner2.ckpt.best_metric == pytest.approx(best_v1)  # 16.5 < 25
+        assert learner2.ckpt.best_metric == pytest.approx(best_v1)  # window not full
         # window [3, 30, 50] -> rolling 27.67 > 25 -> the best finally moves
-        report_episode(counters2, 4, 50.0, 25.0)
+        report_episode(counters2, 6, 50.0, 25.0)
         learner2._poll_episode_metric()
-        assert learner2.ckpt.best_metric > best_v1
+        assert learner2.ckpt.best_metric == pytest.approx(83.0 / 3.0)
 
     def test_window_size_from_config(self, tmp_path) -> None:
         learner, _ = make_learner(tmp_path, window=5)

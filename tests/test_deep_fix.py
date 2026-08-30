@@ -1,0 +1,836 @@
+"""Regression tests for the DEEP-FIX pass.
+
+Every test here pins a defect that was found by reading the code and then
+reproduced by running it.  The docstring of each test states the observable
+symptom of the original bug so a future regression is diagnosable from the
+failure message alone.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from config import PERConfig, BotConfig
+from ipc import SharedCounters, SharedWeights, unflatten_into
+
+try:  # DEEP-FIX added this symbol; keep the import optional so this module
+    from ipc import layout_fingerprint as _layout_fingerprint
+except ImportError:  # pragma: no cover - only on the pre-fix tree
+    _layout_fingerprint = None
+
+
+def layout_fingerprint(module) -> str:
+    """Fail loudly (not at import time) when the guard symbol is missing."""
+    assert _layout_fingerprint is not None, (
+        "ipc.layout_fingerprint does not exist — the weight-layout guard "
+        "is missing")
+    return _layout_fingerprint(module)
+
+
+# --------------------------------------------------------------------- #
+# 1. Prioritised replay must receive PER-SAMPLE TD errors
+# --------------------------------------------------------------------- #
+def _nstep(i: int, action: int = 1, reward: float = 0.1):
+    from replay_buffer import NStepTransition
+
+    obs = np.full((4, 84, 84), i % 200, dtype=np.uint8)
+    return NStepTransition(
+        obs=obs, next_obs=obs, action=action, reward=reward, done=False,
+        span=3, gamma_pow=0.99 ** 3,
+        obs_env_ids=(i, i + 1, i + 2, i + 3),
+        next_env_ids=(i + 1, i + 2, i + 3, i + 4),
+    )
+
+
+def _filled_buffer(n: int = 200, capacity: int = 512):
+    from replay_buffer import PrioritizedReplayBuffer
+
+    buf = PrioritizedReplayBuffer(PERConfig(capacity=capacity), frame_size=84)
+    for i in range(n):
+        buf.add_nstep(_nstep(i))
+    return buf
+
+
+class TestPerSamplePriorities:
+    def test_distinct_td_errors_give_distinct_priorities(self) -> None:
+        """The old learner broadcast one scalar; priorities must differ."""
+        buf = _filled_buffer()
+        batch = buf.sample(32, 0.4, rng=np.random.default_rng(0))
+        td = np.arange(1.0, 33.0)  # 32 clearly different errors
+        buf.update_priorities(batch["indices"], td)
+        prios = buf.priorities[batch["indices"]]
+        assert len(np.unique(np.round(prios, 9))) == 32, (
+            "PER collapsed: every sampled slot received the same priority")
+        # the highest TD error must own the highest priority
+        assert batch["indices"][int(np.argmax(td))] == \
+            batch["indices"][int(np.argmax(prios))]
+
+    def test_agent_returns_per_sample_td_errors(self) -> None:
+        """train_step must expose a per-sample vector, not only the mean."""
+        from agent import DoubleDQNAgent
+        from config import RLConfig
+
+        cfg = RLConfig(batch_size=8, warmup_transitions=1)
+        agent = DoubleDQNAgent("strict_lite", cfg, seed=0)
+        buf = _filled_buffer(n=64, capacity=128)
+        batch = buf.sample(8, 0.4, rng=np.random.default_rng(1))
+        metrics = agent.train_step(batch)
+        assert "td_errors" in metrics
+        assert metrics["td_errors"].shape == (8,)
+        assert np.all(np.isfinite(metrics["td_errors"]))
+        assert metrics["td_error_abs_mean"] == pytest.approx(
+            float(metrics["td_errors"].mean()), rel=1e-5)
+
+    def test_learner_writes_per_sample_priorities(self, tmp_path) -> None:
+        """End to end: one train_one() must leave a non-uniform priority set."""
+        from queue import Queue
+
+        from config import BotConfig
+        from learner_worker import Learner
+        from models import weight_size_for_profile
+
+        cfg = BotConfig()
+        cfg.paths.checkpoints_dir = str(tmp_path / "ckpt")
+        cfg.rl.batch_size = 16
+        cfg.rl.warmup_transitions = 8
+        cfg.per.capacity = 256
+        weights = SharedWeights(weight_size_for_profile("quality_cpu",
+                                                        cfg.perception.frame_stack))
+        learner = Learner(cfg, weights, SharedCounters(), Queue(),
+                          str(tmp_path / "ckpt"))
+        for i in range(60):
+            learner.buffer.add_nstep(_nstep(i))
+        learner.buffer.priorities[:] = 1.0
+        learner.buffer.tree.rebuild_from(learner.buffer.priorities,
+                                         filled=learner.buffer.size)
+        before = learner.buffer.priorities.copy()
+        assert learner.train_one(time.monotonic()) is not None
+        changed = learner.buffer.priorities != before
+        assert changed.sum() > 0, "no priority was updated at all"
+        touched = learner.buffer.priorities[changed]
+        assert len(np.unique(np.round(touched, 9))) > 1, (
+            "all updated slots share one priority — PER is degenerate")
+
+    def test_mismatched_td_length_is_rejected(self) -> None:
+        """A short TD vector must not silently mis-attribute priorities."""
+        buf = _filled_buffer()
+        with pytest.raises(ValueError, match="td errors"):
+            buf.update_priorities(np.arange(8), np.ones(7))
+
+    def test_out_of_range_indices_are_dropped_not_wrapped(self) -> None:
+        """Index -1 used to write through to the LAST slot."""
+        buf = _filled_buffer(n=50, capacity=64)
+        before = buf.priorities[63]
+        buf.update_priorities([-1, 0], np.array([99.0, 99.0]))
+        assert buf.priorities[63] == before, "negative index wrote to slot 63"
+
+
+# --------------------------------------------------------------------- #
+# 2. Profile switch must not corrupt the actor's weights
+# --------------------------------------------------------------------- #
+class TestWeightLayoutGuard:
+    def test_mismatched_layout_is_refused(self) -> None:
+        """An actor on profile A must not consume profile B's prefix."""
+        from agent import InferencePolicy
+        from models import DuelingDQN
+
+        heavy = DuelingDQN.from_profile("quality_cpu")
+        light = DuelingDQN.from_profile("strict_lite")
+        shared = SharedWeights(sum(p.numel() for p in heavy.parameters()))
+        policy = InferencePolicy(light, seed=0)
+        shared.publish(
+            np.concatenate([p.detach().numpy().reshape(-1)
+                            for p in heavy.parameters()]).astype(np.float32),
+            fingerprint=layout_fingerprint(heavy))
+        before = light.state_dict()["encoder.0.0.weight"].clone()
+        assert policy.refresh_weights(shared) is False
+        after = light.state_dict()["encoder.0.0.weight"]
+        assert bool((before == after).all()), "mismatched weights were applied"
+
+    def test_matching_layout_is_applied(self) -> None:
+        from agent import InferencePolicy
+        from models import DuelingDQN
+
+        model = DuelingDQN.from_profile("strict_lite")
+        shared = SharedWeights(sum(p.numel() for p in model.parameters()))
+        policy = InferencePolicy(DuelingDQN.from_profile("strict_lite"), seed=0)
+        flat = np.concatenate([p.detach().numpy().reshape(-1)
+                               for p in model.parameters()]).astype(np.float32)
+        shared.publish(flat, fingerprint=layout_fingerprint(model))
+        assert policy.refresh_weights(shared) is True
+        got = policy.model.state_dict()["encoder.0.0.weight"].numpy()
+        assert np.allclose(got, model.state_dict()["encoder.0.0.weight"].numpy())
+
+    def test_unflatten_refuses_a_short_vector(self) -> None:
+        from models import DuelingDQN
+
+        model = DuelingDQN.from_profile("strict_lite")
+        with pytest.raises(ValueError, match="too short"):
+            unflatten_into(model, np.zeros(10, dtype=np.float32))
+
+    def test_nonfinite_weights_are_never_published(self) -> None:
+        from models import DuelingDQN
+
+        model = DuelingDQN.from_profile("strict_lite")
+        shared = SharedWeights(sum(p.numel() for p in model.parameters()))
+        bad = np.full(shared.size, np.nan, dtype=np.float32)
+        with pytest.raises(ValueError, match="non-finite"):
+            shared.publish(bad, fingerprint=layout_fingerprint(model))
+
+    def test_actor_downgrade_notifies_the_learner_command_queue(self) -> None:
+        """The old code put the notice on transition_q, which nobody reads."""
+        import inspect
+
+        import environment
+
+        src = inspect.getsource(environment.BotActor._downgrade)
+        assert "self.cmd_q" in src, "the downgrade still has no command channel"
+        assert '"cmd": "set_profile"' in src
+
+    def test_learner_accepts_an_inline_profile_command(self, tmp_path) -> None:
+        """Defence in depth: the transition queue path is honoured too."""
+        from queue import Queue
+
+        from config import BotConfig
+        from learner_worker import Learner
+        from models import weight_size_for_profile
+
+        cfg = BotConfig()
+        cfg.rl.profile = "balanced_cpu"
+        weights = SharedWeights(weight_size_for_profile("quality_cpu",
+                                                        cfg.perception.frame_stack))
+        learner = Learner(cfg, weights, SharedCounters(), Queue(),
+                          str(tmp_path / "ckpt"))
+        assert learner.profile == "balanced_cpu"
+        learner.set_profile("strict_lite")
+        assert learner.profile == "strict_lite"
+
+    def test_profile_switch_keeps_the_live_replay_buffer(self, tmp_path) -> None:
+        from queue import Queue
+
+        from config import BotConfig
+        from learner_worker import Learner
+        from models import weight_size_for_profile
+
+        cfg = BotConfig()
+        cfg.paths.checkpoints_dir = str(tmp_path / "ckpt")
+        weights = SharedWeights(weight_size_for_profile("quality_cpu",
+                                                        cfg.perception.frame_stack))
+        learner = Learner(cfg, weights, SharedCounters(), Queue(),
+                          str(tmp_path / "ckpt"))
+        for i in range(25):
+            learner.buffer.add_nstep(_nstep(i))
+        assert learner.buffer.size == 25
+        learner.set_profile("balanced_cpu")
+        assert learner.buffer.size == 25, "the live buffer was discarded"
+
+
+# --------------------------------------------------------------------- #
+# 3. Episode telemetry is an atomic record
+# --------------------------------------------------------------------- #
+class TestEpisodeTelemetry:
+    def test_payload_and_id_are_consistent(self) -> None:
+        c = SharedCounters()
+        c.publish_episode_result(1, 12.5, 7.25)
+        got = c.read_episode_result(0)
+        assert got == {"episode_id": 1, "survival_s": 12.5, "total_reward": 7.25}
+        assert c.read_episode_result(1) is None
+
+    def test_publish_invalidates_before_writing_the_payload(self) -> None:
+        """DEEP-FIX root cause, pinned deterministically.
+
+        The actor used to write ``last_episode_done_id`` FIRST and the two
+        payload fields after it, so a learner that polled in that window saw a
+        *new* id next to the *previous* episode's survival/reward -- the value
+        that gates ``best_model.pth``.
+
+        Writing the id last is also NOT sufficient (see the docstring on
+        ``publish_episode_result``), so this asserts the full three-phase
+        protocol: invalidate -> payload -> commit.
+        """
+        c = SharedCounters()
+        writes: list[tuple[str, float]] = []
+
+        class Recorder:
+            """Proxy that logs every .value assignment and forwards it."""
+
+            def __init__(self, raw, name: str) -> None:
+                self._raw = raw
+                self._name = name
+
+            @property
+            def value(self):
+                return self._raw.value
+
+            @value.setter
+            def value(self, new) -> None:
+                writes.append((self._name, new))
+                self._raw.value = new
+
+        for name in ("last_episode_survival_s", "last_episode_reward",
+                     "last_episode_done_id"):
+            setattr(c, name, Recorder(getattr(c, name), name))
+
+        c.publish_episode_result(7, 3.25, -1.5)
+
+        names = [n for n, _ in writes]
+        assert names[0] == "last_episode_done_id", (
+            f"the id must be INVALIDATED before any payload write, otherwise a "
+            f"reader that sampled the old id still sees it after reading the "
+            f"new payload; write order was {names}")
+        assert writes[0][1] == 0, (
+            f"the first id write must be the invalid marker 0, got {writes[0][1]!r}")
+        assert names[-1] == "last_episode_done_id", (
+            f"the id must also be COMMITTED last; write order was {names}")
+        assert writes[-1][1] == 7, (
+            f"the last id write must be the real episode id, got {writes[-1][1]!r}")
+        assert set(names[1:-1]) == {"last_episode_survival_s",
+                                   "last_episode_reward"}, names
+        # and the committed record must be readable back intact
+        assert c.read_episode_result(0) == {"episode_id": 7, "survival_s": 3.25,
+                                            "total_reward": -1.5}
+
+    def test_reader_never_pairs_a_new_id_with_an_old_payload(self) -> None:
+        """Hammer the writer/reader pair; the pairing must never tear.
+
+        Guards against a *vacuous* pass: a writer that raised (for example on
+        a tree without the publish helper) used to leave ``stop`` set and an
+        empty mismatch list, so the test "passed" without reading anything.
+        The reader's workload and the writer's health are both asserted.
+        """
+        c = SharedCounters()
+        stop = threading.Event()
+        mismatches: list[str] = []
+        writer_error: list[BaseException] = []
+        reads = [0]
+        # DEEP-FIX to the test itself: with the default 5 ms switch interval
+        # the writer finishes all 4000 publishes inside a single GIL slice, so
+        # the reader never ran and the original assertion passed without
+        # observing a single write.  Force a handoff every few publishes and
+        # shrink the switch interval so the interleaving is real.
+        prev_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+
+        def writer() -> None:
+            try:
+                for i in range(1, 20_001):
+                    # payload and id encode the same value, so any tear shows
+                    c.publish_episode_result(i, float(i), float(i))
+                    if i % 8 == 0:
+                        time.sleep(0)  # yield the GIL to the reader
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                writer_error.append(exc)
+            finally:
+                sys.setswitchinterval(prev_interval)
+                stop.set()
+
+        def reader() -> None:
+            last = 0
+            while not stop.is_set():
+                got = c.read_episode_result(last)
+                if got is None:
+                    continue
+                reads[0] += 1
+                last = int(got["episode_id"])
+                if got["survival_s"] != float(last):
+                    mismatches.append(f"id={last} survival={got['survival_s']}")
+
+        tw = threading.Thread(target=writer)
+        tr = threading.Thread(target=reader)
+        tr.start(); tw.start(); tw.join(30); tr.join(30)
+        assert not tw.is_alive() and not tr.is_alive(), "threads did not finish"
+        assert not writer_error, f"writer thread failed: {writer_error[:1]!r}"
+        assert reads[0] > 100, (
+            f"reader only observed {reads[0]} episodes -- the interleaving "
+            f"this test exists to exercise never happened")
+        assert not mismatches, f"torn episode telemetry: {mismatches[:3]}"
+
+    def test_id_first_order_is_demonstrably_tearable(self) -> None:
+        """Evidence that the ordering above is load-bearing, not decorative.
+
+        Reproducing a race by luck is a bad test (a first attempt here saw
+        zero tears in 115,212 opportunistic reads).  Instead the interleaving
+        is *injected*: the reader is forced to yield immediately after reading
+        the id, and the writer is forced to yield between the id and the
+        payload -- which is exactly the window the ordering fix closes.  In
+        the old id-first order the reader must observe a stale payload.
+        """
+        c = SharedCounters()
+        stop = threading.Event()
+        torn = [0]
+        reads = [0]
+
+        class PreemptAfterRead:
+            """Proxy that yields the GIL right after each .value read."""
+
+            def __init__(self, raw) -> None:
+                self._raw = raw
+
+            @property
+            def value(self):
+                got = self._raw.value
+                for _ in range(4):
+                    time.sleep(0)
+                return got
+
+            @value.setter
+            def value(self, new) -> None:
+                self._raw.value = new
+
+        c.last_episode_done_id = PreemptAfterRead(c.last_episode_done_id)
+
+        def writer() -> None:
+            try:
+                for i in range(1, 20_001):
+                    c.last_episode_done_id.value = i      # OLD order: id first
+                    time.sleep(0)                          # widen the window
+                    c.last_episode_survival_s.value = float(i)
+            except BaseException:
+                raise
+            finally:
+                stop.set()
+
+        def reader() -> None:
+            while not stop.is_set():
+                i = int(c.last_episode_done_id.value)
+                surv = float(c.last_episode_survival_s.value)
+                if i:
+                    reads[0] += 1
+                    if abs(surv - float(i)) > 1e-6:
+                        torn[0] += 1
+
+        tw = threading.Thread(target=writer)
+        tr = threading.Thread(target=reader)
+        tr.start(); tw.start(); tw.join(60); tr.join(60)
+        assert not tw.is_alive() and not tr.is_alive(), "threads did not finish"
+        assert reads[0] > 100, f"reader only saw {reads[0]} writes"
+        assert torn[0] > 0, (
+            f"expected the OLD id-first write order to expose a stale payload "
+            f"in {reads[0]} reads; saw none -- either the ordering is no "
+            f"longer load-bearing or the injected interleaving stopped working")
+
+
+# --------------------------------------------------------------------- #
+# 4. Replay buffer persistence
+# --------------------------------------------------------------------- #
+class TestBufferPersistence:
+    def test_capacity_mismatch_is_a_corrupt_file_error(self, tmp_path) -> None:
+        """A raw numpy broadcast error used to escape instead."""
+        from logging_utils import CorruptFileError
+        from replay_buffer import PrioritizedReplayBuffer
+
+        big = PrioritizedReplayBuffer(PERConfig(capacity=4000), frame_size=84)
+        for i in range(40):
+            big.add_nstep(_nstep(i))
+        path = str(tmp_path / "buffer.pkl")
+        big.save(path)
+        with pytest.raises(CorruptFileError, match="per.capacity"):
+            PrioritizedReplayBuffer.load(path, PERConfig(capacity=500),
+                                         frame_size=84)
+
+    def test_round_trip_preserves_transitions(self, tmp_path) -> None:
+        from replay_buffer import PrioritizedReplayBuffer
+
+        cfg = PERConfig(capacity=300)
+        buf = PrioritizedReplayBuffer(cfg, frame_size=84)
+        for i in range(120):
+            buf.add_nstep(_nstep(i, action=i % 5, reward=0.01 * i))
+        path = str(tmp_path / "buffer.pkl")
+        buf.save(path)
+        restored = PrioritizedReplayBuffer.load(path, cfg, frame_size=84)
+        assert restored.size == buf.size
+        batch = restored.sample(16, 0.4, rng=np.random.default_rng(3))
+        assert batch["obs"].shape == (16, 4, 84, 84)
+        assert np.all(np.isfinite(batch["weights"]))
+
+    def test_sample_never_skews_indices_and_transitions(self) -> None:
+        """Evicted slots must be substituted in BOTH the data and the index."""
+        buf = _filled_buffer(n=200, capacity=160)
+        # Evict a contiguous band of frame slots: transitions whose env-ids
+        # fall in it become invalid, the rest stay sampleable.
+        buf.frames.env_ids[100:130] = -1
+        batch = buf.sample(16, 0.5, rng=np.random.default_rng(4),
+                           max_replace_rounds=0)
+        for j, idx in enumerate(batch["indices"]):
+            t = buf.transitions[int(idx)]
+            assert t is not None, f"sample {j} points at an empty slot"
+            # (a) the index must describe exactly the data that was returned
+            expected = np.stack([buf.frames.frames[s] for s in t.obs_ids])
+            assert np.array_equal(batch["obs"][j], expected), (
+                f"sample {j} carries data that index {idx} does not describe")
+            # (b) and that data must still be the frames the transition names.
+            # The old code happily returned a transition whose frames had been
+            # evicted, training on whatever a later frame had overwritten into
+            # the slot -- contradicting this module's own guarantee that
+            # "stale pixels can never silently train the network".
+            for slot, eid in zip(t.obs_ids, t.obs_env_ids):
+                assert buf.frames.resident(slot, eid), (
+                    f"sample {j} (index {idx}) references evicted frame {eid}")
+
+
+# --------------------------------------------------------------------- #
+# 5. Checkpoint integrity
+# --------------------------------------------------------------------- #
+class TestCheckpointIntegrity:
+    def test_best_metric_does_not_advance_on_a_failed_write(self, tmp_path) -> None:
+        from checkpoint_manager import CheckpointManager
+
+        cm = CheckpointManager(tmp_path, "strict_lite")
+
+        def boom(payload, path):
+            raise OSError("disk full")
+
+        cm._atomic_torch_save = boom
+        assert cm.save_model({"online": {}}, {}, which="best", metric=10.0) is None
+        assert cm.best_metric is None, (
+            "the gate advanced even though no file was written")
+        # and a genuinely better metric later still gets through
+        cm._atomic_torch_save = CheckpointManager._atomic_torch_save.__get__(cm)
+        assert cm.save_model({"online": {}}, {}, which="best", metric=5.0) is not None
+        assert cm.best_metric == pytest.approx(5.0)
+
+    def test_nonfinite_metric_is_refused(self, tmp_path) -> None:
+        from checkpoint_manager import CheckpointManager
+
+        cm = CheckpointManager(tmp_path, "strict_lite")
+        assert cm.save_model({}, {}, which="best", metric=float("nan")) is None
+        assert cm.save_model({}, {}, which="best", metric=None) is None
+
+    def test_corrupt_checkpoint_is_quarantined_on_load(self, tmp_path) -> None:
+        """The sidecar used to be written but never read back."""
+        import torch
+
+        from checkpoint_manager import CheckpointManager
+
+        cm = CheckpointManager(tmp_path, "strict_lite")
+        cm.save_model({"online": {}}, {}, which="latest")
+        path = cm.latest_path
+        assert path.exists()
+        blob = bytearray(path.read_bytes())
+        blob[len(blob) // 2] ^= 0xFF  # flip a byte in the payload
+        path.write_bytes(bytes(blob))
+        assert cm.load_model("latest") is None
+        assert not path.exists()
+        assert path.with_name(path.name + ".corrupt").exists()
+
+    def test_rng_state_round_trips_the_sampling_generator(self) -> None:
+        """capture_rng_states used to snapshot a throwaway generator."""
+        from checkpoint_manager import capture_rng_states, restore_rng_states
+
+        rng = np.random.default_rng(123)
+        _ = rng.random(5)
+        snap = capture_rng_states(seed=7, generator=rng)
+        expected = rng.random(4)
+        other = np.random.default_rng(999)
+        assert restore_rng_states(snap, generator=other) is True
+        assert np.allclose(other.random(4), expected)
+
+
+# --------------------------------------------------------------------- #
+# 6. Demonstration recorder
+# --------------------------------------------------------------------- #
+class TestDemoRecorder:
+    def test_listener_is_rebuilt_after_stop(self) -> None:
+        """Episode 2+ used to record NOOP only because _listener stayed None."""
+        from demonstration_recorder import KeyboardTap
+
+        class FakeListener:
+            def __init__(self):
+                self.started = 0
+                self.stopped = 0
+
+            def start(self):
+                self.started += 1
+
+            def stop(self):
+                self.stopped += 1
+
+        tap = KeyboardTap(lambda k: None, lambda k: None)
+        tap._keyboard = type("K", (), {"Listener": staticmethod(
+            lambda on_press, on_release: FakeListener())})
+        assert tap.start() is True
+        tap.stop()
+        assert tap._listener is None
+        assert tap.start() is True, "a stopped listener was never rebuilt"
+        assert tap._listener is not None
+
+    def test_pump_records_frames_from_the_reader(self, tmp_path) -> None:
+        """read_frame was stored and never called; nothing was ever recorded."""
+        from demonstration_recorder import DemoRecorder
+        from ipc import Frame
+
+        frames = [Frame(frame_id=i + 1, ts=i / 30.0,
+                        image=np.full((800, 480, 3), (40, 44, 60), np.uint8))
+                  for i in range(5)]
+        it = iter(frames)
+        rec = DemoRecorder(BotConfig(), tmp_path / "demos",
+                           lambda: next(it, None))
+        rec.start()
+        assert rec.pump(max_frames=5) == 5
+        path = rec.stop()
+        assert path is not None
+        assert np.load(path)["frames"].shape[0] == 5
+
+    def test_same_second_episodes_do_not_overwrite(self, tmp_path) -> None:
+        from demonstration_recorder import DemoRecorder
+        from ipc import Frame
+
+        cfg = BotConfig()
+        cfg.region.width, cfg.region.height = 480, 800
+        paths = []
+        for _ in range(3):
+            rec = DemoRecorder(cfg, tmp_path / "demos", lambda: None)
+            rec.start()
+            for i in range(3):
+                rec.tick(Frame(frame_id=i + 1, ts=i / 30.0,
+                               image=np.full((800, 480, 3), 50, np.uint8)))
+            paths.append(rec.stop())
+        assert len(set(paths)) == 3, f"episodes collided: {paths}"
+        assert all(Path(p).exists() for p in paths)
+
+
+# --------------------------------------------------------------------- #
+# 7. Queue poisoning / shutdown
+# --------------------------------------------------------------------- #
+class TestGuardedDrain:
+    def test_poisoned_queue_is_skipped(self) -> None:
+        from logging_utils import drain, quarantine_queue
+
+        class Hanging:
+            name = "hanging"
+
+            def get_nowait(self):
+                time.sleep(30)
+
+        q = Hanging()
+        t0 = time.monotonic()
+        assert drain(q, limit=4, timeout_s=0.2) == []
+        assert time.monotonic() - t0 < 5.0
+        # the second call must not pay the timeout again
+        t0 = time.monotonic()
+        assert drain(q, limit=4, timeout_s=0.2) == []
+        assert time.monotonic() - t0 < 0.1, "quarantine did not take effect"
+
+    def test_inline_drain_is_unchanged(self) -> None:
+        import queue as queue_mod
+
+        from logging_utils import drain
+
+        q = queue_mod.Queue()
+        for i in range(5):
+            q.put(i)
+        assert drain(q, limit=3) == [0, 1, 2]
+        assert drain(q, limit=10, timeout_s=0.5) == [3, 4]
+        assert drain(q, limit=10, timeout_s=0.5) == []
+
+
+# --------------------------------------------------------------------- #
+# 8. Reward / environment episode boundaries
+# --------------------------------------------------------------------- #
+class TestEpisodeBoundaries:
+    def test_respawn_restores_the_death_penalty(self) -> None:
+        """The -10 penalty used to fire once per process, not per episode."""
+        from config import BotConfig
+        from environment import GameEnvironment
+
+        env = GameEnvironment(BotConfig())
+        env.reset()
+        env.reward_calc.begin_episode(0.0)
+        assert env.reward_calc.death_reward() == pytest.approx(-10.0)
+        env.respawn()
+        assert env.reward_calc.death_reward() == pytest.approx(-10.0), (
+            "the second episode got no death penalty")
+
+    def test_flush_transitions_survives_an_unseeded_stack(self) -> None:
+        """Shutdown before the first valid frame must not raise."""
+        from config import BotConfig
+        from environment import BotActor
+
+        cfg = BotConfig()
+        cfg.capture.source = "fake"
+        cfg.region.width, cfg.region.height = 480, 800
+        cfg.death.anchor_fx, cfg.death.anchor_fy = 30 / 480, 30 / 800
+        cfg.death.anchor_baseline_rgb = (206, 66, 66)
+        cfg.input.respawn_fx, cfg.input.respawn_fy = 0.5, 0.6
+
+        class _Q:
+            def put_nowait(self, item):
+                raise AssertionError("nothing should be shipped")
+
+        from ipc import SharedFrameRing, SharedWeights
+        from models import weight_size_for_profile
+
+        actor = BotActor(
+            cfg, SharedFrameRing(2, 800, 480, 3),
+            {k: threading.Event() for k in
+             ("stop", "emergency", "pause", "pause_learning", "death")},
+            _Q(), _Q(), SharedWeights(weight_size_for_profile("quality_cpu")),
+            SharedCounters(), input_backend="dry_run")
+        actor.nstep.push(np.zeros((4, 84, 84), np.uint8), (1, 2, 3, 4), 0, 0.1, False)
+        assert actor.nstep.pending == 1
+        actor._flush_transitions(final=True)   # must not raise
+        assert actor.nstep.pending == 0
+
+
+# --------------------------------------------------------------------- #
+# 9. Evaluation honesty
+# --------------------------------------------------------------------- #
+class TestEvaluation:
+    def test_evaluation_tool_derives_a_per_episode_seed(self) -> None:
+        """The runner must not reuse cfg.seed for every episode."""
+        import inspect
+
+        import evaluation_tool
+
+        src = inspect.getsource(evaluation_tool.run_headless_evaluation)
+        assert "ep_seed" in src and "SyntheticGame(seed=ep_seed" in src, (
+            "run_headless_evaluation still builds every episode from cfg.seed")
+
+    def test_episodes_are_not_identical(self) -> None:
+        """Same cfg.seed everywhere made all N eval episodes bit-identical."""
+        from config import BotConfig
+        from environment import GameEnvironment, SyntheticGame
+
+        cfg = BotConfig()
+        a = GameEnvironment(cfg, game=SyntheticGame(seed=cfg.seed * 1_000_003 + 0))
+        b = GameEnvironment(cfg, game=SyntheticGame(seed=cfg.seed * 1_000_003 + 1))
+        a.reset(); b.reset()
+        fa = [a.step(0)[0].sum() for _ in range(15)]
+        fb = [b.step(0)[0].sum() for _ in range(15)]
+        assert fa != fb, "two evaluation episodes are identical"
+
+    def test_report_load_tolerates_unknown_fields(self, tmp_path) -> None:
+        from evaluation import EvaluationReport
+
+        path = tmp_path / "old.json"
+        path.write_text(json.dumps({"records": [
+            {"episode_id": 1, "survival_s": 3.0, "total_reward": 1.0,
+             "steps": 10, "env_frames": 10, "fps": 30.0,
+             "action_latency_p95_ms": 5.0, "inference_p95_ms": 1.0,
+             "score": 0.0, "kind": "eval", "ts": 0.0,
+             "a_field_from_the_future": {"nested": True}},
+            "not even a dict",
+        ]}), encoding="utf-8")
+        rep = EvaluationReport.load(path)
+        assert len(rep.records) == 1
+        assert rep.records[0].survival_s == pytest.approx(3.0)
+
+    def test_failure_modes_can_be_scoped(self) -> None:
+        from evaluation import EpisodeRecord, EvaluationReport
+
+        rep = EvaluationReport()
+        for kind, surv in (("train", 1.0), ("eval", 60.0),
+                           ("human_baseline", 2.0)):
+            rep.add(EpisodeRecord(episode_id=1, survival_s=surv, total_reward=0.0,
+                                  steps=1, env_frames=1, fps=30.0,
+                                  action_latency_p95_ms=1.0,
+                                  inference_p95_ms=1.0, kind=kind))
+        assert rep.failure_modes(kinds=("eval",)) == {}
+        assert rep.failure_modes()["early_death_lt_5s"] == 2
+
+
+# --------------------------------------------------------------------- #
+# 10. Dead configuration knobs are now enforced
+# --------------------------------------------------------------------- #
+class TestConfigKnobsAreUsed:
+    def test_grab_timeout_is_read_by_the_capture_worker(self) -> None:
+        import inspect
+
+        import capture_worker
+
+        src = inspect.getsource(capture_worker.capture_main)
+        assert "grab_timeout_s" in src
+
+    def test_max_working_set_is_read_by_the_actor(self) -> None:
+        import inspect
+
+        import environment
+
+        src = inspect.getsource(environment.BotActor._maybe_perf_check)
+        assert "max_working_set_gb" in src
+
+
+# --------------------------------------------------------------------- #
+# 11. Dataset isolation
+# --------------------------------------------------------------------- #
+class TestDatasetIsolation:
+    def test_one_bad_file_does_not_abort_the_load(self, tmp_path) -> None:
+        import dataset
+
+        np.savez_compressed(
+            tmp_path / "good.npz",
+            frames=np.zeros((5, 84, 84), np.uint8),
+            actions=np.zeros(5, np.int64),
+            timestamps=np.arange(5) / 30.0,
+            done=np.array([0, 0, 0, 0, 1], bool))
+        np.savez_compressed(tmp_path / "broken.npz",
+                            frames=np.zeros((5, 84, 84), np.uint8))
+        (tmp_path / "junk.npz").write_bytes(b"not an npz")
+        eps, reps = dataset.validate_directory(tmp_path)
+        assert len(eps) == 1
+        assert sum(1 for r in reps if r.ok) == 1
+        assert sum(1 for r in reps if not r.ok) == 2
+        # zip(episodes, reports) must stay aligned for Learner.pretrain
+        assert all(e.path == r.path for e, r in zip(eps, reps))
+
+
+# --------------------------------------------------------------------- #
+# 12. Input normalisation must not alias the caller's buffer
+# --------------------------------------------------------------------- #
+class TestNoAliasing:
+    def test_float32_input_is_not_mutated_in_place(self) -> None:
+        from agent import _to_unit_float
+
+        arr = np.full((4, 84, 84), 255.0, dtype=np.float32)
+        out = _to_unit_float(arr)
+        assert float(arr.mean()) == pytest.approx(255.0), (
+            "the caller's array was divided by 255 in place")
+        assert float(out.mean()) == pytest.approx(1.0)
+
+    def test_uint8_input_still_normalises(self) -> None:
+        from agent import _to_unit_float
+
+        arr = np.full((4, 84, 84), 255, dtype=np.uint8)
+        assert float(_to_unit_float(arr).mean()) == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------- #
+# 13. Respawn recovery beats the deadline
+# --------------------------------------------------------------------- #
+class TestRespawnOrdering:
+    def test_recovery_at_the_deadline_is_not_reported_as_failure(self) -> None:
+        from config import DeathConfig
+        from death_detector import DeathState, RespawnController
+
+        cfg = DeathConfig(respawn_timeout_s=1.0, stable_frames=2,
+                          respawn_interval_s=0.2)
+        ctl = RespawnController(lambda t: True, cfg, now=lambda: 0.0)
+        ctl.start()
+        ctl.update(DeathState.DEAD_CONFIRMED, 0.0)
+        ctl.update(DeathState.ALIVE, 2.0)          # recovered, past deadline
+        status = ctl.update(DeathState.ALIVE, 2.1)
+        assert status.action == "RECOVERED", (
+            f"a successful respawn was reported as {status.action}")
+
+    def test_timeout_still_fails_when_never_recovered(self) -> None:
+        from config import DeathConfig
+        from death_detector import DeathState, RespawnController
+
+        cfg = DeathConfig(respawn_timeout_s=1.0, stable_frames=2,
+                          respawn_interval_s=0.2)
+        ctl = RespawnController(lambda t: True, cfg, now=lambda: 0.0)
+        ctl.start()
+        last = None
+        for i in range(40):
+            last = ctl.update(DeathState.DEAD_CONFIRMED, i * 0.1)
+            if last.action == "FAILED":
+                break
+        assert last is not None and last.action == "FAILED"
+        assert ctl.clicks <= 12
