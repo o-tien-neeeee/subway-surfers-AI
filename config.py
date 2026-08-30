@@ -22,7 +22,7 @@ import dataclasses
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 CONFIG_VERSION = "1.0"
 
@@ -407,7 +407,7 @@ class BotConfig:
         Path(path).write_text(self.to_json(), encoding="utf-8")
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "BotConfig":
+    def from_dict(cls, data: dict[str, Any]) -> BotConfig:
         cfg = cls()
         for section in (
             "capture", "perception", "horizon", "death", "region", "input",
@@ -428,7 +428,7 @@ class BotConfig:
         return cfg
 
     @classmethod
-    def load(cls, path: str | Path) -> "BotConfig":
+    def load(cls, path: str | Path) -> BotConfig:
         p = Path(path)
         if not p.exists():
             raise ConfigError(f"config file not found: {p}")
@@ -438,7 +438,7 @@ class BotConfig:
             raise ConfigError(f"config file {p} is not valid JSON: {exc}") from exc
         return cls.from_dict(data)
 
-    def profile_downgrade(self) -> Optional[str]:
+    def profile_downgrade(self) -> str | None:
         """Return the next lighter profile, or None if already lightest."""
         try:
             idx = PROFILE_ORDER.index(self.rl.profile)

@@ -23,17 +23,22 @@ from __future__ import annotations
 import random
 import time
 from collections import deque
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
 from agent import DoubleDQNAgent
 from checkpoint_manager import CheckpointManager
-from config import BotConfig, PROFILE_ORDER
+from config import BotConfig
 from ipc import SharedWeights
-from logging_utils import drain, format_exception, get_logger, put_bounded, setup_logging
-from models import PROFILES, weight_size_for_profile
+from logging_utils import (
+    drain,
+    format_exception,
+    get_logger,
+    put_bounded,
+    setup_logging,
+)
+from models import PROFILES
 from replay_buffer import NStepTransition, PrioritizedReplayBuffer
 
 LOGGER = get_logger("learner")
@@ -71,6 +76,7 @@ class Learner:
         self._publish_every_updates = 20
         self._last_buffer_save_update = 0
         self.bc_history: list[dict[str, Any]] = []
+        self.events_paused: bool = False
         # -- online best-model tracking (requirement §12) ---------------- #
         # The actor reports each finished episode through SharedCounters;
         # the learner gates best_model.pth on the ROLLING MEAN of the
@@ -80,12 +86,12 @@ class Learner:
         )
         self._last_seen_episode_done_id = 0
         self.best_metric_name = cfg.rl.best_metric
-        self.best_rolling: Optional[float] = None
+        self.best_rolling: float | None = None
         self._load_checkpoint()
 
     # ------------------------------------------------------------------ #
     def _load_or_fresh_buffer(self) -> PrioritizedReplayBuffer:
-        fresh = lambda: PrioritizedReplayBuffer(  # noqa: E731
+        fresh = lambda: PrioritizedReplayBuffer(
             self.cfg.per, frame_size=self.cfg.perception.ground_size,
             gamma=self.cfg.rl.gamma,
         )
@@ -118,14 +124,14 @@ class Learner:
                     self.best_rolling = float(bm)
                 LOGGER.info("checkpoint restored (updates=%d, best=%s)",
                             self.update_step, self.ckpt.best_metric)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 LOGGER.error("checkpoint restore failed, fresh start:\n%s",
                              format_exception(exc))
         else:
             LOGGER.info("no checkpoint for profile %s; fresh networks", self.profile)
 
     # ------------------------------------------------------------------ #
-    def _poll_episode_metric(self) -> Optional[float]:
+    def _poll_episode_metric(self) -> float | None:
         """Consume actor-reported episode ends; maybe update best_model.pth.
 
         Metric semantics (explicit, not "steps"-ambiguous): the metric is the
@@ -202,9 +208,7 @@ class Learner:
         min_gap = 1.0 / max(0.1, self.cfg.rl.max_updates_per_second)
         return (now - self._last_update_t) >= min_gap
 
-    events_paused: bool = False
-
-    def train_one(self, now: float) -> Optional[dict[str, float]]:
+    def train_one(self, now: float) -> dict[str, float] | None:
         beta = self.buffer.beta_for_step(self.update_step)
         t0 = time.perf_counter()
         try:
@@ -215,9 +219,7 @@ class Learner:
         t1 = time.perf_counter()
         metrics = self.agent.train_step(batch)
         update_ms = (time.perf_counter() - t1) * 1000.0
-        self.buffer.update_priorities(batch["indices"],
-                                      metrics["td_error_abs_mean"]
-                                      * np.ones(len(batch["indices"])))
+        self.buffer.update_priorities(batch["indices"], metrics["td_error_abs"])
         self.update_step += 1
         self.counters.learner_update_step.value = self.update_step
         self.counters.beta.value = beta
@@ -255,10 +257,11 @@ class Learner:
             "best_metric_name": self.cfg.rl.best_metric,
         }
         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
-        if self.update_step - self._last_buffer_save_update >= \
-                self.cfg.per.save_every_updates:
-            if self.ckpt.buffer_save(self.buffer):
-                self._last_buffer_save_update = self.update_step
+        if (
+            self.update_step - self._last_buffer_save_update >= self.cfg.per.save_every_updates
+            and self.ckpt.buffer_save(self.buffer)
+        ):
+            self._last_buffer_save_update = self.update_step
 
     # ------------------------------------------------------------------ #
     # Behaviour cloning (Phase 1)
@@ -359,7 +362,7 @@ def learner_main(
     try:
         learner = Learner(cfg, shared_weights, counters, metrics_q, checkpoints_dir)
         learner._publish(force=True)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
         put_bounded(metrics_q, {"type": "error", "src": "learner",
                                 "error": f"{type(exc).__name__}: {exc}",
                                 "tb": format_exception(exc)})
@@ -420,14 +423,14 @@ def learner_main(
                     },
                 })
                 transitions_since_report = 0
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
         put_bounded(metrics_q, {"type": "error", "src": "learner",
                                 "error": f"{type(exc).__name__}: {exc}",
                                 "tb": format_exception(exc)})
     finally:
         try:
             learner.shutdown_save()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.error("shutdown save failed:\n%s", format_exception(exc))
         LOGGER.info("learner stop")
 

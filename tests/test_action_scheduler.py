@@ -31,7 +31,7 @@ def make_scheduler(**kw) -> tuple[ActionScheduler, FakeClock]:
 
 class TestCadence:
     def test_normal_cadence_low_load(self) -> None:
-        s, clock = make_scheduler()
+        s, _clock = make_scheduler()
         s.set_load(0.1)  # low load -> min frames (2)
         gates = [s.on_frame(danger=False) for _ in range(7)]
         assert gates == [False, True, False, True, False, True, False]
@@ -55,7 +55,7 @@ class TestCadence:
 
 class TestBuffering:
     def test_submit_pop_executes(self) -> None:
-        s, clock = make_scheduler()
+        s, _clock = make_scheduler()
         s.submit(3)  # JUMP
         planned = s.pop_executable()
         assert planned is not None and planned.action == 3
@@ -118,7 +118,7 @@ class TestBuffering:
         assert s.submit(-1) is False
 
     def test_reset_episode(self) -> None:
-        s, clock = make_scheduler()
+        s, _clock = make_scheduler()
         s.submit(1)
         s.pop_executable()
         s.reset_episode()

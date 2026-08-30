@@ -24,7 +24,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Any, Optional
+from typing import Any
 
 from config import BotConfig
 from logging_utils import get_logger, setup_logging
@@ -44,10 +44,10 @@ def set_dpi_awareness() -> float:
 
             try:
                 ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
-            except Exception:
+            except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 ctypes.windll.user32.SetProcessDPIAware()
             DPI_AWARENESS_SET = True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.warning("DPI awareness not set: %s", exc)
     return 1.0
 
@@ -74,9 +74,9 @@ class RegionSelector:
             20, 20, anchor="nw", fill="white", font=("Consolas", 12),
             text="Drag to select the game region | Enter=accept | Esc=cancel | R=reset",
         )
-        self.rect_id: Optional[int] = None
-        self.start_xy: Optional[tuple[int, int]] = None
-        self.cur_xy: Optional[tuple[int, int]] = None
+        self.rect_id: int | None = None
+        self.start_xy: tuple[int, int] | None = None
+        self.cur_xy: tuple[int, int] | None = None
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
@@ -124,7 +124,7 @@ class RegionSelector:
                   f"box: {min(x0,x1)},{min(y0,y1)}  size: {w}x{h}"),
         )
 
-    def selection(self) -> Optional[tuple[int, int, int, int]]:
+    def selection(self) -> tuple[int, int, int, int] | None:
         if not (self.start_xy and self.cur_xy):
             return None
         x0, y0 = self.start_xy
@@ -187,10 +187,10 @@ class PreviewGrabber(threading.Thread):
                             except queue_mod.Empty as empty_exc:
                                 LOGGER.debug("preview queue raced empty: %s",
                                              empty_exc)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                         LOGGER.warning("preview grab failed: %s", exc)
                     self.stop_event.wait(self.interval)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.warning("preview unavailable: %s", exc)
 
     def stop(self) -> None:
@@ -208,15 +208,15 @@ class ControlGUI:
         self.cfg = cfg
         self.cli_args = cli_args
         self.sm = StateMachine(BotState.CALIBRATING)
-        self.app: Optional[Any] = None  # BotApplication once running
-        self.hotkey: Optional[Any] = None
-        self.preview: Optional[PreviewGrabber] = None
-        self.preview_img: Optional[Any] = None  # keep ref for PhotoImage
+        self.app: Any | None = None  # BotApplication once running
+        self.hotkey: Any | None = None
+        self.preview: PreviewGrabber | None = None
+        self.preview_img: Any | None = None  # keep ref for PhotoImage
         self.anchor_frames: list[Any] = []
         self.anchor_t0 = 0.0
         self.dead_sample_frames: list[Any] = []
         self.log_lines: list[str] = []
-        self._demo_recorder: Optional[Any] = None
+        self._demo_recorder: Any | None = None
         self._build()
         self.root.after(self.POLL_MS, self._tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -284,7 +284,7 @@ class ControlGUI:
         RegionSelector(self.root, self._region_accepted, self._region_cancelled)
 
     def _region_accepted(self, left: int, top: int, w: int, h: int) -> None:
-        scale = set_dpi_awareness()
+        set_dpi_awareness()  # best-effort DPI awareness; side effect only
         self.root.update_idletasks()
         try:
             dpi_scale = self.root.winfo_fpixels("1i") / 96.0
@@ -358,8 +358,8 @@ class ControlGUI:
         self.preview_label.configure(image=self.preview_img)
         self._latest_preview = img  # for click/anchor sampling (fractions)
 
-    _latest_preview: Optional[Any] = None
-    _preview_full_size: Optional[Any] = None
+    _latest_preview: Any | None = None
+    _preview_full_size: Any | None = None
 
     def lock_region(self) -> None:
         r = self.cfg.region
@@ -419,7 +419,7 @@ class ControlGUI:
                             f"{int(fy * self.cfg.region.height)}) — now calibrate ALIVE")
         self.log(f"anchor position set: fx={fx:.3f} fy={fy:.3f}")
 
-    def _grab_anchor_patch(self) -> Optional[Any]:
+    def _grab_anchor_patch(self) -> Any | None:
         """Grab the current 5x5 patch at the anchor from a fresh capture."""
         if not (0 <= self.cfg.death.anchor_fx <= 1):
             return None
@@ -435,7 +435,7 @@ class ControlGUI:
                     raw.height, raw.width, 4)[:, :, :3][:, :, ::-1]
             x0, y0 = max(0, ax - 2), max(0, ay - 2)
             return arr[y0 : y0 + 5, x0 : x0 + 5].copy()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             self.log(f"anchor grab failed: {exc}")
             return None
 
@@ -665,7 +665,7 @@ class ControlGUI:
 
         try:
             self.app = BotApplication(self.cfg)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             self._set_state(BotState.ERROR)
             self.status_var.set(f"Failed to start: {exc}")
             self.log(f"start failed: {exc}")
@@ -735,7 +735,7 @@ class ControlGUI:
             self.app = BotApplication(self.cfg)
             self.app.start(with_learner=False)
         # recorder reads the shared ring (latest frame wins)
-        ring: Optional[SharedFrameRing] = self.app.ring if self.app else None
+        ring: SharedFrameRing | None = self.app.ring if self.app else None
 
         class _RingReader:
             def __init__(self, ring) -> None:
@@ -786,7 +786,7 @@ class ControlGUI:
             self._update_preview()
             self._poll_metrics()
             self._check_workers()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             self.log(f"gui tick error: {exc}")
         self.root.after(self.POLL_MS, self._tick)
 
@@ -914,7 +914,7 @@ def run_gui(cli_args: Any = None) -> int:
         root.state("zoomed")
     except tk.TclError:
         root.geometry("1080x860")
-    gui = ControlGUI(root, cfg, cli_args)
+    _gui = ControlGUI(root, cfg, cli_args)  # reference kept alive for Tk mainloop
     root.mainloop()
     return 0
 

@@ -139,10 +139,9 @@ def test_no_actions_after_death(tmp_path) -> None:
 def test_synthetic_game_death_requires_respawn_click(tmp_path) -> None:
     """The synthetic game stays dead until a respawn arrives (like the real
     game-over screen), so the respawn machinery is genuinely exercised."""
-    from environment import SyntheticGame
-    from death_detector import ColorAnchorDeathDetector, DeathState
     from config import DeathConfig
-    from death_detector import synthetic_patch
+    from death_detector import ColorAnchorDeathDetector, DeathState
+    from environment import SyntheticGame
 
     game = SyntheticGame(seed=1)
     cfg = DeathConfig(threshold=25.0, confirm_frames=2, stable_frames=2,
@@ -190,8 +189,9 @@ def test_synthetic_game_death_requires_respawn_click(tmp_path) -> None:
 @pytest.mark.timeout(60, method="thread")
 def test_game_environment_reset_step_cycle(tmp_path) -> None:
     """Synchronous env sanity: rewards finite, death ends episode, respawn works."""
-    from environment import GameEnvironment
     import numpy as np
+
+    from environment import GameEnvironment
 
     cfg = pipeline_cfg(tmp_path)
     env = GameEnvironment(cfg)
@@ -200,7 +200,7 @@ def test_game_environment_reset_step_cycle(tmp_path) -> None:
     total = 0.0
     for step in range(30 * 90):
         action = step % 5
-        obs, r, done, info = env.step(action)
+        obs, r, done, _info = env.step(action)
         assert np.isfinite(r)
         assert obs.shape == (4, 84, 84)
         total += r

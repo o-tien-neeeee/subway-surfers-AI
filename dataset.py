@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional
 
 import numpy as np
 
@@ -39,9 +38,9 @@ class Episode:
     actions: np.ndarray     # [N]
     timestamps: np.ndarray  # [N]
     done: np.ndarray        # [N]
-    score: Optional[np.ndarray] = None
-    death_state: Optional[np.ndarray] = None
-    confidence: Optional[np.ndarray] = None
+    score: np.ndarray | None = None
+    death_state: np.ndarray | None = None
+    confidence: np.ndarray | None = None
     meta: dict = field(default_factory=dict)
 
     def __len__(self) -> int:
@@ -55,7 +54,7 @@ class Episode:
         return (len(self) - 1) / span if span > 0 else 0.0
 
     def action_counts(self) -> dict[int, int]:
-        counts = {a: 0 for a in range(5)}
+        counts = dict.fromkeys(range(5), 0)
         for a in self.actions:
             a = int(a)
             if a in counts:
@@ -194,7 +193,7 @@ class DemonstrationDataset:
         return len(self._index)
 
     def class_counts(self) -> dict[int, int]:
-        counts = {a: 0 for a in range(5)}
+        counts = dict.fromkeys(range(5), 0)
         for ei, si in self._index:
             a = int(self._episodes[ei].actions[si])
             if a in counts:
@@ -228,8 +227,8 @@ class DemonstrationDataset:
         rng = np.random.default_rng(seed)
         n_eps = len(self._episodes)
         order = rng.permutation(n_eps)
-        n_val = max(1, int(round(n_eps * val_fraction))) if n_eps > 1 else 0
-        val_eps = set(int(e) for e in order[:n_val])
+        n_val = max(1, round(n_eps * val_fraction)) if n_eps > 1 else 0
+        val_eps = {int(e) for e in order[:n_val]}
         train_idx, val_idx = [], []
         for pos, (ei, _si) in enumerate(self._index):
             (val_idx if int(ei) in val_eps else train_idx).append(pos)

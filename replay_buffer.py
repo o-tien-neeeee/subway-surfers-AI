@@ -27,8 +27,9 @@ Other guarantees:
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any
 
 import numpy as np
 
@@ -170,7 +171,7 @@ class Transition:
         if not np.isfinite(self.reward):
             raise ValueError(f"non-finite reward {self.reward}")
         if not isinstance(self.done, bool):
-            raise ValueError("done must be bool")
+            raise TypeError("done must be bool")
         for ids in (self.obs_ids, self.next_ids):
             if len(ids) != 4:
                 raise ValueError("stacks must reference exactly 4 frames")
@@ -194,10 +195,20 @@ class NStepTransition:
 class NStepBuilder:
     """Collapses an (obs,action,reward) stream into n-step transitions.
 
-    Emits step t only once obs_{t+span} is observable, or at episode end —
-    so rewards are discounted correctly and nothing crosses an episode
-    boundary.  Only the LAST step of an episode is marked done=True.
+    Semantics (standard DQN n-step returns truncated at episode boundaries):
+
+    * For a transition at time t, emit it only when we have n more rewards
+      after it (or the episode ended earlier).
+    * The n-step reward is G_t^{(n)} = r_t + γ r_{t+1} + ... + γ^{n-1} r_{t+n-1}.
+    * The bootstrap target is γ^n * max_a Q(s_{t+n}, a) when s_{t+n} is
+      non-terminal, or 0 when the episode ended within the n-step window
+      (``done=True`` on the transition).
+    * When the episode ends mid-window, the buffer is drained using
+      progressively smaller spans; the step whose ``next_obs`` lands on
+      the episode-terminal state carries ``done=True``.
     """
+
+    _SENTINEL_ABSORB = object()  # marks the zero-reward absorbing state
 
     def __init__(self, n: int, gamma: float) -> None:
         self.n = max(1, int(n))
@@ -207,47 +218,117 @@ class NStepBuilder:
     def clear(self) -> None:
         self._buf: list[dict[str, Any]] = []
 
+    def push_absorbing(self) -> list[NStepTransition]:
+        """Append the absorbing state (zero reward, no frame) and drain.
+
+        Caller must call this after a ``done=True`` transition to ensure no
+        transition bootstraps across an episode boundary.
+        """
+        self._buf.append({
+            "stack": self._SENTINEL_ABSORB,
+            "ids": (),
+            "a": 0,
+            "r": 0.0,
+            "absorb": True,
+        })
+        return self._drain_terminal()
+
     def push(self, stack: np.ndarray, env_ids: tuple[int, ...], action: int,
              reward: float, done: bool) -> list[NStepTransition]:
-        self._buf.append(
-            {"stack": stack, "ids": tuple(env_ids), "a": int(action),
-             "r": float(reward), "done": bool(done)}
-        )
+        """Append one environment step.
+
+        ``done=True`` marks the step that *caused* termination (death).
+        After pushing a done=True step the caller MUST call
+        ``push_absorbing()`` on the next tick to finish the flush.  However,
+        to make common single-call usage convenient we also auto-append the
+        absorbing sentinel when ``done=True`` so caller's single push drains
+        the window in one go.
+        """
+        self._buf.append({
+            "stack": stack,
+            "ids": tuple(env_ids),
+            "a": int(action),
+            "r": float(reward),
+            "absorb": False,
+        })
         out: list[NStepTransition] = []
-        # Non-terminal emission: we need n entries plus the obs after them.
+        # Normal n-step emission: buffer has head + (n-1) following rewards +
+        # next state (at index n).  That's n+1 entries total.
         while len(self._buf) > self.n:
-            out.append(self._emit(span=self.n, terminal=False))
-        if self._buf and self._buf[-1]["done"]:
-            while self._buf:
-                span = len(self._buf) - 1
-                out.append(self._emit(span=span, terminal=(span == 0)))
+            if self._buf[self.n]["stack"] is self._SENTINEL_ABSORB:
+                break
+            out.append(self._emit(self.n - 1))
+        if done:
+            # Append absorbing state (zero reward, no frame) so the drain
+            # sees a hard episode boundary after the last real step.
+            self._buf.append({
+                "stack": self._SENTINEL_ABSORB, "ids": (), "a": 0,
+                "r": 0.0, "absorb": True,
+            })
+            out.extend(self._drain_terminal())
         return out
 
-    def _emit(self, span: int, terminal: bool) -> NStepTransition:
+    def _drain_terminal(self) -> list[NStepTransition]:
+        out: list[NStepTransition] = []
+        # Emit every real entry still in the buffer.  Because we drain
+        # from an episode boundary, all these transitions have done=True.
+        # Reward span = number of FOLLOWING rewards after the head up to
+        # death (or n, whichever is smaller); the absorbing state gives
+        # γ^n = 0 so bootstrap is ignored.  When death is at head itself
+        # there are zero following rewards -> span=0.
+        while any(b["stack"] is not self._SENTINEL_ABSORB for b in self._buf):
+            s_idx = next(i for i, b in enumerate(self._buf)
+                         if b["stack"] is self._SENTINEL_ABSORB)
+            # following real rewards count = s_idx - 1 (excluding head)
+            following = s_idx - 1
+            span = min(following, self.n)
+            out.append(self._emit(span))
+        # Drop the sentinel.
+        self._buf = [b for b in self._buf if b["stack"] is not self._SENTINEL_ABSORB]
+        return out
+
+    def _emit(self, span: int) -> NStepTransition:
+        """Emit the head transition using ``span`` FOLLOWING rewards.
+
+        ``span`` is the number of rewards after the head to accumulate.
+        The bootstrap state is at index (span + 1) from head, unless we
+        reach the absorbing sentinel earlier (in which case is_done=True).
+        When called from the normal n-step path, span == n and we
+        bootstrap from _buf[n] (non-terminal) as usual.
+        """
         head = self._buf[0]
         r = 0.0
-        for i in range(span):
+        # Rewards: head.r * γ^0 + buf[1].r * γ^1 + ... + buf[span].r * γ^{span}
+        for i in range(span + 1):
             r += (self.gamma ** i) * self._buf[i]["r"]
-        if terminal:
-            r += (self.gamma ** span) * self._buf[span]["r"] if span < len(self._buf) else 0.0
-        nxt = self._buf[span]
+        nxt_idx = span + 1
+        nxt = self._buf[nxt_idx]
+        is_done = nxt["stack"] is self._SENTINEL_ABSORB
+        if is_done:
+            next_stack = head["stack"]  # unused; mask with done=True
+            next_ids = head["ids"]
+        else:
+            next_stack = nxt["stack"]
+            next_ids = nxt["ids"]
+        # Discount applied to Q(s_{t+span+1}, ·): γ^{span+1}; zero on terminal.
+        gamma_pow = 0.0 if is_done else (self.gamma ** (span + 1))
         tr = NStepTransition(
             obs=head["stack"],
-            next_obs=nxt["stack"],
+            next_obs=next_stack,
             action=head["a"],
-            reward=float(r) if not terminal else float(r),
-            done=bool(terminal),
-            span=span if not terminal else span + 1,
-            gamma_pow=self.gamma ** (span if not terminal else span + 1),
+            reward=float(r),
+            done=is_done,
+            span=span + 1,
+            gamma_pow=gamma_pow,
             obs_env_ids=tuple(head["ids"]),
-            next_env_ids=tuple(nxt["ids"]),
+            next_env_ids=tuple(next_ids),
         )
         self._buf.pop(0)
         return tr
 
     @property
     def pending(self) -> int:
-        return len(self._buf)
+        return sum(1 for b in self._buf if b["stack"] is not self._SENTINEL_ABSORB)
 
 
 class PrioritizedReplayBuffer:
@@ -258,7 +339,7 @@ class PrioritizedReplayBuffer:
         self.gamma = gamma
         self.capacity = cfg.capacity
         self.frames = FrameStore(cfg.capacity + 64, frame_size)
-        self.transitions: list[Optional[Transition]] = [None] * cfg.capacity
+        self.transitions: list[Transition | None] = [None] * cfg.capacity
         self.priorities = np.zeros(cfg.capacity, dtype=np.float64)
         self.tree = SumTree(cfg.capacity)
         self.pos = 0
@@ -314,7 +395,7 @@ class PrioritizedReplayBuffer:
         return True
 
     def sample(self, batch_size: int, beta: float,
-               rng: Optional[np.random.Generator] = None,
+               rng: np.random.Generator | None = None,
                max_replace_rounds: int = 3) -> dict[str, Any]:
         if self.size == 0:
             raise IndexError("empty replay buffer")
@@ -388,7 +469,7 @@ class PrioritizedReplayBuffer:
                 + self.priorities.nbytes + len(self.transitions) * 200)
 
     def action_counts(self) -> dict[int, int]:
-        counts = {a: 0 for a in range(5)}
+        counts = dict.fromkeys(range(5), 0)
         for t in self.transitions[: self.size]:
             if t is not None:
                 counts[t.action] += 1
@@ -420,7 +501,7 @@ class PrioritizedReplayBuffer:
 
     @classmethod
     def load(cls, path: str, cfg: PERConfig, frame_size: int = 84,
-             gamma: float = 0.99) -> "PrioritizedReplayBuffer":
+             gamma: float = 0.99) -> PrioritizedReplayBuffer:
         """Load or raise CorruptFileError (file already renamed .corrupt)."""
         payload = integrity_pickle_load(path)
         if not isinstance(payload, dict) or "frames" not in payload \
@@ -433,8 +514,7 @@ class PrioritizedReplayBuffer:
             raise CorruptFileError(
                 f"{path}: frame size {frames.shape[1]} != configured {frame_size}"
             )
-        if cap > cfg.capacity:
-            cap = cfg.capacity  # never exceed the configured memory bound
+        cap = min(cap, cfg.capacity)  # never exceed the configured memory bound
         buf._reinit(cap, frames.shape[1])
         buf.frames.frames[:] = payload["frames"]
         buf.frames.env_ids[:] = np.asarray(payload["frame_env_ids"], dtype=np.int64)

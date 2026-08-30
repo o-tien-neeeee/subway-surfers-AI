@@ -249,7 +249,9 @@ class TestPersistence:
 
 class TestNStepBuilder:
     def test_n1_passthrough(self) -> None:
-        # n=1 emits step t once the NEXT observation exists (bootstrap target).
+        # n=1: G_t = r_t + γ Q(s_{t+1}, ·).  Builder emits step t as soon as
+        # the next observation exists; span=1 (one reward: r_t itself),
+        # γ^1 applied to the bootstrap target.
         b = NStepBuilder(1, 0.9)
         out = b.push(stack4(0), (1, 1, 1, 1), 2, 0.5, False)
         assert out == []
@@ -258,6 +260,7 @@ class TestNStepBuilder:
         assert out[0].reward == pytest.approx(0.5)
         assert out[0].span == 1
         assert out[0].done is False
+        assert out[0].gamma_pow == pytest.approx(0.9)
         assert np.allclose(out[0].obs, stack4(0))
         assert np.allclose(out[0].next_obs, stack4(1))
 
@@ -268,21 +271,32 @@ class TestNStepBuilder:
         b.push(stack4(2), (3,) * 4, 0, 4.0, False)
         out = b.push(stack4(3), (4,) * 4, 0, 8.0, False)  # window complete
         assert len(out) == 1
-        # R = 1 + .5*2 + .25*4 = 3.0 ; next_obs is the stack after 3 steps
+        # n=3: R = r_t + γ r_{t+1} + γ^2 r_{t+2} = 1 + .5*2 + .25*4 = 3.0
+        # Bootstrap from s_{t+3}; γ^3 = 0.125.
         assert out[0].reward == pytest.approx(3.0)
         assert out[0].span == 3
         assert out[0].gamma_pow == pytest.approx(0.125)
         assert np.allclose(out[0].next_obs, stack4(3))
 
-    def test_terminal_flush_marks_only_last_done(self) -> None:
+    def test_terminal_flush_marks_drained_as_done(self) -> None:
+        """On episode end every pending transition inside the n-step window
+        has a terminal bootstrap (done=True, gamma_pow=0) — otherwise Q
+        would leak across episode boundaries.  Rewards are accumulated
+        forward from each head to the death step."""
         b = NStepBuilder(3, 0.9)
         b.push(stack4(0), (1,) * 4, 0, 1.0, False)
         b.push(stack4(1), (2,) * 4, 0, 1.0, False)
         out = b.push(stack4(2), (3,) * 4, 0, -10.0, True)
+        # All three pending transitions terminate at death:
+        #   step0: r = 1 + 0.9*1 + 0.9^2*(-10) = -6.2  done=True
+        #   step1: r = 1 + 0.9*(-10)                = -8.0  done=True
+        #   step2: r = -10                           = -10.0 done=True
         assert len(out) == 3
-        dones = [t.done for t in out]
-        assert dones == [False, False, True]
-        assert out[-1].reward == pytest.approx(-10.0)
+        assert all(t.done for t in out)
+        assert all(t.gamma_pow == 0.0 for t in out)
+        assert out[0].reward == pytest.approx(1 + 0.9 * 1 + 0.81 * (-10.0))
+        assert out[1].reward == pytest.approx(1 + 0.9 * (-10.0))
+        assert out[2].reward == pytest.approx(-10.0)
 
     def test_nothing_crosses_episode_boundary(self) -> None:
         b = NStepBuilder(3, 0.9)
@@ -291,3 +305,5 @@ class TestNStepBuilder:
         out = b.push(stack4(9), (99,) * 4, 0, 5.0, True)
         assert len(out) == 1
         assert out[0].reward == pytest.approx(5.0)
+        assert out[0].done is True
+        assert out[0].gamma_pow == 0.0

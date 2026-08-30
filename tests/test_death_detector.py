@@ -25,11 +25,11 @@ DEAD = (40, 40, 200)
 
 
 def make_cfg(**kw) -> DeathConfig:
-    base = dict(
-        threshold=25.0, confirm_frames=3, stable_frames=5,
-        respawn_interval_s=0.8, respawn_timeout_s=3.0,
-        anchor_fx=0.05, anchor_fy=0.05, anchor_baseline_rgb=ALIVE,
-    )
+    base = {
+        "threshold": 25.0, "confirm_frames": 3, "stable_frames": 5,
+        "respawn_interval_s": 0.8, "respawn_timeout_s": 3.0,
+        "anchor_fx": 0.05, "anchor_fy": 0.05, "anchor_baseline_rgb": ALIVE,
+    }
     base.update(kw)
     return DeathConfig(**base)
 

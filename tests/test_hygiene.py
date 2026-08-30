@@ -32,12 +32,15 @@ class TestNoBareExcepts:
     def test_no_silent_exception_pass(self, path: Path) -> None:
         tree = file_ast(path)
         for node in ast.walk(tree):
-            if isinstance(node, ast.ExceptHandler):
-                if (isinstance(node.type, ast.Name) and node.type.id == "Exception"):
-                    assert not all(isinstance(b, ast.Pass) for b in node.body), (
-                        f"{path.name}:{node.lineno} `except Exception: pass` "
-                        f"swallows errors silently"
-                    )
+            if (
+                isinstance(node, ast.ExceptHandler)
+                and isinstance(node.type, ast.Name)
+                and node.type.id == "Exception"
+            ):
+                assert not all(isinstance(b, ast.Pass) for b in node.body), (
+                    f"{path.name}:{node.lineno} `except Exception: pass` "
+                    f"swallows errors silently"
+                )
 
     @pytest.mark.parametrize("path", PY_FILES, ids=lambda p: p.name)
     def test_every_except_logs_or_returns(self, path: Path) -> None:

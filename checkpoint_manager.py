@@ -13,12 +13,11 @@ Rules (requirement §12):
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -36,7 +35,7 @@ def _git_hash() -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5,
-            cwd=str(Path(__file__).parent),
+            cwd=str(Path(__file__).parent), check=False,
         )
         if out.returncode == 0:
             return out.stdout.strip()
@@ -74,7 +73,7 @@ class CheckpointManager:
         self.dir = Path(directory) / profile
         self.dir.mkdir(parents=True, exist_ok=True)
         self.profile = profile
-        self.best_metric: Optional[float] = None
+        self.best_metric: float | None = None
         self._best_path = self.dir / "best_model.pth"
         self._latest_path = self.dir / "latest_model.pth"
         self._buffer_path = self.dir / "buffer.pkl"
@@ -102,9 +101,9 @@ class CheckpointManager:
         agent_payload: dict[str, Any],
         extra: dict[str, Any],
         which: str = "latest",
-        metric: Optional[float] = None,
+        metric: float | None = None,
         higher_is_better: bool = True,
-    ) -> Optional[Path]:
+    ) -> Path | None:
         payload = {
             "profile": self.profile,
             "agent": agent_payload,
@@ -130,14 +129,14 @@ class CheckpointManager:
             return None
         return path
 
-    def load_model(self, which: str = "latest") -> Optional[dict[str, Any]]:
+    def load_model(self, which: str = "latest") -> dict[str, Any] | None:
         path = self._latest_path if which == "latest" else self._best_path
         if not path.exists():
             return None
         try:
             payload = torch.load(str(path), map_location="cpu", weights_only=False)
             return payload
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             corrupt = path.with_name(path.name + ".corrupt")
             try:
                 os.replace(str(path), str(corrupt))
@@ -152,8 +151,8 @@ class CheckpointManager:
 
     def _atomic_torch_save(self, payload: dict[str, Any], path: Path) -> None:
         tmp = path.with_name(path.name + ".tmp")
-        data = torch.save(payload, str(tmp))
-        # torch.save returns None; rewrite via bytes buffer for hashing.
+        torch.save(payload, str(tmp))
+        # torch.save returns None; read back for hashing.
         with open(tmp, "rb") as fh:
             digest = hash_bytes(fh.read())
         sidecar = path.with_name(path.name + ".sha256")
@@ -167,7 +166,7 @@ class CheckpointManager:
         try:
             buffer_obj.save(str(self._buffer_path))
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             get_logger("checkpoint").error(
                 "buffer save failed:\n%s", format_exception(exc)
             )
@@ -191,7 +190,7 @@ class CheckpointManager:
                 "buffer corrupt, starting empty:\n%s", format_exception(exc)
             )
             return None, False
-        except Exception as exc:  # unexpected: never take the process down
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             get_logger("checkpoint").error(
                 "buffer load failed, starting empty:\n%s", format_exception(exc)
             )

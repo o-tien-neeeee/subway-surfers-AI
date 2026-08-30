@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
-import pickle  # noqa: S403 - only used for our own local buffer files
+import pickle
 import sys
 import traceback
 import types
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 LOG_FORMAT = "%(asctime)s | %(processName)s | %(levelname)-7s | %(name)s | %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -68,7 +68,7 @@ def report_exception(
     logger: logging.Logger,
     exc: BaseException,
     context: str,
-    queue: Optional[Any] = None,
+    queue: Any | None = None,
 ) -> None:
     """Log a traceback and forward it to the GUI error queue if provided."""
     tb = format_exception(exc)
@@ -134,7 +134,6 @@ def hash_bytes(data: bytes) -> str:
 
 def atomic_write_bytes(path: str | Path, data: bytes, suffix: str = ".tmp") -> None:
     """Write ``data`` to a temp file then ``os.replace`` it into place."""
-    import os
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +162,6 @@ def integrity_pickle_load(path: str | Path) -> Any:
     from scratch while keeping the GUI alive.  Only ever point this at files
     the bot itself wrote (a pickle is executed-equivalent untrusted input).
     """
-    import os
     import shutil
 
     p = Path(path)
@@ -180,7 +178,7 @@ def integrity_pickle_load(path: str | Path) -> Any:
                 f"{p} failed sha256 verification; moved to {corrupt}"
             )
     try:
-        return pickle.loads(data)  # noqa: S301 - own artifact, hash-verified
+        return pickle.loads(data)
     except Exception as exc:  # narrow handling, then re-raise typed
         corrupt = p.with_name(p.name + ".corrupt")
         try:

@@ -24,10 +24,9 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
-import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from config import PROFILE_ORDER, BotConfig
 from ipc import (
@@ -38,8 +37,8 @@ from ipc import (
     bounded_queue,
     make_events,
 )
-from logging_utils import drain, format_exception, get_logger, setup_logging
-from models import PROFILES, weight_size_for_profile
+from logging_utils import drain, get_logger, setup_logging
+from models import weight_size_for_profile
 
 LOGGER = get_logger("app")
 
@@ -48,7 +47,7 @@ class BotApplication:
     """Owns worker processes and shared state (used by GUI and headless CLI)."""
 
     def __init__(self, cfg: BotConfig, input_backend: str = "auto",
-                 capture_source: Optional[str] = None, log_dir: str = "logs") -> None:
+                 capture_source: str | None = None, log_dir: str = "logs") -> None:
         self.cfg = cfg
         self.input_backend = input_backend
         if capture_source is not None:
@@ -69,9 +68,9 @@ class BotApplication:
         self.cmd_q = bounded_queue(32)
         self.action_q = bounded_queue(64)  # actor -> fake game
 
-        self.capture_proc: Optional[mp.process.BaseProcess] = None
-        self.actor_proc: Optional[mp.process.BaseProcess] = None
-        self.learner_proc: Optional[mp.process.BaseProcess] = None
+        self.capture_proc: mp.process.BaseProcess | None = None
+        self.actor_proc: mp.process.BaseProcess | None = None
+        self.learner_proc: mp.process.BaseProcess | None = None
         self._started = False
 
     # ------------------------------------------------------------------ #
@@ -233,7 +232,7 @@ class BotApplication:
     # Headless run (CI smoke test / profiling)
     # ------------------------------------------------------------------ #
     def headless_run(self, max_env_frames: int = 600, learn: bool = True,
-                     report_path: Optional[str] = None) -> dict[str, Any]:
+                     report_path: str | None = None) -> dict[str, Any]:
         """Run the full pipeline against the synthetic game; return summary."""
         from evaluation import EpisodeRecord, EvaluationReport
 
@@ -291,7 +290,7 @@ class BotApplication:
 def cmd_validate_demos(demos_dir: str) -> int:
     from dataset import summarize_reports, validate_directory
 
-    eps, reps = validate_directory(demos_dir)
+    _eps, reps = validate_directory(demos_dir)
     print(summarize_reports(reps))
     ok = sum(1 for r in reps if r.ok)
     print(f"\n{ok}/{len(reps)} episodes valid for behaviour cloning")
@@ -365,7 +364,7 @@ def cmd_pretrain_headless(args: argparse.Namespace) -> int:
     return 0 if result.get("status") == "ok" else 1
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="app.py", description="Subway Surfers research bot (screen-capture only)"
     )

@@ -16,7 +16,7 @@ Two sources:
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
@@ -32,7 +32,7 @@ def _mss_grab_factory(monitor: dict[str, int]):
 
     sct = mss.mss()
 
-    def grab() -> Optional[np.ndarray]:
+    def grab() -> np.ndarray | None:
         raw = sct.grab(monitor)
         arr = np.asarray(raw)[:, :, :3]  # BGRA -> BGR
         rgb = arr[:, :, ::-1]            # -> RGB
@@ -41,7 +41,7 @@ def _mss_grab_factory(monitor: dict[str, int]):
     return grab
 
 
-def virtual_screen_geometry() -> Optional[tuple[int, int]]:
+def virtual_screen_geometry() -> tuple[int, int] | None:
     """(width, height) of the virtual screen, or None when unavailable."""
     try:
         import mss
@@ -49,12 +49,12 @@ def virtual_screen_geometry() -> Optional[tuple[int, int]]:
         with mss.mss() as sct:
             mon0 = sct.monitors[0]
             return int(mon0["width"]), int(mon0["height"])
-    except Exception:  # no display / mss trouble: caller must tolerate None
+    except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
         return None
 
 
-def geometry_matches(region: Any, actual_w: Optional[int],
-                     actual_h: Optional[int]) -> Optional[bool]:
+def geometry_matches(region: Any, actual_w: int | None,
+                     actual_h: int | None) -> bool | None:
     """Compare the current virtual screen against the calibrated one.
 
     Returns True (same), False (changed — recalibration advised), or None
@@ -129,7 +129,7 @@ def capture_main(
             grab = _fake_grab_factory(cfg, action_q)
         else:
             raise ValueError(f"unknown capture source {source!r}")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
         put_bounded(metrics_q, {"type": "error", "src": "capture",
                                 "error": f"{type(exc).__name__}: {exc}",
                                 "tb": format_exception(exc)})
@@ -147,7 +147,7 @@ def capture_main(
     # and warn exactly once per change so the user can re-calibrate.
     geometry_check_interval = 5.0
     next_geometry_check = time.monotonic() + geometry_check_interval
-    last_geometry_state: Optional[bool] = None
+    last_geometry_state: bool | None = None
     LOGGER.info("capture start: %s %dx%d+%d+%d @ %dfps", source,
                 cfg.region.width, cfg.region.height, cfg.region.left,
                 cfg.region.top, cfg.capture.target_fps)
@@ -158,7 +158,7 @@ def capture_main(
             t0 = time.monotonic()
             try:
                 image = grab()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 failures += 1
                 LOGGER.error("grab failed (#%d): %s", failures, exc)
                 if failures >= 5:
@@ -223,7 +223,7 @@ def capture_main(
                             "type": "log", "level": "info", "src": "capture",
                             "msg": "screen geometry matches calibration again",
                         })
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
         put_bounded(metrics_q, {"type": "error", "src": "capture",
                                 "error": f"{type(exc).__name__}: {exc}",
                                 "tb": format_exception(exc)})

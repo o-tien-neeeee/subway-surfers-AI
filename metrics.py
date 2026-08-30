@@ -10,7 +10,8 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from typing import Any, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any
 
 
 class Ring:
@@ -57,7 +58,7 @@ def percentile(values: list[float], pct: float) -> float:
 def stats(values: list[float]) -> dict[str, float]:
     """Mean/std/min/max/p50/p95/p99 summary."""
     if not values:
-        return {k: 0.0 for k in ("n", "mean", "std", "min", "max", "p50", "p95", "p99")}
+        return dict.fromkeys(("n", "mean", "std", "min", "max", "p50", "p95", "p99"), 0.0)
     n = len(values)
     mean = sum(values) / n
     var = sum((v - mean) ** 2 for v in values) / n
@@ -101,14 +102,14 @@ class Counter:
         self.total += n
         self._window_count += n
 
-    def rate_per_s(self, now: Optional[float] = None) -> float:
+    def rate_per_s(self, now: float | None = None) -> float:
         t = now if now is not None else time.monotonic()
         span = t - self._window_start
         if span <= 0:
             return 0.0
         return self._window_count / span
 
-    def reset_window(self, now: Optional[float] = None) -> None:
+    def reset_window(self, now: float | None = None) -> None:
         self._window_start = now if now is not None else time.monotonic()
         self._window_count = 0
 
@@ -120,13 +121,13 @@ class FpsMeter:
         self.window_s = window_s
         self._ts: deque[float] = deque()
 
-    def tick(self, t: Optional[float] = None) -> None:
+    def tick(self, t: float | None = None) -> None:
         t = t if t is not None else time.monotonic()
         self._ts.append(t)
         while self._ts and self._ts[0] < t - self.window_s:
             self._ts.popleft()
 
-    def fps(self, now: Optional[float] = None) -> float:
+    def fps(self, now: float | None = None) -> float:
         now = now if now is not None else (self._ts[-1] if self._ts else 0.0)
         if len(self._ts) < 2:
             return 0.0
@@ -163,7 +164,7 @@ def system_usage() -> dict[str, float]:
         out["ram_system_gb"] = vm.used / (1024 ** 3)
         out["ram_system_total_gb"] = vm.total / (1024 ** 3)
         out["cpu_system"] = psutil.cpu_percent(interval=None)
-    except Exception:
+    except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
         out["available"] = 0.0
     return out
 

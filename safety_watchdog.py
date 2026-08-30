@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from logging_utils import format_exception, get_logger, put_bounded
 
@@ -38,7 +39,7 @@ class SafetyWatchdog(threading.Thread):
         ring: Any = None,
         interval_s: float = 0.25,
         stall_timeout_s: float = 2.0,
-        on_status: Optional[Callable[[str, str], None]] = None,
+        on_status: Callable[[str, str], None] | None = None,
     ) -> None:
         super().__init__(daemon=True, name="safety-watchdog")
         self.events = events
@@ -49,7 +50,7 @@ class SafetyWatchdog(threading.Thread):
         self.interval_s = interval_s
         self.stall_timeout_s = stall_timeout_s
         self.on_status = on_status
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._last_frame_id = -1
         self._last_progress_ts = time.monotonic()
         self._focus_loss_reported = False
@@ -57,12 +58,12 @@ class SafetyWatchdog(threading.Thread):
     # ------------------------------------------------------------------ #
     def run(self) -> None:
         LOGGER.info("watchdog running (interval=%.2fs)", self.interval_s)
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self._check_once()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 LOGGER.error("watchdog check failed:\n%s", format_exception(exc))
-            self._stop.wait(self.interval_s)
+            self._stop_event.wait(self.interval_s)
         LOGGER.info("watchdog stopped")
 
     def _check_once(self) -> None:
@@ -123,11 +124,11 @@ class SafetyWatchdog(threading.Thread):
         if self.on_status is not None:
             try:
                 self.on_status(tag, message)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 LOGGER.error("on_status callback failed: %s", exc)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
 
 class EmergencyHotkey:
@@ -155,7 +156,7 @@ class EmergencyHotkey:
             self._listener.start()
             self.available = True
             LOGGER.info("emergency hotkey '%s' armed", self.hotkey_name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.warning("hotkey listener unavailable (%s: %s) — use the "
                            "GUI STOP button or Ctrl+C", type(exc).__name__, exc)
 
@@ -164,6 +165,6 @@ class EmergencyHotkey:
         if self._listener is not None:
             try:
                 self._listener.stop()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 LOGGER.warning("hotkey stop failed: %s", exc)
             self._listener = None

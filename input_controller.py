@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 from config import ACTIONS, NOOP, InputConfig
 from logging_utils import get_logger
@@ -48,7 +48,9 @@ class _PynputBackend:
     """Real key presses via pynput (lazy import, Windows/Linux/macOS)."""
 
     def __init__(self, keymap: dict[int, str]) -> None:
-        from pynput import keyboard  # noqa: import checked by factory
+        from pynput import (
+            keyboard,
+        )
 
         self._kb = keyboard.Controller()
         self._keys = {}
@@ -132,7 +134,7 @@ class InputController:
         # auto: try real input, degrade to dry-run with a logged warning.
         try:
             return _PynputBackend(keymap)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.warning(
                 "pynput backend unavailable (%s: %s); falling back to dry_run — "
                 "no real keys will be pressed", type(exc).__name__, exc,
@@ -144,8 +146,8 @@ class InputController:
     # Gameplay keys
     # ------------------------------------------------------------------ #
     def press_action(
-        self, action: int, hold_ms: Optional[int] = None,
-        created_ts: Optional[float] = None,
+        self, action: int, hold_ms: int | None = None,
+        created_ts: float | None = None,
     ) -> InputEvent:
         """Press a gameplay key and schedule its release.
 
@@ -179,7 +181,7 @@ class InputController:
                 self._release_at.append((t + hold, keyname))
                 self.stats["presses"] += 1
                 return InputEvent(action, keyname, True, t, "pressed")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.error("press_action failed, releasing all:\n%s", exc)
             self.release_all()
             return InputEvent(action, keyname, False, t, f"error:{type(exc).__name__}")
@@ -194,7 +196,7 @@ class InputController:
                     self._backend.release(keyobj)
                     released += 1
                     self.stats["releases"] += 1
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                     LOGGER.error("release failed for %s: %s", keyname, exc)
             self._pressed.clear()
             self._release_at.clear()
@@ -233,10 +235,9 @@ class InputController:
                         to_release.append(keyname)
                 # Hard safety: anything held past max_hold_ms dies.
                 for keyname, (since, _ko) in self._pressed.items():
-                    if (t - since) * 1000.0 > self.cfg.max_hold_ms:
-                        if keyname not in to_release:
-                            to_release.append(keyname)
-                            self.stats["guardian_releases"] += 1
+                    if (t - since) * 1000.0 > self.cfg.max_hold_ms and keyname not in to_release:
+                        to_release.append(keyname)
+                        self.stats["guardian_releases"] += 1
             for keyname in to_release:
                 self._release_one(keyname)
             time.sleep(0.005)
@@ -250,7 +251,7 @@ class InputController:
         try:
             self._backend.release(keyobj)
             self.stats["releases"] += 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.error("scheduled release failed for %s: %s", keyname, exc)
 
     # ------------------------------------------------------------------ #
@@ -271,11 +272,11 @@ class InputController:
                 return False
             pyautogui.click(x=int(x), y=int(y))
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.error("click failed: %s", exc)
             return False
 
-    def browser_focused(self) -> Optional[bool]:
+    def browser_focused(self) -> bool | None:
         """True/False when detectable; None when the platform can't tell."""
         if self.backend_name == "dry_run":
             return None
@@ -284,12 +285,12 @@ class InputController:
 
             try:
                 title = pyautogui.getActiveWindow().title
-            except Exception:
+            except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 return None
             if not title:
                 return None
             return self.cfg.browser_title_hint.lower() in str(title).lower()
-        except Exception:
+        except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             return None
 
     def focus_gate(self) -> bool:

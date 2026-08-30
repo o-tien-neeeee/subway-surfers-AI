@@ -75,7 +75,7 @@ class TestPendingHazard:
         r0 = calc.step(ts=0.03, action=3, horizon=hz(10, 0.03, 20.0, True))
         assert r0.hazard == 0.0, "bonus is pending, not immediate"
         # next 2 frames: action recorded + horizon quiet -> resolve
-        r1 = calc.step(ts=0.06, action=0, horizon=hz(11, 0.06, 1.0, False))
+        calc.step(ts=0.06, action=0, horizon=hz(11, 0.06, 1.0, False))
         r2 = calc.step(ts=0.09, action=0, horizon=hz(12, 0.09, 1.0, False))
         assert r2.hazard == pytest.approx(0.1)
 
@@ -119,7 +119,7 @@ class TestPendingHazard:
             action = 3 if dodge else 0
             r0 = calc.step(ts=0.03, action=action,
                            horizon=hz(10, 0.03, 20.0, True))
-            det = False if resolves else True
+            det = not resolves
             calc.step(ts=0.06, action=0, horizon=hz(11, 0.06, 5.0, det))
             calc.step(ts=0.09, action=0, horizon=hz(12, 0.09, 5.0, det))
             return r0.total

@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import numpy as np
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 from agent import DoubleDQNAgent, InferencePolicy, epsilon_for_frame
 from config import RLConfig
-from models import PROFILES, DuelingDQN, build_models_for_profile, count_trainable_params
+from models import (
+    PROFILES,
+    DuelingDQN,
+    build_models_for_profile,
+    count_trainable_params,
+)
 
 
 class TestParameterBudgets:
@@ -131,7 +138,7 @@ class TestAgent:
                "gamma_pows": np.ones(4, dtype=np.float32)}
 
         class _Opt:
-            param_groups = [{"lr": 1e-4}]
+            param_groups: ClassVar[list[dict]] = [{"lr": 1e-4}]
 
             def zero_grad(self, set_to_none=True):
                 return None  # test double: grads handled by train_step internals

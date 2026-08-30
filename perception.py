@@ -17,7 +17,6 @@ Pipeline per frame (all numpy/cv2, no torch on this path):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -35,7 +34,7 @@ def is_black_frame(image: np.ndarray, threshold: float) -> bool:
     return float(image.mean()) < threshold
 
 
-def anchor_patch(image: np.ndarray, cx: int, cy: int, half: int = 2) -> Optional[np.ndarray]:
+def anchor_patch(image: np.ndarray, cx: int, cy: int, half: int = 2) -> np.ndarray | None:
     """Extract a (2*half+1)^2 RGB patch centred on (cx, cy), None if clipped."""
     h, w = image.shape[:2]
     x0, x1 = cx - half, cx + half + 1
@@ -74,9 +73,9 @@ class ZoneResult:
 
     frame_id: int
     ts: float
-    horizon_gray: Optional[np.ndarray]  # 40x40 uint8
-    ground_gray: Optional[np.ndarray]  # 84x84 uint8
-    anchor_patch: Optional[np.ndarray]  # 5x5x3 uint8
+    horizon_gray: np.ndarray | None  # 40x40 uint8
+    ground_gray: np.ndarray | None  # 84x84 uint8
+    anchor_patch: np.ndarray | None  # 5x5x3 uint8
     valid: bool
     reason: str = "ok"
 
@@ -88,7 +87,7 @@ class ZonePreprocessor:
         self,
         cfg: PerceptionConfig,
         horizon_frac: float,
-        anchor_xy: Optional[tuple[int, int]] = None,
+        anchor_xy: tuple[int, int] | None = None,
         require_anchor: bool = True,
     ) -> None:
         self.cfg = cfg
@@ -100,12 +99,12 @@ class ZonePreprocessor:
         self.require_anchor = require_anchor
         self.horizon_h_cache: dict[int, int] = {}
 
-    def set_anchor(self, xy: Optional[tuple[int, int]]) -> None:
+    def set_anchor(self, xy: tuple[int, int] | None) -> None:
         self.anchor_xy = xy
 
     def split_line(self, region_h: int) -> int:
         """Pixel row separating horizon band from ground band."""
-        return max(1, int(round(region_h * self.horizon_frac)))
+        return max(1, round(region_h * self.horizon_frac))
 
     def process(self, image: np.ndarray, frame_id: int, ts: float) -> ZoneResult:
         h, w = image.shape[:2]
@@ -186,7 +185,7 @@ class FrameStack:
         return out
 
 
-def normalize_obs(stack_u8: np.ndarray) -> "torch.Tensor":  # noqa: F821
+def normalize_obs(stack_u8: np.ndarray) -> torch.Tensor:  # noqa: F821  (torch imported lazily inside body)
     """uint8 [k,H,W] -> float32 tensor [1,k,H,W] in [0,1] (for the network)."""
     import torch
 

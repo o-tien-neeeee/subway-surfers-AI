@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from config import NOOP, BotConfig
+from config import BotConfig
 from demonstration_recorder import DemoRecorder
 from ipc import Frame
 

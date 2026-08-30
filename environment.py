@@ -27,14 +27,19 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
 
 from action_scheduler import ActionScheduler, PlannedAction
 from agent import InferencePolicy, epsilon_for_frame
-from config import ACTIONS, BotConfig, NOOP
-from death_detector import ColorAnchorDeathDetector, DeathResult, DeathState, RespawnController
+from config import NOOP, BotConfig
+from death_detector import (
+    ColorAnchorDeathDetector,
+    DeathResult,
+    DeathState,
+    RespawnController,
+)
 from horizon_detector import HorizonDetector, HorizonResult
 from input_controller import InputController
 from ipc import SharedFrameRing, SharedWeights
@@ -95,7 +100,7 @@ class SyntheticGame:
         return self.render()
 
     # ------------------------------------------------------------------ #
-    def step(self, action: int, dt: Optional[float] = None) -> np.ndarray:
+    def step(self, action: int, dt: float | None = None) -> np.ndarray:
         """Advance the game one tick with the player's action."""
         dt = dt if dt is not None else 1.0 / self.fps
         self._t += dt
@@ -199,7 +204,7 @@ class StepInfo:
 class GameEnvironment:
     """Classic reset/step API over SyntheticGame with full bot perception."""
 
-    def __init__(self, cfg: BotConfig, game: Optional[SyntheticGame] = None) -> None:
+    def __init__(self, cfg: BotConfig, game: SyntheticGame | None = None) -> None:
         self.cfg = cfg
         self.game = game or SyntheticGame(seed=cfg.seed)
         self.pre = ZonePreprocessor(cfg.perception, cfg.perception.horizon_frac,
@@ -244,8 +249,10 @@ class GameEnvironment:
         frame = self.game.render()
         ts = self._t
         z = self.pre.process(frame, self.game.frame_id, ts)
-        hz = self.detector.update(z.horizon_gray, z.frame_id, ts)
-        dr = self.death.update(z.anchor_patch, z.frame_id, ts)
+        # Advance the internal debounce state of detectors even on reset,
+        # but the results aren't needed by the caller.
+        self.detector.update(z.horizon_gray, z.frame_id, ts)
+        self.death.update(z.anchor_patch, z.frame_id, ts)
         fid = self.game.frame_id
         if reset:
             self.stack.reset(z.ground_gray)
@@ -391,7 +398,7 @@ class BotActor:
         self._episode_start_ts = 0.0
         self._episode_frames = 0
         self._last_load_check = time.monotonic()
-        self._perf_violation_since: Optional[float] = None
+        self._perf_violation_since: float | None = None
         self._profile = cfg.rl.profile
         self._action_step_at_episode_start = self.scheduler.action_step
         self._episode_stats: list[ActorEpisodeStats] = []
@@ -445,7 +452,7 @@ class BotActor:
                 self._maybe_report()
             # graceful exit
             self._end_episode(reason="shutdown")
-        except Exception as exc:  # full traceback to GUI + log
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             from logging_utils import format_exception
 
             LOGGER.error("actor crashed:\n%s", format_exception(exc))
@@ -556,12 +563,10 @@ class BotActor:
             put_bounded(self.transition_q, tr)
 
     def _flush_transitions(self, final: bool) -> None:
-        # emit anything still pending in the n-step window as terminal steps
-        while self.nstep.pending:
-            leftover = self.nstep.push(self.stack.get(), tuple(self._env_ids),
-                                       NOOP, 0.0, True)
-            for tr in leftover:
-                put_bounded(self.transition_q, tr)
+        # Emit anything still pending in the n-step window as episode-
+        # terminal transitions (zero bootstrap beyond end of episode).
+        for tr in self.nstep.push_absorbing():
+            put_bounded(self.transition_q, tr)
 
     # ------------------------------------------------------------------ #
     def _begin_episode(self, t_frame: float) -> None:
@@ -695,7 +700,7 @@ class BotActor:
             import psutil
 
             return min(1.0, psutil.cpu_percent(interval=None) / 100.0)
-        except Exception:
+        except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             return 0.5
 
     def _maybe_perf_check(self) -> None:
@@ -768,7 +773,7 @@ class BotActor:
         self._shutdown_requested = True
 
 
-def headless_env_from_cfg(cfg: BotConfig, seed: Optional[int] = None) -> GameEnvironment:
+def headless_env_from_cfg(cfg: BotConfig, seed: int | None = None) -> GameEnvironment:
     if seed is not None:
         cfg.seed = seed
     return GameEnvironment(cfg)

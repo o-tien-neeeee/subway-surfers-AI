@@ -17,15 +17,14 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 import numpy as np
 
-from config import BotConfig, N_ACTIONS, NOOP
+from config import N_ACTIONS, NOOP, BotConfig
 from logging_utils import get_logger
 from perception import ZonePreprocessor
-from states import BotState
 
 LOGGER = get_logger("demo_recorder")
 
@@ -61,13 +60,13 @@ class KeyboardTap:
             self._listener = keyboard.Listener(on_press=_press, on_release=_release)
             self._keyboard = keyboard
             self.available = True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
             LOGGER.warning("keyboard listener unavailable: %s (%s) — "
                            "demos will record NOOP only",
                            type(exc).__name__, exc)
 
     @staticmethod
-    def _key_name(key) -> Optional[str]:
+    def _key_name(key) -> str | None:
         if hasattr(key, "char") and key.char:
             return str(key.char).lower()
         if hasattr(key, "name") and key.name:
@@ -83,7 +82,7 @@ class KeyboardTap:
         if self._listener is not None:
             try:
                 self._listener.stop()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
                 LOGGER.warning("listener stop failed: %s", exc)
             self._listener = None
 
@@ -92,7 +91,7 @@ class DemoRecorder:
     """Subscribes to the frame ring and the human's keys to build episodes."""
 
     def __init__(self, cfg: BotConfig, out_dir: str | Path,
-                 read_frame: Callable[[], Optional[object]]) -> None:
+                 read_frame: Callable[[], object | None]) -> None:
         self.cfg = cfg
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -154,7 +153,7 @@ class DemoRecorder:
         LOGGER.info("demo recording started")
         return True
 
-    def stop(self, done: bool = True) -> Optional[str]:
+    def stop(self, done: bool = True) -> str | None:
         """Finalise and atomically write the episode; returns its path."""
         if not self._recording:
             return None

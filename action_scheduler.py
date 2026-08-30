@@ -19,8 +19,8 @@ Cadence policy (requirement §9):
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from config import NOOP, SchedulerConfig
 
@@ -53,11 +53,11 @@ class ActionScheduler:
         self._frames_since_decision = 0
         self._current_cadence = cfg.max_decision_frames
         self._buffer: list[PlannedAction] = []
-        self._last_executed: Optional[int] = None
+        self._last_executed: int | None = None
         self._last_executed_ts = -1e9
         self._action_step = 0
         self._last_load: float = 0.0
-        self._last_confidence: Optional[float] = None
+        self._last_confidence: float | None = None
 
     # ------------------------------------------------------------------ #
     # Load adaptation
@@ -66,7 +66,7 @@ class ActionScheduler:
         """Pick cadence from CPU load only (backward-compatible shim)."""
         self.set_signal(load01, None)
 
-    def set_signal(self, load01: float, horizon_confidence: Optional[float]) -> None:
+    def set_signal(self, load01: float, horizon_confidence: float | None) -> None:
         """Pick cadence from CPU load AND horizon confidence (requirement §9).
 
         * high load  -> slow bound (protect the FPS budget),
@@ -120,7 +120,7 @@ class ActionScheduler:
         self.stats.decisions += 1
         return True
 
-    def pop_executable(self) -> Optional[PlannedAction]:
+    def pop_executable(self) -> PlannedAction | None:
         """Next action to execute, applying expiry and duplicate suppression."""
         t = self.now()
         while self._buffer:

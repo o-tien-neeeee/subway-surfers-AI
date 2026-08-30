@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
-from config import InputConfig, NOOP
-from input_controller import InputController, _DryRunBackend
+from config import NOOP, InputConfig
+from input_controller import InputController
 
 
 class TestDryRun:
@@ -105,7 +103,6 @@ class TestBackendFailure:
         ctl = InputController(InputConfig(hold_ms=100), backend="dry_run")
         try:
             ctl.press_action(1)  # hold one healthy key
-            orig = ctl._backend.press
 
             def boom(key):
                 raise RuntimeError("input stack exploded")

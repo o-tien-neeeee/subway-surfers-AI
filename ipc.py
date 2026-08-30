@@ -24,12 +24,11 @@ Synchronisation decisions
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import ctypes as ct
+import multiprocessing as mp
 import struct
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 
@@ -98,7 +97,7 @@ class SharedFrameRing:
     # ------------------------------------------------------------------ #
     # Reader side (actor)
     # ------------------------------------------------------------------ #
-    def read_latest(self, max_retries: int = 4) -> Optional[Frame]:
+    def read_latest(self, max_retries: int = 4) -> Frame | None:
         """Copy out the newest completely-written frame (None if empty)."""
         h, w, c = self.shape
         nbytes = h * w * c

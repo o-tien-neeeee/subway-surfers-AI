@@ -20,7 +20,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 NOT_MEASURED = "not yet measured"
 
@@ -213,7 +213,7 @@ class EvaluationReport:
 
     # ------------------------------------------------------------------ #
     def beats_baseline(self, kind_a: str = "eval", kind_b: str = "human_baseline",
-                       metric: str = "survival_s") -> Optional[bool]:
+                       metric: str = "survival_s") -> bool | None:
         """True only if mean_a > mean_b with non-overlapping 95% CIs."""
         a = summarize(self._col(kind_a, metric))
         b = summarize(self._col(kind_b, metric))
@@ -347,7 +347,7 @@ class EvaluationReport:
         return p
 
     @classmethod
-    def load(cls, path: str | Path) -> "EvaluationReport":
+    def load(cls, path: str | Path) -> EvaluationReport:
         rep = cls()
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         for r in data.get("records", []):

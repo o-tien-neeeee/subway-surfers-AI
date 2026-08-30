@@ -8,8 +8,8 @@ unit tests instead of during live gameplay.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from enum import Enum
-from typing import Iterable, Optional
 
 
 class BotState(str, Enum):
@@ -111,7 +111,7 @@ class StateMachine:
         self._state = target
         return self._state
 
-    def try_transition(self, target: BotState) -> Optional[BotState]:
+    def try_transition(self, target: BotState) -> BotState | None:
         """Transition if legal; return the new state or ``None`` if refused."""
         if self.can(target):
             return self.transition(target)

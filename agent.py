@@ -13,12 +13,11 @@
 from __future__ import annotations
 
 import math
-import random
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 from config import RLConfig
 from models import DuelingDQN, build_models_for_profile
@@ -38,7 +37,7 @@ class InferencePolicy:
         self.rng = np.random.default_rng(seed)
         self._version = -1
 
-    def refresh_weights(self, shared, version: Optional[int] = None) -> bool:
+    def refresh_weights(self, shared, version: int | None = None) -> bool:
         """Pull new flat weights from SharedWeights if version changed."""
         v = shared.version() if version is None else version
         if v == self._version:
@@ -84,7 +83,7 @@ class DoubleDQNAgent:
         self.online.to(self.device)
         self.target.to(self.device)
         self.optimizer = torch.optim.Adam(self.online.parameters(), lr=cfg.learning_rate)
-        self.scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         if cfg.lr_schedule == "cosine":
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
@@ -140,9 +139,12 @@ class DoubleDQNAgent:
         self.update_count += 1
         self.maybe_sync_target()
 
+        with torch.no_grad():
+            td_error_abs = td_error.abs().detach().cpu().numpy().astype(np.float64)
         return {
             "loss": float(loss.item()),
-            "td_error_abs_mean": float(td_error.abs().mean().item()),
+            "td_error_abs": td_error_abs,                          # per-sample for PER
+            "td_error_abs_mean": float(td_error_abs.mean()),
             "q_mean": float(q_all.mean().item()),
             "q_max": float(q_all.max().item()),
             "q_min": float(q_all.min().item()),
@@ -158,7 +160,7 @@ class DoubleDQNAgent:
         obs_u8: np.ndarray,
         actions: np.ndarray,
         sample_weights: np.ndarray,
-        optimizer: Optional[torch.optim.Optimizer] = None,
+        optimizer: torch.optim.Optimizer | None = None,
     ) -> dict[str, float]:
         """Cross-entropy of softmax(advantage logits) vs expert actions."""
         opt = optimizer or self.optimizer
@@ -206,7 +208,7 @@ class DoubleDQNAgent:
         if payload.get("optimizer"):
             try:
                 self.optimizer.load_state_dict(payload["optimizer"])
-            except ValueError as exc:
+            except ValueError:
                 if strict:
                     raise
                 # profile change: keep fresh optimizer, warn through return

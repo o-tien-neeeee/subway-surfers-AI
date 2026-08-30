@@ -35,10 +35,10 @@ Exact counts are asserted in tests/test_models.py and printed by
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 N_ACTIONS = 5
 
@@ -124,7 +124,7 @@ class DuelingDQN(nn.Module):
 
     @classmethod
     def from_profile(cls, profile: str, in_frames: int = 4, size: int = 84,
-                     n_actions: int = N_ACTIONS) -> "DuelingDQN":
+                     n_actions: int = N_ACTIONS) -> DuelingDQN:
         spec = PROFILES[profile]
         encoder, out_ch = build_encoder(spec, in_frames)
         return cls(in_frames, encoder, out_ch, n_actions, spec["head_hidden"])
@@ -164,7 +164,7 @@ def build_encoder(spec: dict[str, Any], in_frames: int) -> tuple[nn.Module, int]
     return nn.Sequential(*layers), cin
 
 
-PROFILES: Dict[str, Dict[str, Any]] = {
+PROFILES: dict[str, dict[str, Any]] = {
     "strict_lite": {
         "kind": "dws",
         "blocks": [(32, 2), (48, 2), (64, 2), (128, 1)],
@@ -200,7 +200,7 @@ def count_trainable_params(model: nn.Module) -> int:
 
 
 def build_models_for_profile(profile: str, in_frames: int = 4, size: int = 84
-                             ) -> tuple["DuelingDQN", "DuelingDQN"]:
+                             ) -> tuple[DuelingDQN, DuelingDQN]:
     """(online, target) networks for a profile; target starts as a copy."""
     online = DuelingDQN.from_profile(profile, in_frames, size)
     target = DuelingDQN.from_profile(profile, in_frames, size)

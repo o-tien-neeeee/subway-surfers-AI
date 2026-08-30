@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
+from typing_extensions import Self
 
 from metrics import stats
 from models import PROFILES, DuelingDQN, count_trainable_params
@@ -201,7 +202,7 @@ class SystemProfiler:
         self.cpu_samples: list[float] = []
         self._stop = False
 
-    def __enter__(self) -> "SystemProfiler":
+    def __enter__(self) -> Self:
         import threading
 
         from metrics import system_usage
@@ -222,7 +223,7 @@ class SystemProfiler:
             self.cpu_samples.append(usage["cpu_process"])
             _time.sleep(self.interval_s)
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self._stop = True
         if getattr(self, "_thread", None) is not None:
             self._thread.join(timeout=2.0)

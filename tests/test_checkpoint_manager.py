@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import numpy as np
-import pytest
+import numpy as np  # noqa: F401  (used for RNG state side effects)
+import pytest  # noqa: F401
 import torch
+from test_replay_buffer import (
+    TestPrioritizedReplayBuffer,  # noqa: F401  (base class for parametrised tests)
+)
 
 from agent import DoubleDQNAgent
 from checkpoint_manager import CheckpointManager
 from config import PERConfig, RLConfig
-from replay_buffer import NStepTransition, PrioritizedReplayBuffer
-from test_replay_buffer import TestPrioritizedReplayBuffer
+from replay_buffer import NStepTransition, PrioritizedReplayBuffer  # noqa: F401
 
 
 def small_agent() -> DoubleDQNAgent:
@@ -127,7 +128,7 @@ class TestBufferViaManager:
 
 class TestRngStateIntegrity:
     def test_rng_states_restorable(self, tmp_path) -> None:
-        from checkpoint_manager import capture_rng_states, restore_rng_states
+        from checkpoint_manager import restore_rng_states
 
         mgr = CheckpointManager(tmp_path, "strict_lite")
         agent = small_agent()

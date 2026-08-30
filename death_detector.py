@@ -23,13 +23,13 @@ from __future__ import annotations
 
 import enum
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 
 from config import DeathConfig
-from perception import patch_median_rgb, patch_rgb_distance
+from perception import patch_rgb_distance
 
 
 class DeathState(enum.Enum):
@@ -58,7 +58,7 @@ class ColorAnchorDeathDetector:
         self._off_frames = 0
         self._on_frames = 0
         self._state = DeathState.ALIVE
-        self.last_result: Optional[DeathResult] = None
+        self.last_result: DeathResult | None = None
         self.last_distance = 0.0
         if not cfg.anchor_set():
             raise ValueError(
@@ -67,7 +67,7 @@ class ColorAnchorDeathDetector:
             )
 
     # ------------------------------------------------------------------ #
-    def update(self, patch: Optional[np.ndarray], frame_id: int, ts: float) -> DeathResult:
+    def update(self, patch: np.ndarray | None, frame_id: int, ts: float) -> DeathResult:
         if patch is None:
             res = DeathResult(DeathState.UNKNOWN, -1.0, "invalid_or_missing_patch",
                               frame_id, ts, self._on_frames)
@@ -131,10 +131,10 @@ class StagnationDetector:
     def __init__(self, timeout_s: float, change_threshold: float = 1.0) -> None:
         self.timeout_s = timeout_s
         self.change_threshold = change_threshold
-        self._last_change_ts: Optional[float] = None
-        self._last_frame: Optional[np.ndarray] = None
+        self._last_change_ts: float | None = None
+        self._last_frame: np.ndarray | None = None
 
-    def update(self, ground_gray: Optional[np.ndarray], ts: float) -> bool:
+    def update(self, ground_gray: np.ndarray | None, ts: float) -> bool:
         """Returns True when stagnation exceeded the timeout."""
         if ground_gray is None:
             return False
@@ -221,7 +221,7 @@ class RespawnController:
     def active(self) -> bool:
         return self._active
 
-    def update(self, death_state: DeathState, ts: Optional[float] = None) -> RespawnStatus:
+    def update(self, death_state: DeathState, ts: float | None = None) -> RespawnStatus:
         """Feed the current anchor state; returns the next respawn action."""
         t = ts if ts is not None else self.now()
         if not self._active:
@@ -249,7 +249,7 @@ class RespawnController:
 
 
 def synthetic_patch(rgb: tuple[int, int, int], noise: float = 0.0,
-                    rng: Optional[np.random.Generator] = None,
+                    rng: np.random.Generator | None = None,
                     size: int = 5) -> np.ndarray:
     """Build a synthetic NxNx3 anchor patch (used by tests and dry runs)."""
     rng = rng or np.random.default_rng(0)

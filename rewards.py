@@ -23,8 +23,7 @@ Design (requirement §13, cross-checked against the reward-hacking audit):
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 from config import RewardConfig
 from horizon_detector import HorizonResult
@@ -58,7 +57,7 @@ class RewardBreakdown:
 class PendingHazard:
     opened_frame_id: int
     opened_ts: float
-    action: Optional[int] = None
+    action: int | None = None
     frames_seen: int = 0
     resolved: bool = False
     expired: bool = False
@@ -83,7 +82,7 @@ class PendingHazardTracker:
 
     def __init__(self, cfg: RewardConfig) -> None:
         self.cfg = cfg
-        self._current: Optional[PendingHazard] = None
+        self._current: PendingHazard | None = None
         self.events: list[PendingHazard] = []
         self.bonuses_granted = 0
 
@@ -98,9 +97,8 @@ class PendingHazardTracker:
         self.events.append(self._current)
 
     def observe_action(self, action: int, frame_id: int) -> None:
-        if self._current is not None and not self._current.resolved:
-            if self._current.action is None:
-                self._current.action = action
+        if self._current is not None and not self._current.resolved and self._current.action is None:
+            self._current.action = action
 
     def on_frame(self, horizon: HorizonResult, action: int) -> float:
         """Advance the open event with a new valid frame; return bonus (0/…).
@@ -161,11 +159,11 @@ class SurvivalRewardCalculator:
         self.now = now
         self.hazards = PendingHazardTracker(cfg)
         self._episode_dead = False
-        self._last_ts: Optional[float] = None
+        self._last_ts: float | None = None
         self._last_ground_diff = 0.0
 
     # ------------------------------------------------------------------ #
-    def begin_episode(self, ts: Optional[float] = None) -> None:
+    def begin_episode(self, ts: float | None = None) -> None:
         self._episode_dead = False
         self._last_ts = self.now() if ts is None else ts
         self._last_ground_diff = 0.0
