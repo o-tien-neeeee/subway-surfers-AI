@@ -23,6 +23,8 @@ import queue as queue_mod
 import threading
 import time
 import tkinter as tk
+
+from version import APP_VERSION, banner
 from tkinter import messagebox, ttk
 from typing import Any, Optional
 
@@ -271,7 +273,9 @@ class ControlGUI:
     # Widget construction
     # ------------------------------------------------------------------ #
     def _build(self) -> None:
-        self.root.title("Subway Surfers Research Bot — calibration & control")
+        # DEEP-FIX: surface the build version so a user can tell at a
+        # glance whether they are running the fixed binary.
+        self.root.title(f"{banner()} — calibration & control")
         outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
 
@@ -419,10 +423,29 @@ class ControlGUI:
         from PIL import ImageTk
 
         img = img.copy()
-        img.thumbnail((420, 420))
+        img.thumbnail((420, 260))
         self.preview_img = ImageTk.PhotoImage(img)
         self.preview_label.configure(image=self.preview_img)
         self._latest_preview = img  # for click/anchor sampling (fractions)
+        # DEEP-FIX: the step-3 anchor canvas used to stay a blank grey/black
+        # box -- the preview image was never drawn on it, so the user picked
+        # the anchor blind ("đen thui").  Draw the same live frame there.
+        self.anchor_canvas.delete("preview")
+        self.anchor_canvas.delete("marker")
+        self._anchor_photo = self.preview_img
+        self.anchor_canvas.create_image(0, 0, anchor="nw",
+                                        image=self._anchor_photo, tags="preview")
+        # DEEP-FIX: luminance readout so a broken capture is obvious.
+        import numpy as _np
+        lum = float(_np.asarray(img, dtype=_np.float32).mean())
+        if lum < 8.0:
+            self.preview_luma_var.set(
+                f"capture luma {lum:.0f}/255 — BLACK! capture is broken: game "
+                "occluded / wrong region / hardware acceleration")
+        elif lum > 247.0:
+            self.preview_luma_var.set(f"capture luma {lum:.0f}/255 — pure WHITE, wrong region?")
+        else:
+            self.preview_luma_var.set(f"capture luma {lum:.0f}/255 — OK")
 
     _latest_preview: Optional[Any] = None
     _preview_full_size: Optional[Any] = None
@@ -460,6 +483,12 @@ class ControlGUI:
         self.anchor_canvas.bind("<ButtonPress-1>", self._anchor_clicked)
         self.anchor_var = tk.StringVar(value="anchor: not set")
         ttk.Label(f, textvariable=self.anchor_var, font=("Consolas", 10)).pack()
+        # DEEP-FIX: live readout of how "readable" the capture is.
+        # A black or white capture is instantly visible here instead of
+        # silently producing a useless anchor.
+        self.preview_luma_var = tk.StringVar(value="preview: not started")
+        ttk.Label(f, textvariable=self.preview_luma_var,
+                  font=("Consolas", 10), foreground="#080").pack()
         row = ttk.Frame(f)
         row.pack(pady=4)
         ttk.Button(row, text="Start preview", command=self.start_preview).pack(side=tk.LEFT, padx=3)
@@ -480,6 +509,10 @@ class ControlGUI:
             return
         self.cfg.death.anchor_fx = float(fx)
         self.cfg.death.anchor_fy = float(fy)
+        # DEEP-FIX: show where the anchor landed instead of an invisible state.
+        self.anchor_canvas.delete("marker")
+        self.anchor_canvas.create_oval(ev.x - 5, ev.y - 5, ev.x + 5, ev.y + 5,
+                                       outline="#ff3b30", width=2, tags="marker")
         self.anchor_var.set(f"anchor position: fx={fx:.3f} fy={fy:.3f} "
                             f"(abs {int(fx * self.cfg.region.width)},"
                             f"{int(fy * self.cfg.region.height)}) — now calibrate ALIVE")
@@ -525,16 +558,31 @@ class ControlGUI:
         if len(self.anchor_frames) < 8:
             self.status_var.set("Too few anchor samples; is the preview running? Retry.")
             return
-        from perception import patch_stability
+        from perception import (patch_stability, is_degenerate_patch,
+                                 mean_luma)
+        import numpy as np
 
         std, baseline = patch_stability(self.anchor_frames)
+        stacked = np.stack(self.anchor_frames)
+        black = mean_luma(stacked) < 8.0
+        flat = is_degenerate_patch(self.anchor_frames[0])
+        # DEEP-FIX: "stable" alone is the wrong gate -- a black or flat patch
+        # is the *most* stable thing there is, so a broken capture used to be
+        # [ACCEPTED] with std=0.00.  Require stability AND real content.
+        ok = (std <= 6.0) and not black and not flat
+        if black:
+            verdict = "[BLACK CAPTURE — not usable, see hint below]"
+        elif flat:
+            verdict = "[FLAT COLOUR — pick a textured pixel]"
+        elif std > 6.0:
+            verdict = "[UNSTABLE — pick a calmer pixel]"
+        else:
+            verdict = "[ACCEPTED]"
         self.cfg.death.anchor_baseline_rgb = baseline
         self.cfg.death.anchor_baseline_std = std
-        ok = std <= 6.0
         self.anchor_var.set(
             f"anchor baseline RGB={baseline} stability(std)={std:.2f} "
-            f"samples={len(self.anchor_frames)} "
-            f"{'[ACCEPTED]' if ok else '[UNSTABLE — pick a calmer pixel]'}"
+            f"samples={len(self.anchor_frames)} {verdict}"
         )
         if ok:
             self.log(f"anchor calibrated: rgb={baseline} std={std:.2f}")
@@ -542,7 +590,8 @@ class ControlGUI:
             self._maybe_ready()
         else:
             self.status_var.set(
-                f"Anchor unstable (std={std:.2f} > 6). Choose a pixel that does not "
+                f"Anchor not usable (std={std:.2f}, black={black}, flat={flat}). "
+                "Choose a pixel that does not "
                 f"flicker, then recalibrate."
             )
 

@@ -68,6 +68,60 @@ def patch_stability(patch_samples: list[np.ndarray]) -> tuple[float, tuple[int, 
     return float(stds.max()), (int(med[0]), int(med[1]), int(med[2]))
 
 
+def mean_luma(rgb: np.ndarray) -> float:
+    """ITU-R BT.601 luma of an HxWx3 uint8 array, in 0..255."""
+    arr = rgb.astype(np.float32)
+    return float(
+        (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).mean()
+    )
+
+
+def is_black_frame(frame: np.ndarray, max_luma: float = 8.0) -> bool:
+    """True when the frame is (near) black — the signature of a failed capture.
+
+    mss returns a black block when the target is occluded, off-screen, or the
+    window is drawn by a hardware-accelerated surface that BitBlt cannot read
+    (the classic Chrome "hardware acceleration" case).  A black capture is
+    *useless* for calibration, so callers must treat it as an error, not data.
+    """
+    return mean_luma(frame) < max_luma
+
+
+def capture_problem(frame: np.ndarray) -> Optional[str]:
+    """Return a human-readable diagnosis if a capture is unusable, else None.
+
+    The anchor acceptance used to rely on "stability" alone, but a black or
+    single-colour frame is the *most* stable thing there is -- so a broken
+    capture passed the check with std=0.00 and was silently [ACCEPTED].
+    This inverts that: degenerate content is rejected up front.
+    """
+    if frame is None or frame.size == 0:
+        return "empty capture (grab returned no pixels)"
+    lum = mean_luma(frame)
+    if lum < 8.0:
+        return (
+            f"capture is BLACK (luma={lum:.1f}). Likely causes: the game window "
+            "is occluded/minimised, the selected region is off-screen, or the "
+            "browser uses hardware acceleration that screen capture cannot "
+            "read (Chrome: Settings → disable 'Use hardware acceleration')."
+        )
+    if lum > 247.0:
+        return f"capture is pure WHITE (luma={lum:.1f}); wrong region?"
+    return None
+
+
+def is_degenerate_patch(patch: np.ndarray) -> bool:
+    """True for a 5x5 patch with effectively no information (uniform colour).
+
+    A uniform patch -- black, white, or any flat colour -- tells us nothing
+    about liveness, so it must never be accepted as a calibration anchor.
+    """
+    if patch is None or patch.size == 0:
+        return True
+    arr = patch.astype(np.float32)
+    return float(arr.std()) < 1e-6
+
+
 @dataclass
 class ZoneResult:
     """Preprocessed zones + validity flags for one captured frame."""

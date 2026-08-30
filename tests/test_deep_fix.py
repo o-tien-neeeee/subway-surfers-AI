@@ -1041,3 +1041,71 @@ class TestHazardExpiry:
             "the 'extend the danger window' semantics should still be "
             "recorded, just not on the deadline field"
         )
+
+
+# --------------------------------------------------------------------- #
+# 16. A black / flat capture must never be accepted as a calibration anchor
+# --------------------------------------------------------------------- #
+class TestBlackCaptureGuard:
+    """The anchor check used to accept a broken capture.
+
+    Symptom from a real Windows run: the preview was a black box and the
+    anchor read ``RGB=(37,37,35) stability(std)=0.00 [ACCEPTED]``.  Two
+    defects compounded:
+
+    * the step-3 preview image was never drawn on the anchor canvas, so the
+      user picked the anchor blind on a black box, and
+    * the acceptance gate was ``std <= 6`` -- "stable" -- but a black or flat
+      patch is the *most* stable thing there is, so a broken capture sailed
+      through with std=0.00.
+
+    These tests pin the perception-side guards that make a broken capture
+    impossible to accept silently.  They are pure numpy, so they run without a
+    display.
+    """
+
+    def test_black_frame_is_flagged(self) -> None:
+        from perception import is_black_frame, capture_problem, mean_luma
+
+        black = np.zeros((50, 50, 3), dtype=np.uint8)
+        assert is_black_frame(black)
+        msg = capture_problem(black)
+        assert msg is not None and "BLACK" in msg
+
+    def test_normal_frame_is_not_flagged(self) -> None:
+        from perception import is_black_frame, capture_problem
+
+        rng = np.random.default_rng(0)
+        frame = rng.integers(40, 220, size=(50, 50, 3)).astype(np.uint8)
+        assert not is_black_frame(frame)
+        assert capture_problem(frame) is None
+
+    def test_flat_patch_is_degenerate_even_when_stable(self) -> None:
+        """A uniform patch has std=0 (maximally 'stable') yet is useless."""
+        from perception import is_degenerate_patch
+
+        flat = np.full((5, 5, 3), 37, dtype=np.uint8)   # the (37,37,35)-style patch
+        assert is_degenerate_patch(flat)
+        textured = np.random.default_rng(1).integers(
+            0, 255, size=(5, 5, 3)).astype(np.uint8)
+        assert not is_degenerate_patch(textured)
+
+    def test_acceptance_requires_content_not_just_stability(self) -> None:
+        """Rebuild the real gate and show a black capture is rejected."""
+        from perception import patch_stability, is_degenerate_patch, mean_luma
+
+        black_samples = [np.zeros((5, 5, 3), dtype=np.uint8) for _ in range(17)]
+        std, baseline = patch_stability(black_samples)
+        assert std == 0.0, "a black patch is perfectly stable — that's the trap"
+        black = mean_luma(np.stack(black_samples)) < 8.0
+        flat = is_degenerate_patch(black_samples[0])
+        accepted = (std <= 6.0) and not black and not flat
+        assert not accepted, "black capture must be rejected despite std=0"
+
+    def test_mean_luma_matches_known_value(self) -> None:
+        from perception import mean_luma
+
+        white = np.full((4, 4, 3), 255, dtype=np.uint8)
+        assert mean_luma(white) == pytest.approx(255.0, abs=1e-6)
+        grey = np.full((4, 4, 3), 128, dtype=np.uint8)
+        assert 127.0 <= mean_luma(grey) <= 129.0

@@ -48,7 +48,8 @@ sys.path.insert(0, str(ROOT))
 from agent import InferencePolicy                       # noqa: E402
 from config import BotConfig, NOOP                      # noqa: E402
 from environment import GameEnvironment, SyntheticGame  # noqa: E402
-from models import PROFILES, DuelingDQN                 # noqa: E402
+from models import PROFILES, DuelingDQN
+from version import APP_VERSION, CHANGELOG                 # noqa: E402
 
 
 # --------------------------------------------------------------------- #
@@ -436,6 +437,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
         elif path == "/api/health":
             self._json({"ok": True, "python": sys.version.split()[0],
+                        "version": APP_VERSION,
                         "demo_running": DEMO.running,
                         "train_running": TRAIN.running})
         else:
@@ -524,7 +526,7 @@ border-radius:0 7px 7px 0;color:var(--mut);font-size:13px;margin:0 0 14px}
 .dot.on{background:var(--ok);box-shadow:0 0 7px var(--ok)}
 </style></head><body>
 <header>
-  <h1>Subway Surfers Research Bot</h1>
+  <h1>Subway Surfers Research Bot <span class="sub" id="ver"></span></h1>
   <span class="sub">screen-capture RL &middot; CPU-only PyTorch</span>
   <span class="sub"><span class="dot" id="dot"></span> <span id="dotT">idle</span></span>
   <nav>
@@ -615,6 +617,7 @@ border-radius:0 7px 7px 0;color:var(--mut);font-size:13px;margin:0 0 14px}
 </main>
 <script>
 const $=id=>document.getElementById(id);
+get('/api/health').then(h=>{ if(h.version) $('ver').textContent='v'+h.version; }).catch(()=>{});
 const tabs=document.querySelectorAll('nav button');
 tabs.forEach(b=>b.onclick=()=>{
   tabs.forEach(x=>x.classList.remove('pri'));b.classList.add('pri');
@@ -688,7 +691,7 @@ setInterval(async()=>{
 async function loadReport(){
   const r=await get('/api/report');
   if(!r.exists){$('rbody').innerHTML='<span class="mut">Chưa có report. Chạy tab Train trước.</span>';return;}
-  $('rmeta').textContent='· cập nhật '+r.mtime;
+  $('rmeta').textContent='· bản '+(r.data.app_version||'?')+' · cập nhật '+r.mtime;
   const d=r.data,s=d.summary||{},recs=d.records||[];
   let h=`<p><b>Verdict:</b> <span class="warn">${d.verdict||'—'}</span></p>`;
   for(const kind of Object.keys(s)){

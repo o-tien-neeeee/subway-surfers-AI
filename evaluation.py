@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+
+from version import APP_VERSION
 import logging
 import math
 import random
@@ -352,6 +354,7 @@ class EvaluationReport:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "app_version": APP_VERSION,   # DEEP-FIX: reports are self-describing
             "summary": self.summary(),
             "verdict": self.verdict(),
             "records": [asdict(r) for r in self.records],

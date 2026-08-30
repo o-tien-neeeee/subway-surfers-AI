@@ -691,3 +691,54 @@ trong phạm vi quét của nó.
 > **Trung thực:** sandbox này không có display/Windows, nên phần calibration
 > GUI (mục 7) vẫn chưa thể chạy ở đây. Dashboard cho bạn xem Live/Train/Report
 > — những phần thực sự chạy được không cần desktop.
+
+---
+
+# PHẦN 9 — VÒNG 4: preview đen thui + version hiển thị khắp nơi
+
+Bạn gửi ảnh: bước 3 preview **đen thui**, anchor `RGB=(37,37,35) std=0.00
+[ACCEPTED]`, và yêu cầu *"mỗi lần chỉnh sửa thì tăng version lên"*.
+
+## 9.1 🔴 Vì sao preview đen và vì sao capture đen vẫn được [ACCEPTED]
+
+Hai lỗi cộng hưởng:
+
+1. **Ảnh preview không bao giờ được vẽ lên canvas bước 3.** Preview chỉ hiện ở
+   `preview_label` (bước 2); `anchor_canvas` (bước 3) giữ nguyên nền `grey15`
+   (gần đen) trống trơn. Nên bạn chọn anchor **mò trên một hộp đen**.
+2. **Cổng chấp nhận là `std <= 6` ("ổn định") — nhưng một capture đen/đồng
+   nhất lại là thứ *ổn định nhất* (std=0.00).** Heuristic "ổn định = tốt" bị
+   đảo ngược khi capture hỏng: màn hình đen pass cổng và được `[ACCEPTED]`.
+   Tác giả giả định "pixel ổn định là UI element tốt", nhưng quên rằng capture
+   hỏng cũng ổn định tuyệt đối.
+
+## 9.2 Đã sửa
+
+- **Vẽ preview sống lên `anchor_canvas`** (cùng frame với bước 2) để bạn **nhìn
+  thấy game** khi chọn anchor; thêm **vòng đỏ đánh dấu** vị trí bạn click.
+- **Đọc độ sáng (luma) trực tiếp trên preview**: `capture luma X/255 — OK /
+  BLACK! / WHITE?` — capture hỏng hiện ra ngay lập tức.
+- **Cổng chấp nhận mới**: `ok = (std<=6) AND không đen AND không phẳng`.
+  Capture đen → `[BLACK CAPTURE — not usable]`; màu phẳng → `[FLAT COLOUR]`.
+- **Helper mới trong `perception.py`**: `mean_luma`, `is_black_frame`,
+  `capture_problem` (chẩn đoán nguyên liệu: game bị che / sai vùng / hardware
+  acceleration của Chrome), `is_degenerate_patch`.
+- **Hệ thống version** (`version.py`, một nguồn duy nhất): title cửa sổ Tk,
+  dòng khởi động `app.py`, header + `/api/health` của dashboard, và
+  `app_version` trong `runs/headless_report.json`. Hiện tại **v1.5.0**. Quy
+  tắc: bump `APP_VERSION` ở mỗi lần hành vi thay đổi.
+
+## 9.3 Kiểm chứng
+
+| Kiểm chứng | Kết quả |
+|---|---|
+| `pytest -q` | **490 passed, 0 failed** (83.4 s) — trước: 481 |
+| `app.py --headless` | in `Subway Surfers Research Bot v1.5.0`; report có `app_version: 1.5.0` |
+| Test guard capture đen (`TestBlackCaptureGuard`, 5 test) | pass; chứng minh patch đen có std=0 nhưng bị từ chối |
+| Smoke | `HEADLESS SMOKE TEST: PASS`, `workers_exited_cleanly: true` |
+
+> **Trung thực:** sandbox không có display, nên tôi không thể tự nhìn thấy cửa
+> sổ Tk. Phần vẽ preview lên canvas được kiểm chứng bằng đọc code + test logic
+> perception; bạn cần chạy `python app.py` trên Windows để thấy preview có hình.
+> Nếu vẫn đen: tắt **hardware acceleration** của Chrome, đảm bảo game không bị
+> che, và chọn lại vùng — dashboard/report giờ sẽ nói rõ lý do thay vì im lặng.

@@ -23,6 +23,8 @@ CLI examples:
 from __future__ import annotations
 
 import argparse
+
+from version import banner
 import multiprocessing as mp
 import sys
 import time
@@ -401,6 +403,7 @@ def cmd_pretrain_headless(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    print(banner(), flush=True)  # DEEP-FIX: show build at startup
     parser = argparse.ArgumentParser(
         prog="app.py", description="Subway Surfers research bot (screen-capture only)"
     )
