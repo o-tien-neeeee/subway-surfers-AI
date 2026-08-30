@@ -1357,7 +1357,10 @@ class TestCalibrationVisibleAndTestClick:
         src = self._src()
         assert "HELP_AZ" in src and '"❓ Hướng dẫn"' in src
         for phrase in ("BƯỚC 1", "BƯỚC 6", "hardware acceleration",
-                       "CLICK VÀO CỬA", "F8"):
+                       "CLICK VÀO CỬA", "F8",
+                       "QUAY DEMO", "TIỀN-HUẤN LUYỆN BC",
+                       "--validate-demos", "--pretrain",
+                       "bc.min_episodes", "NOOP only"):
             assert phrase in src, f"help must cover {phrase!r}"
 
     def test_click_focus_gate_still_protects_gameplay(self) -> None:

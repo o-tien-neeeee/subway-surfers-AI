@@ -124,6 +124,36 @@ BƯỚC 6 – Chạy: "▶ Bắt đầu train". QUAN TRỌNG: ngay sau khi bấm
    SỔ CHROME để game có focus — bot chỉ chơi khi Chrome focus (để không bấm nhầm
    khi bạn đang gõ). F8 = dừng khẩn cấp. F9 = dừng quay demo.
 
+QUAY DEMO (dạy bot bằng cách BẠN chơi):
+ • Mục đích: bot HỌC BẮT CHƯỚC bạn. Bạn chơi, bot CHỈ quay lại — nó KHÔNG
+   tự bấm phím.  Mỗi khung hình 84x84 được lưu kèm hành động bạn nhấn.
+ • Cách dùng: (1) đã Chọn + Khoá vùng (bước 1-2); (2) bấm "● Quay demo (F9
+   dừng)"; (3) CHƠI bằng phím mũi tên (trái / phải / nhảy / lướt) — ô
+   "demo frames: N" đếm số khung đang ghi; (4) bấm F9 (hoặc nút) để dừng & lưu.
+ • File lưu: demos/episode_YYYYmmdd_HHMMSS.npz (ghi atomic, không ghi đè).
+ • Dòng lệnh: python app.py --record-demo
+ • LƯU Ý QUAN TRỌNG: cần bàn phím thật + pynput.  Nếu không có hook bàn phím,
+   log báo "UNAVAILABLE — NOOP only" và episode sẽ TOÀN NOOP = VÔ DỤNG cho BC.
+   Bạn phải chơi thật, nhấn phím thật.
+ • Kiểm tra demo đã quay: python app.py --validate-demos demos  →  in
+   "X/Y episodes valid".  Episode INVALID nếu: rỗng, khung != 84x84, hành động
+   ngoài 0..4, timestamp không tăng dần, hoặc cờ done không nằm ở bước cuối.
+
+TIỀN-HUẤN LUYỆN BC (học bắt chước TRƯỚC khi RL):
+ • Mục đích: huấn luyện policy bắt chước các demo ở trên TRƯỚC, để bot không
+   khởi đầu hoàn toàn ngẫu nhiên.  (BC = behaviour cloning.)
+ • Điều kiện: cần >= 2 episode hợp lệ (bc.min_episodes).  Thiếu thì log báo
+   "BC skipped — online learning with warm-up will be used instead" — vẫn train
+   RL bình thường, chỉ là không có bước bắt chước.
+ • Cách dùng (GUI): phải BẬT train trước (để learner chạy), rồi bấm nút
+   "Tiền-huấn luyện (BC)".
+ • Cách dùng (dòng lệnh, KHÔNG cần game): python app.py --pretrain demos
+ • Nó làm gì: kiểm tra demos → train 8 epoch (batch 64, Adam lr 1e-3) → mỗi
+   epoch log "BC epoch K: loss / train_acc / val_acc" → lưu checkpoint best
+   (theo val_acc) và latest.
+ • BC KHÔNG tự chạy khi bấm "Bắt đầu train" — bạn phải chủ động bấm nút BC
+   hoặc chạy lệnh --pretrain.
+
 GIẢI QUYẾT RẮC RỐI:
  • "test click ... BLOCKED (focus?)": bản cũ bắt Chrome focus cả khi test — đã sửa,
    nút Test giờ bỏ qua cổng focus (vẫn hỏi xác nhận).

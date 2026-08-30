@@ -915,3 +915,37 @@ Hướng dẫn.
 Calibration của người dùng thực ra ĐÚNG — vấn đề là *không nhìn thấy* và *bị chặn oan*. Đường chân trời và marker phải được vẽ lên chính preview (toạ độ phân số để đúng tỉ lệ thumbnail). Cổng focus là đúng cho gameplay (tránh bấm nhầm khi người dùng gõ phím) nhưng sai cho cú test có xác nhận — nên bypass có chủ đích, không bỏ cổng. Chết-ngay là hệ quả môi trường (vùng bị che/màn thua) nên thêm preflight phát hiện sớm thay vì đoán. Changelog gộp chuỗi là bug thật tìm thấy khi bump version — sửa và khoá bằng test.
 
 **Chưa kiểm chứng được trong sandbox:** không có display/Chrome/pynput — việc vẽ overlay và tab hướng dẫn chỉ xác minh bằng compile + test cấu trúc/chuỗi, chưa thấy bằng mắt.
+
+---
+
+## Phần 14 — Vòng 8b (v1.9.1): Giải thích + cách dùng Quay demo & Tiền-huấn luyện BC
+
+**Yêu cầu:** người dùng cần giải thích và cách dùng của **quay demo** và **tiền huấn luyện**. Đã đọc code thật (`demonstration_recorder.py`, `learner_worker.py::pretrain`, `dataset.py::validate_episode`, `gui.py::toggle_demo_recording/run_pretrain`, `app.py` CLI) để mô tả đúng cơ chế, không đoán.
+
+### Cơ chế thật (đã xác minh bằng đọc code)
+
+**Quay demo** — `DemoRecorder` + `KeyboardTap`:
+- Bot **chỉ quay, không bấm phím**. `KeyboardTap` (pynput) quan sát phím mũi tên người chơi → map sang action 1/2/3/4 (NOOP=0 khi không giữ phím), honour cả keymap tuỳ chỉnh.
+- Ghi khung ground-zone 84×84 (uint8) + action + timestamp + death_state + confidence + score; `pump(max_frames=4)` được Tk polling loop gọi (latest-wins).
+- Dừng bằng F9/nút → `stop(done=True)` ghi atomic `demos/episode_YYYYmmdd_HHMMSS[_NN].npz` (counter chống ghi đè trong cùng giây).
+- Không có hook bàn phím → log "UNAVAILABLE — NOOP only", episode toàn NOOP = vô dụng cho BC.
+- GUI: nút "● Quay demo (F9 dừng)" (`toggle_demo_recording`), cần vùng đã chọn; CLI `--record-demo`.
+
+**Validate demo** — `dataset.validate_episode`: INVALID nếu rỗng, frames ≠ [N,84,84], action ngoài 0..4, timestamp không tăng, hoặc `done` không đúng 1 cờ ở bước cuối. Gap timestamp > 3× cadence chỉ là warning. CLI `--validate-demos demos`.
+
+**Tiền-huấn luyện BC** — `learner_worker.pretrain`:
+- `validate_directory` → giữ episode hợp lệ; nếu `< bc.min_episodes` (mặc định 2) → "BC skipped — online learning with warm-up will be used instead", trả `status=skipped`.
+- Đủ thì: `DemonstrationDataset` (frame_stack) → `split_by_episode(val_fraction 0.15)` → `class_weights(inverse_sqrt)` → Adam(lr 1e-3, wd 1e-5) → `bc.epochs` (8) epoch, batch 64, `agent.bc_epoch` + `bc_eval` → log "BC epoch K: loss/train_acc/val_acc" → lưu ckpt best (theo val_acc) + latest, `sync_target`.
+- **Không tự chạy khi Start** — chỉ trigger qua nút "Tiền-huấn luyện (BC)" (`run_pretrain` → `app.command("pretrain")`, cần app đang chạy) hoặc CLI `--pretrain demos` (headless, không cần game).
+
+### Thay đổi
+
+- `gui.py::HELP_AZ`: thêm 2 mục "QUAY DEMO" và "TIỀN-HUẤN LUYỆN BC" (mục đích, cách dùng GUI + CLI, điều kiện ≥2 episode, cảnh báo NOOP-only, lệnh validate).
+- `version.py`: `APP_VERSION → 1.9.1` + CHANGELOG.
+- `tests/test_deep_fix.py`: mở rộng `test_a_to_z_help_tab_exists_and_is_vietnamese` kiểm tra help phủ "QUAY DEMO", "TIỀN-HUẤN LUYỆN BC", "--validate-demos", "--pretrain", "bc.min_episodes", "NOOP only".
+
+**Kết quả:** `pytest -q` → **508 passed**. (Không thêm test mới, chỉ mở rộng assertion.)
+
+### My Reasoning
+
+Người dùng "chẳng hiểu gì" vì demo/BC là hai workflow tách biệt khỏi 6 bước calibration, lại chỉ có nút bấm không giải thích. Thay vì đoán, tôi đọc `demonstration_recorder.py` (thấy bot không bấm phím, cần pynput thật, NOOP-only khi headless), `learner_worker.pretrain` (ngưỡng ≥2 episode, BC không auto-run), và `validate_episode` (tiêu chí INVALID) rồi viết đúng những gì code làm — kể cả các bẫy (episode toàn NOOP, BC bỏ qua khi thiếu demo, phải bật train trước khi bấm nút BC).
