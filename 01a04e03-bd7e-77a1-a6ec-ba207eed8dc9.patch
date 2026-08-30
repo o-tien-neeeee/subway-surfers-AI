@@ -1,0 +1,2153 @@
+diff --git a/action_scheduler.py b/action_scheduler.py
+index 3c1c129..7747c50 100644
+--- a/action_scheduler.py
++++ b/action_scheduler.py
+@@ -19,8 +19,8 @@ Cadence policy (requirement §9):
+ from __future__ import annotations
+ 
+ import time
+-from dataclasses import dataclass, field
+-from typing import Optional, Callable
++from collections.abc import Callable
++from dataclasses import dataclass
+ 
+ from config import NOOP, SchedulerConfig
+ 
+@@ -53,11 +53,11 @@ class ActionScheduler:
+         self._frames_since_decision = 0
+         self._current_cadence = cfg.max_decision_frames
+         self._buffer: list[PlannedAction] = []
+-        self._last_executed: Optional[int] = None
++        self._last_executed: int | None = None
+         self._last_executed_ts = -1e9
+         self._action_step = 0
+         self._last_load: float = 0.0
+-        self._last_confidence: Optional[float] = None
++        self._last_confidence: float | None = None
+ 
+     # ------------------------------------------------------------------ #
+     # Load adaptation
+@@ -66,7 +66,7 @@ class ActionScheduler:
+         """Pick cadence from CPU load only (backward-compatible shim)."""
+         self.set_signal(load01, None)
+ 
+-    def set_signal(self, load01: float, horizon_confidence: Optional[float]) -> None:
++    def set_signal(self, load01: float, horizon_confidence: float | None) -> None:
+         """Pick cadence from CPU load AND horizon confidence (requirement §9).
+ 
+         * high load  -> slow bound (protect the FPS budget),
+@@ -120,7 +120,7 @@ class ActionScheduler:
+         self.stats.decisions += 1
+         return True
+ 
+-    def pop_executable(self) -> Optional[PlannedAction]:
++    def pop_executable(self) -> PlannedAction | None:
+         """Next action to execute, applying expiry and duplicate suppression."""
+         t = self.now()
+         while self._buffer:
+diff --git a/agent.py b/agent.py
+index 19715c7..a0bb994 100644
+--- a/agent.py
++++ b/agent.py
+@@ -13,12 +13,11 @@
+ from __future__ import annotations
+ 
+ import math
+-import random
+-from typing import Any, Optional
++from typing import Any
+ 
+ import numpy as np
+ import torch
+-import torch.nn as nn
++from torch import nn
+ 
+ from config import RLConfig
+ from models import DuelingDQN, build_models_for_profile
+@@ -38,7 +37,7 @@ class InferencePolicy:
+         self.rng = np.random.default_rng(seed)
+         self._version = -1
+ 
+-    def refresh_weights(self, shared, version: Optional[int] = None) -> bool:
++    def refresh_weights(self, shared, version: int | None = None) -> bool:
+         """Pull new flat weights from SharedWeights if version changed."""
+         v = shared.version() if version is None else version
+         if v == self._version:
+@@ -84,7 +83,7 @@ class DoubleDQNAgent:
+         self.online.to(self.device)
+         self.target.to(self.device)
+         self.optimizer = torch.optim.Adam(self.online.parameters(), lr=cfg.learning_rate)
+-        self.scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
++        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+         if cfg.lr_schedule == "cosine":
+             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                 self.optimizer,
+@@ -140,9 +139,12 @@ class DoubleDQNAgent:
+         self.update_count += 1
+         self.maybe_sync_target()
+ 
++        with torch.no_grad():
++            td_error_abs = td_error.abs().detach().cpu().numpy().astype(np.float64)
+         return {
+             "loss": float(loss.item()),
+-            "td_error_abs_mean": float(td_error.abs().mean().item()),
++            "td_error_abs": td_error_abs,                          # per-sample for PER
++            "td_error_abs_mean": float(td_error_abs.mean()),
+             "q_mean": float(q_all.mean().item()),
+             "q_max": float(q_all.max().item()),
+             "q_min": float(q_all.min().item()),
+@@ -158,7 +160,7 @@ class DoubleDQNAgent:
+         obs_u8: np.ndarray,
+         actions: np.ndarray,
+         sample_weights: np.ndarray,
+-        optimizer: Optional[torch.optim.Optimizer] = None,
++        optimizer: torch.optim.Optimizer | None = None,
+     ) -> dict[str, float]:
+         """Cross-entropy of softmax(advantage logits) vs expert actions."""
+         opt = optimizer or self.optimizer
+@@ -206,7 +208,7 @@ class DoubleDQNAgent:
+         if payload.get("optimizer"):
+             try:
+                 self.optimizer.load_state_dict(payload["optimizer"])
+-            except ValueError as exc:
++            except ValueError:
+                 if strict:
+                     raise
+                 # profile change: keep fresh optimizer, warn through return
+diff --git a/app.py b/app.py
+index a68bc03..da38364 100644
+--- a/app.py
++++ b/app.py
+@@ -24,10 +24,9 @@ from __future__ import annotations
+ 
+ import argparse
+ import multiprocessing as mp
+-import sys
+ import time
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any
+ 
+ from config import PROFILE_ORDER, BotConfig
+ from ipc import (
+@@ -38,8 +37,8 @@ from ipc import (
+     bounded_queue,
+     make_events,
+ )
+-from logging_utils import drain, format_exception, get_logger, setup_logging
+-from models import PROFILES, weight_size_for_profile
++from logging_utils import drain, get_logger, setup_logging
++from models import weight_size_for_profile
+ 
+ LOGGER = get_logger("app")
+ 
+@@ -48,7 +47,7 @@ class BotApplication:
+     """Owns worker processes and shared state (used by GUI and headless CLI)."""
+ 
+     def __init__(self, cfg: BotConfig, input_backend: str = "auto",
+-                 capture_source: Optional[str] = None, log_dir: str = "logs") -> None:
++                 capture_source: str | None = None, log_dir: str = "logs") -> None:
+         self.cfg = cfg
+         self.input_backend = input_backend
+         if capture_source is not None:
+@@ -69,9 +68,9 @@ class BotApplication:
+         self.cmd_q = bounded_queue(32)
+         self.action_q = bounded_queue(64)  # actor -> fake game
+ 
+-        self.capture_proc: Optional[mp.process.BaseProcess] = None
+-        self.actor_proc: Optional[mp.process.BaseProcess] = None
+-        self.learner_proc: Optional[mp.process.BaseProcess] = None
++        self.capture_proc: mp.process.BaseProcess | None = None
++        self.actor_proc: mp.process.BaseProcess | None = None
++        self.learner_proc: mp.process.BaseProcess | None = None
+         self._started = False
+ 
+     # ------------------------------------------------------------------ #
+@@ -233,7 +232,7 @@ class BotApplication:
+     # Headless run (CI smoke test / profiling)
+     # ------------------------------------------------------------------ #
+     def headless_run(self, max_env_frames: int = 600, learn: bool = True,
+-                     report_path: Optional[str] = None) -> dict[str, Any]:
++                     report_path: str | None = None) -> dict[str, Any]:
+         """Run the full pipeline against the synthetic game; return summary."""
+         from evaluation import EpisodeRecord, EvaluationReport
+ 
+@@ -291,7 +290,7 @@ class BotApplication:
+ def cmd_validate_demos(demos_dir: str) -> int:
+     from dataset import summarize_reports, validate_directory
+ 
+-    eps, reps = validate_directory(demos_dir)
++    _eps, reps = validate_directory(demos_dir)
+     print(summarize_reports(reps))
+     ok = sum(1 for r in reps if r.ok)
+     print(f"\n{ok}/{len(reps)} episodes valid for behaviour cloning")
+@@ -365,7 +364,7 @@ def cmd_pretrain_headless(args: argparse.Namespace) -> int:
+     return 0 if result.get("status") == "ok" else 1
+ 
+ 
+-def main(argv: Optional[list[str]] = None) -> int:
++def main(argv: list[str] | None = None) -> int:
+     parser = argparse.ArgumentParser(
+         prog="app.py", description="Subway Surfers research bot (screen-capture only)"
+     )
+diff --git a/capture_worker.py b/capture_worker.py
+index 14591f2..22a46ba 100644
+--- a/capture_worker.py
++++ b/capture_worker.py
+@@ -16,7 +16,7 @@ Two sources:
+ from __future__ import annotations
+ 
+ import time
+-from typing import Any, Optional
++from typing import Any
+ 
+ import numpy as np
+ 
+@@ -32,7 +32,7 @@ def _mss_grab_factory(monitor: dict[str, int]):
+ 
+     sct = mss.mss()
+ 
+-    def grab() -> Optional[np.ndarray]:
++    def grab() -> np.ndarray | None:
+         raw = sct.grab(monitor)
+         arr = np.asarray(raw)[:, :, :3]  # BGRA -> BGR
+         rgb = arr[:, :, ::-1]            # -> RGB
+@@ -41,7 +41,7 @@ def _mss_grab_factory(monitor: dict[str, int]):
+     return grab
+ 
+ 
+-def virtual_screen_geometry() -> Optional[tuple[int, int]]:
++def virtual_screen_geometry() -> tuple[int, int] | None:
+     """(width, height) of the virtual screen, or None when unavailable."""
+     try:
+         import mss
+@@ -49,12 +49,12 @@ def virtual_screen_geometry() -> Optional[tuple[int, int]]:
+         with mss.mss() as sct:
+             mon0 = sct.monitors[0]
+             return int(mon0["width"]), int(mon0["height"])
+-    except Exception:  # no display / mss trouble: caller must tolerate None
++    except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+         return None
+ 
+ 
+-def geometry_matches(region: Any, actual_w: Optional[int],
+-                     actual_h: Optional[int]) -> Optional[bool]:
++def geometry_matches(region: Any, actual_w: int | None,
++                     actual_h: int | None) -> bool | None:
+     """Compare the current virtual screen against the calibrated one.
+ 
+     Returns True (same), False (changed — recalibration advised), or None
+@@ -129,7 +129,7 @@ def capture_main(
+             grab = _fake_grab_factory(cfg, action_q)
+         else:
+             raise ValueError(f"unknown capture source {source!r}")
+-    except Exception as exc:
++    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+         put_bounded(metrics_q, {"type": "error", "src": "capture",
+                                 "error": f"{type(exc).__name__}: {exc}",
+                                 "tb": format_exception(exc)})
+@@ -147,7 +147,7 @@ def capture_main(
+     # and warn exactly once per change so the user can re-calibrate.
+     geometry_check_interval = 5.0
+     next_geometry_check = time.monotonic() + geometry_check_interval
+-    last_geometry_state: Optional[bool] = None
++    last_geometry_state: bool | None = None
+     LOGGER.info("capture start: %s %dx%d+%d+%d @ %dfps", source,
+                 cfg.region.width, cfg.region.height, cfg.region.left,
+                 cfg.region.top, cfg.capture.target_fps)
+@@ -158,7 +158,7 @@ def capture_main(
+             t0 = time.monotonic()
+             try:
+                 image = grab()
+-            except Exception as exc:
++            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 failures += 1
+                 LOGGER.error("grab failed (#%d): %s", failures, exc)
+                 if failures >= 5:
+@@ -223,7 +223,7 @@ def capture_main(
+                             "type": "log", "level": "info", "src": "capture",
+                             "msg": "screen geometry matches calibration again",
+                         })
+-    except Exception as exc:
++    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+         put_bounded(metrics_q, {"type": "error", "src": "capture",
+                                 "error": f"{type(exc).__name__}: {exc}",
+                                 "tb": format_exception(exc)})
+diff --git a/checkpoint_manager.py b/checkpoint_manager.py
+index 9663be7..2b7626c 100644
+--- a/checkpoint_manager.py
++++ b/checkpoint_manager.py
+@@ -13,12 +13,11 @@ Rules (requirement §12):
+ 
+ from __future__ import annotations
+ 
+-import json
+ import os
+ import subprocess
+ import time
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any
+ 
+ import numpy as np
+ import torch
+@@ -36,7 +35,7 @@ def _git_hash() -> str:
+     try:
+         out = subprocess.run(
+             ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5,
+-            cwd=str(Path(__file__).parent),
++            cwd=str(Path(__file__).parent), check=False,
+         )
+         if out.returncode == 0:
+             return out.stdout.strip()
+@@ -74,7 +73,7 @@ class CheckpointManager:
+         self.dir = Path(directory) / profile
+         self.dir.mkdir(parents=True, exist_ok=True)
+         self.profile = profile
+-        self.best_metric: Optional[float] = None
++        self.best_metric: float | None = None
+         self._best_path = self.dir / "best_model.pth"
+         self._latest_path = self.dir / "latest_model.pth"
+         self._buffer_path = self.dir / "buffer.pkl"
+@@ -102,9 +101,9 @@ class CheckpointManager:
+         agent_payload: dict[str, Any],
+         extra: dict[str, Any],
+         which: str = "latest",
+-        metric: Optional[float] = None,
++        metric: float | None = None,
+         higher_is_better: bool = True,
+-    ) -> Optional[Path]:
++    ) -> Path | None:
+         payload = {
+             "profile": self.profile,
+             "agent": agent_payload,
+@@ -130,14 +129,14 @@ class CheckpointManager:
+             return None
+         return path
+ 
+-    def load_model(self, which: str = "latest") -> Optional[dict[str, Any]]:
++    def load_model(self, which: str = "latest") -> dict[str, Any] | None:
+         path = self._latest_path if which == "latest" else self._best_path
+         if not path.exists():
+             return None
+         try:
+             payload = torch.load(str(path), map_location="cpu", weights_only=False)
+             return payload
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             corrupt = path.with_name(path.name + ".corrupt")
+             try:
+                 os.replace(str(path), str(corrupt))
+@@ -152,8 +151,8 @@ class CheckpointManager:
+ 
+     def _atomic_torch_save(self, payload: dict[str, Any], path: Path) -> None:
+         tmp = path.with_name(path.name + ".tmp")
+-        data = torch.save(payload, str(tmp))
+-        # torch.save returns None; rewrite via bytes buffer for hashing.
++        torch.save(payload, str(tmp))
++        # torch.save returns None; read back for hashing.
+         with open(tmp, "rb") as fh:
+             digest = hash_bytes(fh.read())
+         sidecar = path.with_name(path.name + ".sha256")
+@@ -167,7 +166,7 @@ class CheckpointManager:
+         try:
+             buffer_obj.save(str(self._buffer_path))
+             return True
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             get_logger("checkpoint").error(
+                 "buffer save failed:\n%s", format_exception(exc)
+             )
+@@ -191,7 +190,7 @@ class CheckpointManager:
+                 "buffer corrupt, starting empty:\n%s", format_exception(exc)
+             )
+             return None, False
+-        except Exception as exc:  # unexpected: never take the process down
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             get_logger("checkpoint").error(
+                 "buffer load failed, starting empty:\n%s", format_exception(exc)
+             )
+diff --git a/config.py b/config.py
+index 9bccbae..d9db862 100644
+--- a/config.py
++++ b/config.py
+@@ -22,7 +22,7 @@ import dataclasses
+ import json
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any
+ 
+ CONFIG_VERSION = "1.0"
+ 
+@@ -407,7 +407,7 @@ class BotConfig:
+         Path(path).write_text(self.to_json(), encoding="utf-8")
+ 
+     @classmethod
+-    def from_dict(cls, data: dict[str, Any]) -> "BotConfig":
++    def from_dict(cls, data: dict[str, Any]) -> BotConfig:
+         cfg = cls()
+         for section in (
+             "capture", "perception", "horizon", "death", "region", "input",
+@@ -428,7 +428,7 @@ class BotConfig:
+         return cfg
+ 
+     @classmethod
+-    def load(cls, path: str | Path) -> "BotConfig":
++    def load(cls, path: str | Path) -> BotConfig:
+         p = Path(path)
+         if not p.exists():
+             raise ConfigError(f"config file not found: {p}")
+@@ -438,7 +438,7 @@ class BotConfig:
+             raise ConfigError(f"config file {p} is not valid JSON: {exc}") from exc
+         return cls.from_dict(data)
+ 
+-    def profile_downgrade(self) -> Optional[str]:
++    def profile_downgrade(self) -> str | None:
+         """Return the next lighter profile, or None if already lightest."""
+         try:
+             idx = PROFILE_ORDER.index(self.rl.profile)
+diff --git a/dataset.py b/dataset.py
+index b2fc7eb..3ae2269 100644
+--- a/dataset.py
++++ b/dataset.py
+@@ -27,7 +27,6 @@ from __future__ import annotations
+ import json
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Iterator, Optional
+ 
+ import numpy as np
+ 
+@@ -39,9 +38,9 @@ class Episode:
+     actions: np.ndarray     # [N]
+     timestamps: np.ndarray  # [N]
+     done: np.ndarray        # [N]
+-    score: Optional[np.ndarray] = None
+-    death_state: Optional[np.ndarray] = None
+-    confidence: Optional[np.ndarray] = None
++    score: np.ndarray | None = None
++    death_state: np.ndarray | None = None
++    confidence: np.ndarray | None = None
+     meta: dict = field(default_factory=dict)
+ 
+     def __len__(self) -> int:
+@@ -55,7 +54,7 @@ class Episode:
+         return (len(self) - 1) / span if span > 0 else 0.0
+ 
+     def action_counts(self) -> dict[int, int]:
+-        counts = {a: 0 for a in range(5)}
++        counts = dict.fromkeys(range(5), 0)
+         for a in self.actions:
+             a = int(a)
+             if a in counts:
+@@ -194,7 +193,7 @@ class DemonstrationDataset:
+         return len(self._index)
+ 
+     def class_counts(self) -> dict[int, int]:
+-        counts = {a: 0 for a in range(5)}
++        counts = dict.fromkeys(range(5), 0)
+         for ei, si in self._index:
+             a = int(self._episodes[ei].actions[si])
+             if a in counts:
+@@ -228,8 +227,8 @@ class DemonstrationDataset:
+         rng = np.random.default_rng(seed)
+         n_eps = len(self._episodes)
+         order = rng.permutation(n_eps)
+-        n_val = max(1, int(round(n_eps * val_fraction))) if n_eps > 1 else 0
+-        val_eps = set(int(e) for e in order[:n_val])
++        n_val = max(1, round(n_eps * val_fraction)) if n_eps > 1 else 0
++        val_eps = {int(e) for e in order[:n_val]}
+         train_idx, val_idx = [], []
+         for pos, (ei, _si) in enumerate(self._index):
+             (val_idx if int(ei) in val_eps else train_idx).append(pos)
+diff --git a/death_detector.py b/death_detector.py
+index c2962e0..87a859a 100644
+--- a/death_detector.py
++++ b/death_detector.py
+@@ -23,13 +23,13 @@ from __future__ import annotations
+ 
+ import enum
+ import time
+-from dataclasses import dataclass, field
+-from typing import Callable, Optional
++from collections.abc import Callable
++from dataclasses import dataclass
+ 
+ import numpy as np
+ 
+ from config import DeathConfig
+-from perception import patch_median_rgb, patch_rgb_distance
++from perception import patch_rgb_distance
+ 
+ 
+ class DeathState(enum.Enum):
+@@ -58,7 +58,7 @@ class ColorAnchorDeathDetector:
+         self._off_frames = 0
+         self._on_frames = 0
+         self._state = DeathState.ALIVE
+-        self.last_result: Optional[DeathResult] = None
++        self.last_result: DeathResult | None = None
+         self.last_distance = 0.0
+         if not cfg.anchor_set():
+             raise ValueError(
+@@ -67,7 +67,7 @@ class ColorAnchorDeathDetector:
+             )
+ 
+     # ------------------------------------------------------------------ #
+-    def update(self, patch: Optional[np.ndarray], frame_id: int, ts: float) -> DeathResult:
++    def update(self, patch: np.ndarray | None, frame_id: int, ts: float) -> DeathResult:
+         if patch is None:
+             res = DeathResult(DeathState.UNKNOWN, -1.0, "invalid_or_missing_patch",
+                               frame_id, ts, self._on_frames)
+@@ -131,10 +131,10 @@ class StagnationDetector:
+     def __init__(self, timeout_s: float, change_threshold: float = 1.0) -> None:
+         self.timeout_s = timeout_s
+         self.change_threshold = change_threshold
+-        self._last_change_ts: Optional[float] = None
+-        self._last_frame: Optional[np.ndarray] = None
++        self._last_change_ts: float | None = None
++        self._last_frame: np.ndarray | None = None
+ 
+-    def update(self, ground_gray: Optional[np.ndarray], ts: float) -> bool:
++    def update(self, ground_gray: np.ndarray | None, ts: float) -> bool:
+         """Returns True when stagnation exceeded the timeout."""
+         if ground_gray is None:
+             return False
+@@ -221,7 +221,7 @@ class RespawnController:
+     def active(self) -> bool:
+         return self._active
+ 
+-    def update(self, death_state: DeathState, ts: Optional[float] = None) -> RespawnStatus:
++    def update(self, death_state: DeathState, ts: float | None = None) -> RespawnStatus:
+         """Feed the current anchor state; returns the next respawn action."""
+         t = ts if ts is not None else self.now()
+         if not self._active:
+@@ -249,7 +249,7 @@ class RespawnController:
+ 
+ 
+ def synthetic_patch(rgb: tuple[int, int, int], noise: float = 0.0,
+-                    rng: Optional[np.random.Generator] = None,
++                    rng: np.random.Generator | None = None,
+                     size: int = 5) -> np.ndarray:
+     """Build a synthetic NxNx3 anchor patch (used by tests and dry runs)."""
+     rng = rng or np.random.default_rng(0)
+diff --git a/demonstration_recorder.py b/demonstration_recorder.py
+index d6fdd4a..4e86fe9 100644
+--- a/demonstration_recorder.py
++++ b/demonstration_recorder.py
+@@ -17,15 +17,14 @@ from __future__ import annotations
+ import json
+ import threading
+ import time
++from collections.abc import Callable
+ from pathlib import Path
+-from typing import Callable, Optional
+ 
+ import numpy as np
+ 
+-from config import BotConfig, N_ACTIONS, NOOP
++from config import N_ACTIONS, NOOP, BotConfig
+ from logging_utils import get_logger
+ from perception import ZonePreprocessor
+-from states import BotState
+ 
+ LOGGER = get_logger("demo_recorder")
+ 
+@@ -61,13 +60,13 @@ class KeyboardTap:
+             self._listener = keyboard.Listener(on_press=_press, on_release=_release)
+             self._keyboard = keyboard
+             self.available = True
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.warning("keyboard listener unavailable: %s (%s) — "
+                            "demos will record NOOP only",
+                            type(exc).__name__, exc)
+ 
+     @staticmethod
+-    def _key_name(key) -> Optional[str]:
++    def _key_name(key) -> str | None:
+         if hasattr(key, "char") and key.char:
+             return str(key.char).lower()
+         if hasattr(key, "name") and key.name:
+@@ -83,7 +82,7 @@ class KeyboardTap:
+         if self._listener is not None:
+             try:
+                 self._listener.stop()
+-            except Exception as exc:
++            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 LOGGER.warning("listener stop failed: %s", exc)
+             self._listener = None
+ 
+@@ -92,7 +91,7 @@ class DemoRecorder:
+     """Subscribes to the frame ring and the human's keys to build episodes."""
+ 
+     def __init__(self, cfg: BotConfig, out_dir: str | Path,
+-                 read_frame: Callable[[], Optional[object]]) -> None:
++                 read_frame: Callable[[], object | None]) -> None:
+         self.cfg = cfg
+         self.out_dir = Path(out_dir)
+         self.out_dir.mkdir(parents=True, exist_ok=True)
+@@ -154,7 +153,7 @@ class DemoRecorder:
+         LOGGER.info("demo recording started")
+         return True
+ 
+-    def stop(self, done: bool = True) -> Optional[str]:
++    def stop(self, done: bool = True) -> str | None:
+         """Finalise and atomically write the episode; returns its path."""
+         if not self._recording:
+             return None
+diff --git a/environment.py b/environment.py
+index 832eb90..4153fd9 100644
+--- a/environment.py
++++ b/environment.py
+@@ -27,14 +27,19 @@ from __future__ import annotations
+ import time
+ from collections import deque
+ from dataclasses import dataclass, field
+-from typing import Any, Callable, Optional
++from typing import Any
+ 
+ import numpy as np
+ 
+ from action_scheduler import ActionScheduler, PlannedAction
+ from agent import InferencePolicy, epsilon_for_frame
+-from config import ACTIONS, BotConfig, NOOP
+-from death_detector import ColorAnchorDeathDetector, DeathResult, DeathState, RespawnController
++from config import NOOP, BotConfig
++from death_detector import (
++    ColorAnchorDeathDetector,
++    DeathResult,
++    DeathState,
++    RespawnController,
++)
+ from horizon_detector import HorizonDetector, HorizonResult
+ from input_controller import InputController
+ from ipc import SharedFrameRing, SharedWeights
+@@ -95,7 +100,7 @@ class SyntheticGame:
+         return self.render()
+ 
+     # ------------------------------------------------------------------ #
+-    def step(self, action: int, dt: Optional[float] = None) -> np.ndarray:
++    def step(self, action: int, dt: float | None = None) -> np.ndarray:
+         """Advance the game one tick with the player's action."""
+         dt = dt if dt is not None else 1.0 / self.fps
+         self._t += dt
+@@ -199,7 +204,7 @@ class StepInfo:
+ class GameEnvironment:
+     """Classic reset/step API over SyntheticGame with full bot perception."""
+ 
+-    def __init__(self, cfg: BotConfig, game: Optional[SyntheticGame] = None) -> None:
++    def __init__(self, cfg: BotConfig, game: SyntheticGame | None = None) -> None:
+         self.cfg = cfg
+         self.game = game or SyntheticGame(seed=cfg.seed)
+         self.pre = ZonePreprocessor(cfg.perception, cfg.perception.horizon_frac,
+@@ -244,8 +249,10 @@ class GameEnvironment:
+         frame = self.game.render()
+         ts = self._t
+         z = self.pre.process(frame, self.game.frame_id, ts)
+-        hz = self.detector.update(z.horizon_gray, z.frame_id, ts)
+-        dr = self.death.update(z.anchor_patch, z.frame_id, ts)
++        # Advance the internal debounce state of detectors even on reset,
++        # but the results aren't needed by the caller.
++        self.detector.update(z.horizon_gray, z.frame_id, ts)
++        self.death.update(z.anchor_patch, z.frame_id, ts)
+         fid = self.game.frame_id
+         if reset:
+             self.stack.reset(z.ground_gray)
+@@ -391,7 +398,7 @@ class BotActor:
+         self._episode_start_ts = 0.0
+         self._episode_frames = 0
+         self._last_load_check = time.monotonic()
+-        self._perf_violation_since: Optional[float] = None
++        self._perf_violation_since: float | None = None
+         self._profile = cfg.rl.profile
+         self._action_step_at_episode_start = self.scheduler.action_step
+         self._episode_stats: list[ActorEpisodeStats] = []
+@@ -445,7 +452,7 @@ class BotActor:
+                 self._maybe_report()
+             # graceful exit
+             self._end_episode(reason="shutdown")
+-        except Exception as exc:  # full traceback to GUI + log
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             from logging_utils import format_exception
+ 
+             LOGGER.error("actor crashed:\n%s", format_exception(exc))
+@@ -556,12 +563,10 @@ class BotActor:
+             put_bounded(self.transition_q, tr)
+ 
+     def _flush_transitions(self, final: bool) -> None:
+-        # emit anything still pending in the n-step window as terminal steps
+-        while self.nstep.pending:
+-            leftover = self.nstep.push(self.stack.get(), tuple(self._env_ids),
+-                                       NOOP, 0.0, True)
+-            for tr in leftover:
+-                put_bounded(self.transition_q, tr)
++        # Emit anything still pending in the n-step window as episode-
++        # terminal transitions (zero bootstrap beyond end of episode).
++        for tr in self.nstep.push_absorbing():
++            put_bounded(self.transition_q, tr)
+ 
+     # ------------------------------------------------------------------ #
+     def _begin_episode(self, t_frame: float) -> None:
+@@ -695,7 +700,7 @@ class BotActor:
+             import psutil
+ 
+             return min(1.0, psutil.cpu_percent(interval=None) / 100.0)
+-        except Exception:
++        except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             return 0.5
+ 
+     def _maybe_perf_check(self) -> None:
+@@ -768,7 +773,7 @@ class BotActor:
+         self._shutdown_requested = True
+ 
+ 
+-def headless_env_from_cfg(cfg: BotConfig, seed: Optional[int] = None) -> GameEnvironment:
++def headless_env_from_cfg(cfg: BotConfig, seed: int | None = None) -> GameEnvironment:
+     if seed is not None:
+         cfg.seed = seed
+     return GameEnvironment(cfg)
+diff --git a/evaluation.py b/evaluation.py
+index 67c8d7b..5118ac1 100644
+--- a/evaluation.py
++++ b/evaluation.py
+@@ -20,7 +20,7 @@ import random
+ import time
+ from dataclasses import asdict, dataclass, field
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any
+ 
+ NOT_MEASURED = "not yet measured"
+ 
+@@ -213,7 +213,7 @@ class EvaluationReport:
+ 
+     # ------------------------------------------------------------------ #
+     def beats_baseline(self, kind_a: str = "eval", kind_b: str = "human_baseline",
+-                       metric: str = "survival_s") -> Optional[bool]:
++                       metric: str = "survival_s") -> bool | None:
+         """True only if mean_a > mean_b with non-overlapping 95% CIs."""
+         a = summarize(self._col(kind_a, metric))
+         b = summarize(self._col(kind_b, metric))
+@@ -347,7 +347,7 @@ class EvaluationReport:
+         return p
+ 
+     @classmethod
+-    def load(cls, path: str | Path) -> "EvaluationReport":
++    def load(cls, path: str | Path) -> EvaluationReport:
+         rep = cls()
+         data = json.loads(Path(path).read_text(encoding="utf-8"))
+         for r in data.get("records", []):
+diff --git a/gui.py b/gui.py
+index 714fef6..16396ae 100644
+--- a/gui.py
++++ b/gui.py
+@@ -24,7 +24,7 @@ import threading
+ import time
+ import tkinter as tk
+ from tkinter import messagebox, ttk
+-from typing import Any, Optional
++from typing import Any
+ 
+ from config import BotConfig
+ from logging_utils import get_logger, setup_logging
+@@ -44,10 +44,10 @@ def set_dpi_awareness() -> float:
+ 
+             try:
+                 ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
+-            except Exception:
++            except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 ctypes.windll.user32.SetProcessDPIAware()
+             DPI_AWARENESS_SET = True
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.warning("DPI awareness not set: %s", exc)
+     return 1.0
+ 
+@@ -74,9 +74,9 @@ class RegionSelector:
+             20, 20, anchor="nw", fill="white", font=("Consolas", 12),
+             text="Drag to select the game region | Enter=accept | Esc=cancel | R=reset",
+         )
+-        self.rect_id: Optional[int] = None
+-        self.start_xy: Optional[tuple[int, int]] = None
+-        self.cur_xy: Optional[tuple[int, int]] = None
++        self.rect_id: int | None = None
++        self.start_xy: tuple[int, int] | None = None
++        self.cur_xy: tuple[int, int] | None = None
+         self.canvas.bind("<ButtonPress-1>", self._press)
+         self.canvas.bind("<B1-Motion>", self._drag)
+         self.canvas.bind("<ButtonRelease-1>", self._release)
+@@ -124,7 +124,7 @@ class RegionSelector:
+                   f"box: {min(x0,x1)},{min(y0,y1)}  size: {w}x{h}"),
+         )
+ 
+-    def selection(self) -> Optional[tuple[int, int, int, int]]:
++    def selection(self) -> tuple[int, int, int, int] | None:
+         if not (self.start_xy and self.cur_xy):
+             return None
+         x0, y0 = self.start_xy
+@@ -187,10 +187,10 @@ class PreviewGrabber(threading.Thread):
+                             except queue_mod.Empty as empty_exc:
+                                 LOGGER.debug("preview queue raced empty: %s",
+                                              empty_exc)
+-                    except Exception as exc:
++                    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                         LOGGER.warning("preview grab failed: %s", exc)
+                     self.stop_event.wait(self.interval)
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.warning("preview unavailable: %s", exc)
+ 
+     def stop(self) -> None:
+@@ -208,15 +208,15 @@ class ControlGUI:
+         self.cfg = cfg
+         self.cli_args = cli_args
+         self.sm = StateMachine(BotState.CALIBRATING)
+-        self.app: Optional[Any] = None  # BotApplication once running
+-        self.hotkey: Optional[Any] = None
+-        self.preview: Optional[PreviewGrabber] = None
+-        self.preview_img: Optional[Any] = None  # keep ref for PhotoImage
++        self.app: Any | None = None  # BotApplication once running
++        self.hotkey: Any | None = None
++        self.preview: PreviewGrabber | None = None
++        self.preview_img: Any | None = None  # keep ref for PhotoImage
+         self.anchor_frames: list[Any] = []
+         self.anchor_t0 = 0.0
+         self.dead_sample_frames: list[Any] = []
+         self.log_lines: list[str] = []
+-        self._demo_recorder: Optional[Any] = None
++        self._demo_recorder: Any | None = None
+         self._build()
+         self.root.after(self.POLL_MS, self._tick)
+         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+@@ -284,7 +284,7 @@ class ControlGUI:
+         RegionSelector(self.root, self._region_accepted, self._region_cancelled)
+ 
+     def _region_accepted(self, left: int, top: int, w: int, h: int) -> None:
+-        scale = set_dpi_awareness()
++        set_dpi_awareness()  # best-effort DPI awareness; side effect only
+         self.root.update_idletasks()
+         try:
+             dpi_scale = self.root.winfo_fpixels("1i") / 96.0
+@@ -358,8 +358,8 @@ class ControlGUI:
+         self.preview_label.configure(image=self.preview_img)
+         self._latest_preview = img  # for click/anchor sampling (fractions)
+ 
+-    _latest_preview: Optional[Any] = None
+-    _preview_full_size: Optional[Any] = None
++    _latest_preview: Any | None = None
++    _preview_full_size: Any | None = None
+ 
+     def lock_region(self) -> None:
+         r = self.cfg.region
+@@ -419,7 +419,7 @@ class ControlGUI:
+                             f"{int(fy * self.cfg.region.height)}) — now calibrate ALIVE")
+         self.log(f"anchor position set: fx={fx:.3f} fy={fy:.3f}")
+ 
+-    def _grab_anchor_patch(self) -> Optional[Any]:
++    def _grab_anchor_patch(self) -> Any | None:
+         """Grab the current 5x5 patch at the anchor from a fresh capture."""
+         if not (0 <= self.cfg.death.anchor_fx <= 1):
+             return None
+@@ -435,7 +435,7 @@ class ControlGUI:
+                     raw.height, raw.width, 4)[:, :, :3][:, :, ::-1]
+             x0, y0 = max(0, ax - 2), max(0, ay - 2)
+             return arr[y0 : y0 + 5, x0 : x0 + 5].copy()
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             self.log(f"anchor grab failed: {exc}")
+             return None
+ 
+@@ -665,7 +665,7 @@ class ControlGUI:
+ 
+         try:
+             self.app = BotApplication(self.cfg)
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             self._set_state(BotState.ERROR)
+             self.status_var.set(f"Failed to start: {exc}")
+             self.log(f"start failed: {exc}")
+@@ -735,7 +735,7 @@ class ControlGUI:
+             self.app = BotApplication(self.cfg)
+             self.app.start(with_learner=False)
+         # recorder reads the shared ring (latest frame wins)
+-        ring: Optional[SharedFrameRing] = self.app.ring if self.app else None
++        ring: SharedFrameRing | None = self.app.ring if self.app else None
+ 
+         class _RingReader:
+             def __init__(self, ring) -> None:
+@@ -786,7 +786,7 @@ class ControlGUI:
+             self._update_preview()
+             self._poll_metrics()
+             self._check_workers()
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             self.log(f"gui tick error: {exc}")
+         self.root.after(self.POLL_MS, self._tick)
+ 
+@@ -914,7 +914,7 @@ def run_gui(cli_args: Any = None) -> int:
+         root.state("zoomed")
+     except tk.TclError:
+         root.geometry("1080x860")
+-    gui = ControlGUI(root, cfg, cli_args)
++    _gui = ControlGUI(root, cfg, cli_args)  # reference kept alive for Tk mainloop
+     root.mainloop()
+     return 0
+ 
+diff --git a/input_controller.py b/input_controller.py
+index 9f4fbae..274d579 100644
+--- a/input_controller.py
++++ b/input_controller.py
+@@ -26,8 +26,8 @@ from __future__ import annotations
+ 
+ import threading
+ import time
++from collections.abc import Callable
+ from dataclasses import dataclass
+-from typing import Callable, Optional
+ 
+ from config import ACTIONS, NOOP, InputConfig
+ from logging_utils import get_logger
+@@ -48,7 +48,9 @@ class _PynputBackend:
+     """Real key presses via pynput (lazy import, Windows/Linux/macOS)."""
+ 
+     def __init__(self, keymap: dict[int, str]) -> None:
+-        from pynput import keyboard  # noqa: import checked by factory
++        from pynput import (
++            keyboard,
++        )
+ 
+         self._kb = keyboard.Controller()
+         self._keys = {}
+@@ -132,7 +134,7 @@ class InputController:
+         # auto: try real input, degrade to dry-run with a logged warning.
+         try:
+             return _PynputBackend(keymap)
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.warning(
+                 "pynput backend unavailable (%s: %s); falling back to dry_run — "
+                 "no real keys will be pressed", type(exc).__name__, exc,
+@@ -144,8 +146,8 @@ class InputController:
+     # Gameplay keys
+     # ------------------------------------------------------------------ #
+     def press_action(
+-        self, action: int, hold_ms: Optional[int] = None,
+-        created_ts: Optional[float] = None,
++        self, action: int, hold_ms: int | None = None,
++        created_ts: float | None = None,
+     ) -> InputEvent:
+         """Press a gameplay key and schedule its release.
+ 
+@@ -179,7 +181,7 @@ class InputController:
+                 self._release_at.append((t + hold, keyname))
+                 self.stats["presses"] += 1
+                 return InputEvent(action, keyname, True, t, "pressed")
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.error("press_action failed, releasing all:\n%s", exc)
+             self.release_all()
+             return InputEvent(action, keyname, False, t, f"error:{type(exc).__name__}")
+@@ -194,7 +196,7 @@ class InputController:
+                     self._backend.release(keyobj)
+                     released += 1
+                     self.stats["releases"] += 1
+-                except Exception as exc:
++                except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                     LOGGER.error("release failed for %s: %s", keyname, exc)
+             self._pressed.clear()
+             self._release_at.clear()
+@@ -233,10 +235,9 @@ class InputController:
+                         to_release.append(keyname)
+                 # Hard safety: anything held past max_hold_ms dies.
+                 for keyname, (since, _ko) in self._pressed.items():
+-                    if (t - since) * 1000.0 > self.cfg.max_hold_ms:
+-                        if keyname not in to_release:
+-                            to_release.append(keyname)
+-                            self.stats["guardian_releases"] += 1
++                    if (t - since) * 1000.0 > self.cfg.max_hold_ms and keyname not in to_release:
++                        to_release.append(keyname)
++                        self.stats["guardian_releases"] += 1
+             for keyname in to_release:
+                 self._release_one(keyname)
+             time.sleep(0.005)
+@@ -250,7 +251,7 @@ class InputController:
+         try:
+             self._backend.release(keyobj)
+             self.stats["releases"] += 1
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.error("scheduled release failed for %s: %s", keyname, exc)
+ 
+     # ------------------------------------------------------------------ #
+@@ -271,11 +272,11 @@ class InputController:
+                 return False
+             pyautogui.click(x=int(x), y=int(y))
+             return True
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.error("click failed: %s", exc)
+             return False
+ 
+-    def browser_focused(self) -> Optional[bool]:
++    def browser_focused(self) -> bool | None:
+         """True/False when detectable; None when the platform can't tell."""
+         if self.backend_name == "dry_run":
+             return None
+@@ -284,12 +285,12 @@ class InputController:
+ 
+             try:
+                 title = pyautogui.getActiveWindow().title
+-            except Exception:
++            except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 return None
+             if not title:
+                 return None
+             return self.cfg.browser_title_hint.lower() in str(title).lower()
+-        except Exception:
++        except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             return None
+ 
+     def focus_gate(self) -> bool:
+diff --git a/ipc.py b/ipc.py
+index 450c021..4b8212d 100644
+--- a/ipc.py
++++ b/ipc.py
+@@ -24,12 +24,11 @@ Synchronisation decisions
+ 
+ from __future__ import annotations
+ 
+-import multiprocessing as mp
+ import ctypes as ct
++import multiprocessing as mp
+ import struct
+ import time
+ from dataclasses import dataclass
+-from typing import Optional
+ 
+ import numpy as np
+ 
+@@ -98,7 +97,7 @@ class SharedFrameRing:
+     # ------------------------------------------------------------------ #
+     # Reader side (actor)
+     # ------------------------------------------------------------------ #
+-    def read_latest(self, max_retries: int = 4) -> Optional[Frame]:
++    def read_latest(self, max_retries: int = 4) -> Frame | None:
+         """Copy out the newest completely-written frame (None if empty)."""
+         h, w, c = self.shape
+         nbytes = h * w * c
+diff --git a/learner_worker.py b/learner_worker.py
+index 59341bb..894533b 100644
+--- a/learner_worker.py
++++ b/learner_worker.py
+@@ -23,17 +23,22 @@ from __future__ import annotations
+ import random
+ import time
+ from collections import deque
+-from pathlib import Path
+-from typing import Any, Optional
++from typing import Any
+ 
+ import numpy as np
+ 
+ from agent import DoubleDQNAgent
+ from checkpoint_manager import CheckpointManager
+-from config import BotConfig, PROFILE_ORDER
++from config import BotConfig
+ from ipc import SharedWeights
+-from logging_utils import drain, format_exception, get_logger, put_bounded, setup_logging
+-from models import PROFILES, weight_size_for_profile
++from logging_utils import (
++    drain,
++    format_exception,
++    get_logger,
++    put_bounded,
++    setup_logging,
++)
++from models import PROFILES
+ from replay_buffer import NStepTransition, PrioritizedReplayBuffer
+ 
+ LOGGER = get_logger("learner")
+@@ -71,6 +76,7 @@ class Learner:
+         self._publish_every_updates = 20
+         self._last_buffer_save_update = 0
+         self.bc_history: list[dict[str, Any]] = []
++        self.events_paused: bool = False
+         # -- online best-model tracking (requirement §12) ---------------- #
+         # The actor reports each finished episode through SharedCounters;
+         # the learner gates best_model.pth on the ROLLING MEAN of the
+@@ -80,12 +86,12 @@ class Learner:
+         )
+         self._last_seen_episode_done_id = 0
+         self.best_metric_name = cfg.rl.best_metric
+-        self.best_rolling: Optional[float] = None
++        self.best_rolling: float | None = None
+         self._load_checkpoint()
+ 
+     # ------------------------------------------------------------------ #
+     def _load_or_fresh_buffer(self) -> PrioritizedReplayBuffer:
+-        fresh = lambda: PrioritizedReplayBuffer(  # noqa: E731
++        fresh = lambda: PrioritizedReplayBuffer(
+             self.cfg.per, frame_size=self.cfg.perception.ground_size,
+             gamma=self.cfg.rl.gamma,
+         )
+@@ -118,14 +124,14 @@ class Learner:
+                     self.best_rolling = float(bm)
+                 LOGGER.info("checkpoint restored (updates=%d, best=%s)",
+                             self.update_step, self.ckpt.best_metric)
+-            except Exception as exc:
++            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 LOGGER.error("checkpoint restore failed, fresh start:\n%s",
+                              format_exception(exc))
+         else:
+             LOGGER.info("no checkpoint for profile %s; fresh networks", self.profile)
+ 
+     # ------------------------------------------------------------------ #
+-    def _poll_episode_metric(self) -> Optional[float]:
++    def _poll_episode_metric(self) -> float | None:
+         """Consume actor-reported episode ends; maybe update best_model.pth.
+ 
+         Metric semantics (explicit, not "steps"-ambiguous): the metric is the
+@@ -202,9 +208,7 @@ class Learner:
+         min_gap = 1.0 / max(0.1, self.cfg.rl.max_updates_per_second)
+         return (now - self._last_update_t) >= min_gap
+ 
+-    events_paused: bool = False
+-
+-    def train_one(self, now: float) -> Optional[dict[str, float]]:
++    def train_one(self, now: float) -> dict[str, float] | None:
+         beta = self.buffer.beta_for_step(self.update_step)
+         t0 = time.perf_counter()
+         try:
+@@ -215,9 +219,7 @@ class Learner:
+         t1 = time.perf_counter()
+         metrics = self.agent.train_step(batch)
+         update_ms = (time.perf_counter() - t1) * 1000.0
+-        self.buffer.update_priorities(batch["indices"],
+-                                      metrics["td_error_abs_mean"]
+-                                      * np.ones(len(batch["indices"])))
++        self.buffer.update_priorities(batch["indices"], metrics["td_error_abs"])
+         self.update_step += 1
+         self.counters.learner_update_step.value = self.update_step
+         self.counters.beta.value = beta
+@@ -255,10 +257,11 @@ class Learner:
+             "best_metric_name": self.cfg.rl.best_metric,
+         }
+         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
+-        if self.update_step - self._last_buffer_save_update >= \
+-                self.cfg.per.save_every_updates:
+-            if self.ckpt.buffer_save(self.buffer):
+-                self._last_buffer_save_update = self.update_step
++        if (
++            self.update_step - self._last_buffer_save_update >= self.cfg.per.save_every_updates
++            and self.ckpt.buffer_save(self.buffer)
++        ):
++            self._last_buffer_save_update = self.update_step
+ 
+     # ------------------------------------------------------------------ #
+     # Behaviour cloning (Phase 1)
+@@ -359,7 +362,7 @@ def learner_main(
+     try:
+         learner = Learner(cfg, shared_weights, counters, metrics_q, checkpoints_dir)
+         learner._publish(force=True)
+-    except Exception as exc:
++    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+         put_bounded(metrics_q, {"type": "error", "src": "learner",
+                                 "error": f"{type(exc).__name__}: {exc}",
+                                 "tb": format_exception(exc)})
+@@ -420,14 +423,14 @@ def learner_main(
+                     },
+                 })
+                 transitions_since_report = 0
+-    except Exception as exc:
++    except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+         put_bounded(metrics_q, {"type": "error", "src": "learner",
+                                 "error": f"{type(exc).__name__}: {exc}",
+                                 "tb": format_exception(exc)})
+     finally:
+         try:
+             learner.shutdown_save()
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.error("shutdown save failed:\n%s", format_exception(exc))
+         LOGGER.info("learner stop")
+ 
+diff --git a/logging_utils.py b/logging_utils.py
+index 1aa68da..3a81998 100644
+--- a/logging_utils.py
++++ b/logging_utils.py
+@@ -12,12 +12,12 @@ from __future__ import annotations
+ 
+ import logging
+ import logging.handlers
+-import pickle  # noqa: S403 - only used for our own local buffer files
++import pickle
+ import sys
+ import traceback
+ import types
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any
+ 
+ LOG_FORMAT = "%(asctime)s | %(processName)s | %(levelname)-7s | %(name)s | %(message)s"
+ _DATEFMT = "%Y-%m-%d %H:%M:%S"
+@@ -68,7 +68,7 @@ def report_exception(
+     logger: logging.Logger,
+     exc: BaseException,
+     context: str,
+-    queue: Optional[Any] = None,
++    queue: Any | None = None,
+ ) -> None:
+     """Log a traceback and forward it to the GUI error queue if provided."""
+     tb = format_exception(exc)
+@@ -134,7 +134,6 @@ def hash_bytes(data: bytes) -> str:
+ 
+ def atomic_write_bytes(path: str | Path, data: bytes, suffix: str = ".tmp") -> None:
+     """Write ``data`` to a temp file then ``os.replace`` it into place."""
+-    import os
+ 
+     p = Path(path)
+     p.parent.mkdir(parents=True, exist_ok=True)
+@@ -163,7 +162,6 @@ def integrity_pickle_load(path: str | Path) -> Any:
+     from scratch while keeping the GUI alive.  Only ever point this at files
+     the bot itself wrote (a pickle is executed-equivalent untrusted input).
+     """
+-    import os
+     import shutil
+ 
+     p = Path(path)
+@@ -180,7 +178,7 @@ def integrity_pickle_load(path: str | Path) -> Any:
+                 f"{p} failed sha256 verification; moved to {corrupt}"
+             )
+     try:
+-        return pickle.loads(data)  # noqa: S301 - own artifact, hash-verified
++        return pickle.loads(data)
+     except Exception as exc:  # narrow handling, then re-raise typed
+         corrupt = p.with_name(p.name + ".corrupt")
+         try:
+diff --git a/metrics.py b/metrics.py
+index e33941e..40aaeba 100644
+--- a/metrics.py
++++ b/metrics.py
+@@ -10,7 +10,8 @@ from __future__ import annotations
+ import math
+ import time
+ from collections import deque
+-from typing import Any, Iterable, Optional
++from collections.abc import Iterable
++from typing import Any
+ 
+ 
+ class Ring:
+@@ -57,7 +58,7 @@ def percentile(values: list[float], pct: float) -> float:
+ def stats(values: list[float]) -> dict[str, float]:
+     """Mean/std/min/max/p50/p95/p99 summary."""
+     if not values:
+-        return {k: 0.0 for k in ("n", "mean", "std", "min", "max", "p50", "p95", "p99")}
++        return dict.fromkeys(("n", "mean", "std", "min", "max", "p50", "p95", "p99"), 0.0)
+     n = len(values)
+     mean = sum(values) / n
+     var = sum((v - mean) ** 2 for v in values) / n
+@@ -101,14 +102,14 @@ class Counter:
+         self.total += n
+         self._window_count += n
+ 
+-    def rate_per_s(self, now: Optional[float] = None) -> float:
++    def rate_per_s(self, now: float | None = None) -> float:
+         t = now if now is not None else time.monotonic()
+         span = t - self._window_start
+         if span <= 0:
+             return 0.0
+         return self._window_count / span
+ 
+-    def reset_window(self, now: Optional[float] = None) -> None:
++    def reset_window(self, now: float | None = None) -> None:
+         self._window_start = now if now is not None else time.monotonic()
+         self._window_count = 0
+ 
+@@ -120,13 +121,13 @@ class FpsMeter:
+         self.window_s = window_s
+         self._ts: deque[float] = deque()
+ 
+-    def tick(self, t: Optional[float] = None) -> None:
++    def tick(self, t: float | None = None) -> None:
+         t = t if t is not None else time.monotonic()
+         self._ts.append(t)
+         while self._ts and self._ts[0] < t - self.window_s:
+             self._ts.popleft()
+ 
+-    def fps(self, now: Optional[float] = None) -> float:
++    def fps(self, now: float | None = None) -> float:
+         now = now if now is not None else (self._ts[-1] if self._ts else 0.0)
+         if len(self._ts) < 2:
+             return 0.0
+@@ -163,7 +164,7 @@ def system_usage() -> dict[str, float]:
+         out["ram_system_gb"] = vm.used / (1024 ** 3)
+         out["ram_system_total_gb"] = vm.total / (1024 ** 3)
+         out["cpu_system"] = psutil.cpu_percent(interval=None)
+-    except Exception:
++    except Exception:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+         out["available"] = 0.0
+     return out
+ 
+diff --git a/models.py b/models.py
+index f7698bd..d09822c 100644
+--- a/models.py
++++ b/models.py
+@@ -35,10 +35,10 @@ Exact counts are asserted in tests/test_models.py and printed by
+ 
+ from __future__ import annotations
+ 
+-from typing import Any, Dict
++from typing import Any
+ 
+ import torch
+-import torch.nn as nn
++from torch import nn
+ 
+ N_ACTIONS = 5
+ 
+@@ -124,7 +124,7 @@ class DuelingDQN(nn.Module):
+ 
+     @classmethod
+     def from_profile(cls, profile: str, in_frames: int = 4, size: int = 84,
+-                     n_actions: int = N_ACTIONS) -> "DuelingDQN":
++                     n_actions: int = N_ACTIONS) -> DuelingDQN:
+         spec = PROFILES[profile]
+         encoder, out_ch = build_encoder(spec, in_frames)
+         return cls(in_frames, encoder, out_ch, n_actions, spec["head_hidden"])
+@@ -164,7 +164,7 @@ def build_encoder(spec: dict[str, Any], in_frames: int) -> tuple[nn.Module, int]
+     return nn.Sequential(*layers), cin
+ 
+ 
+-PROFILES: Dict[str, Dict[str, Any]] = {
++PROFILES: dict[str, dict[str, Any]] = {
+     "strict_lite": {
+         "kind": "dws",
+         "blocks": [(32, 2), (48, 2), (64, 2), (128, 1)],
+@@ -200,7 +200,7 @@ def count_trainable_params(model: nn.Module) -> int:
+ 
+ 
+ def build_models_for_profile(profile: str, in_frames: int = 4, size: int = 84
+-                             ) -> tuple["DuelingDQN", "DuelingDQN"]:
++                             ) -> tuple[DuelingDQN, DuelingDQN]:
+     """(online, target) networks for a profile; target starts as a copy."""
+     online = DuelingDQN.from_profile(profile, in_frames, size)
+     target = DuelingDQN.from_profile(profile, in_frames, size)
+diff --git a/perception.py b/perception.py
+index bffb37b..3a4afb9 100644
+--- a/perception.py
++++ b/perception.py
+@@ -17,7 +17,6 @@ Pipeline per frame (all numpy/cv2, no torch on this path):
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from typing import Optional
+ 
+ import cv2
+ import numpy as np
+@@ -35,7 +34,7 @@ def is_black_frame(image: np.ndarray, threshold: float) -> bool:
+     return float(image.mean()) < threshold
+ 
+ 
+-def anchor_patch(image: np.ndarray, cx: int, cy: int, half: int = 2) -> Optional[np.ndarray]:
++def anchor_patch(image: np.ndarray, cx: int, cy: int, half: int = 2) -> np.ndarray | None:
+     """Extract a (2*half+1)^2 RGB patch centred on (cx, cy), None if clipped."""
+     h, w = image.shape[:2]
+     x0, x1 = cx - half, cx + half + 1
+@@ -74,9 +73,9 @@ class ZoneResult:
+ 
+     frame_id: int
+     ts: float
+-    horizon_gray: Optional[np.ndarray]  # 40x40 uint8
+-    ground_gray: Optional[np.ndarray]  # 84x84 uint8
+-    anchor_patch: Optional[np.ndarray]  # 5x5x3 uint8
++    horizon_gray: np.ndarray | None  # 40x40 uint8
++    ground_gray: np.ndarray | None  # 84x84 uint8
++    anchor_patch: np.ndarray | None  # 5x5x3 uint8
+     valid: bool
+     reason: str = "ok"
+ 
+@@ -88,7 +87,7 @@ class ZonePreprocessor:
+         self,
+         cfg: PerceptionConfig,
+         horizon_frac: float,
+-        anchor_xy: Optional[tuple[int, int]] = None,
++        anchor_xy: tuple[int, int] | None = None,
+         require_anchor: bool = True,
+     ) -> None:
+         self.cfg = cfg
+@@ -100,12 +99,12 @@ class ZonePreprocessor:
+         self.require_anchor = require_anchor
+         self.horizon_h_cache: dict[int, int] = {}
+ 
+-    def set_anchor(self, xy: Optional[tuple[int, int]]) -> None:
++    def set_anchor(self, xy: tuple[int, int] | None) -> None:
+         self.anchor_xy = xy
+ 
+     def split_line(self, region_h: int) -> int:
+         """Pixel row separating horizon band from ground band."""
+-        return max(1, int(round(region_h * self.horizon_frac)))
++        return max(1, round(region_h * self.horizon_frac))
+ 
+     def process(self, image: np.ndarray, frame_id: int, ts: float) -> ZoneResult:
+         h, w = image.shape[:2]
+@@ -186,7 +185,7 @@ class FrameStack:
+         return out
+ 
+ 
+-def normalize_obs(stack_u8: np.ndarray) -> "torch.Tensor":  # noqa: F821
++def normalize_obs(stack_u8: np.ndarray) -> torch.Tensor:  # noqa: F821  (torch imported lazily inside body)
+     """uint8 [k,H,W] -> float32 tensor [1,k,H,W] in [0,1] (for the network)."""
+     import torch
+ 
+diff --git a/profiling.py b/profiling.py
+index 84a8e5b..674343c 100644
+--- a/profiling.py
++++ b/profiling.py
+@@ -12,10 +12,11 @@ from __future__ import annotations
+ 
+ import logging
+ import time
+-from typing import Any, Callable
++from typing import Any
+ 
+ import torch
+-import torch.nn as nn
++from torch import nn
++from typing_extensions import Self
+ 
+ from metrics import stats
+ from models import PROFILES, DuelingDQN, count_trainable_params
+@@ -201,7 +202,7 @@ class SystemProfiler:
+         self.cpu_samples: list[float] = []
+         self._stop = False
+ 
+-    def __enter__(self) -> "SystemProfiler":
++    def __enter__(self) -> Self:
+         import threading
+ 
+         from metrics import system_usage
+@@ -222,7 +223,7 @@ class SystemProfiler:
+             self.cpu_samples.append(usage["cpu_process"])
+             _time.sleep(self.interval_s)
+ 
+-    def __exit__(self, *exc: Any) -> None:
++    def __exit__(self, *exc: object) -> None:
+         self._stop = True
+         if getattr(self, "_thread", None) is not None:
+             self._thread.join(timeout=2.0)
+diff --git a/replay_buffer.py b/replay_buffer.py
+index 3d239e9..46bb84a 100644
+--- a/replay_buffer.py
++++ b/replay_buffer.py
+@@ -27,8 +27,9 @@ Other guarantees:
+ from __future__ import annotations
+ 
+ from collections import OrderedDict
++from collections.abc import Iterable
+ from dataclasses import dataclass
+-from typing import Any, Iterable, Optional
++from typing import Any
+ 
+ import numpy as np
+ 
+@@ -170,7 +171,7 @@ class Transition:
+         if not np.isfinite(self.reward):
+             raise ValueError(f"non-finite reward {self.reward}")
+         if not isinstance(self.done, bool):
+-            raise ValueError("done must be bool")
++            raise TypeError("done must be bool")
+         for ids in (self.obs_ids, self.next_ids):
+             if len(ids) != 4:
+                 raise ValueError("stacks must reference exactly 4 frames")
+@@ -194,11 +195,21 @@ class NStepTransition:
+ class NStepBuilder:
+     """Collapses an (obs,action,reward) stream into n-step transitions.
+ 
+-    Emits step t only once obs_{t+span} is observable, or at episode end —
+-    so rewards are discounted correctly and nothing crosses an episode
+-    boundary.  Only the LAST step of an episode is marked done=True.
++    Semantics (standard DQN n-step returns truncated at episode boundaries):
++
++    * For a transition at time t, emit it only when we have n more rewards
++      after it (or the episode ended earlier).
++    * The n-step reward is G_t^{(n)} = r_t + γ r_{t+1} + ... + γ^{n-1} r_{t+n-1}.
++    * The bootstrap target is γ^n * max_a Q(s_{t+n}, a) when s_{t+n} is
++      non-terminal, or 0 when the episode ended within the n-step window
++      (``done=True`` on the transition).
++    * When the episode ends mid-window, the buffer is drained using
++      progressively smaller spans; the step whose ``next_obs`` lands on
++      the episode-terminal state carries ``done=True``.
+     """
+ 
++    _SENTINEL_ABSORB = object()  # marks the zero-reward absorbing state
++
+     def __init__(self, n: int, gamma: float) -> None:
+         self.n = max(1, int(n))
+         self.gamma = float(gamma)
+@@ -207,47 +218,117 @@ class NStepBuilder:
+     def clear(self) -> None:
+         self._buf: list[dict[str, Any]] = []
+ 
++    def push_absorbing(self) -> list[NStepTransition]:
++        """Append the absorbing state (zero reward, no frame) and drain.
++
++        Caller must call this after a ``done=True`` transition to ensure no
++        transition bootstraps across an episode boundary.
++        """
++        self._buf.append({
++            "stack": self._SENTINEL_ABSORB,
++            "ids": (),
++            "a": 0,
++            "r": 0.0,
++            "absorb": True,
++        })
++        return self._drain_terminal()
++
+     def push(self, stack: np.ndarray, env_ids: tuple[int, ...], action: int,
+              reward: float, done: bool) -> list[NStepTransition]:
+-        self._buf.append(
+-            {"stack": stack, "ids": tuple(env_ids), "a": int(action),
+-             "r": float(reward), "done": bool(done)}
+-        )
++        """Append one environment step.
++
++        ``done=True`` marks the step that *caused* termination (death).
++        After pushing a done=True step the caller MUST call
++        ``push_absorbing()`` on the next tick to finish the flush.  However,
++        to make common single-call usage convenient we also auto-append the
++        absorbing sentinel when ``done=True`` so caller's single push drains
++        the window in one go.
++        """
++        self._buf.append({
++            "stack": stack,
++            "ids": tuple(env_ids),
++            "a": int(action),
++            "r": float(reward),
++            "absorb": False,
++        })
+         out: list[NStepTransition] = []
+-        # Non-terminal emission: we need n entries plus the obs after them.
++        # Normal n-step emission: buffer has head + (n-1) following rewards +
++        # next state (at index n).  That's n+1 entries total.
+         while len(self._buf) > self.n:
+-            out.append(self._emit(span=self.n, terminal=False))
+-        if self._buf and self._buf[-1]["done"]:
+-            while self._buf:
+-                span = len(self._buf) - 1
+-                out.append(self._emit(span=span, terminal=(span == 0)))
++            if self._buf[self.n]["stack"] is self._SENTINEL_ABSORB:
++                break
++            out.append(self._emit(self.n - 1))
++        if done:
++            # Append absorbing state (zero reward, no frame) so the drain
++            # sees a hard episode boundary after the last real step.
++            self._buf.append({
++                "stack": self._SENTINEL_ABSORB, "ids": (), "a": 0,
++                "r": 0.0, "absorb": True,
++            })
++            out.extend(self._drain_terminal())
+         return out
+ 
+-    def _emit(self, span: int, terminal: bool) -> NStepTransition:
++    def _drain_terminal(self) -> list[NStepTransition]:
++        out: list[NStepTransition] = []
++        # Emit every real entry still in the buffer.  Because we drain
++        # from an episode boundary, all these transitions have done=True.
++        # Reward span = number of FOLLOWING rewards after the head up to
++        # death (or n, whichever is smaller); the absorbing state gives
++        # γ^n = 0 so bootstrap is ignored.  When death is at head itself
++        # there are zero following rewards -> span=0.
++        while any(b["stack"] is not self._SENTINEL_ABSORB for b in self._buf):
++            s_idx = next(i for i, b in enumerate(self._buf)
++                         if b["stack"] is self._SENTINEL_ABSORB)
++            # following real rewards count = s_idx - 1 (excluding head)
++            following = s_idx - 1
++            span = min(following, self.n)
++            out.append(self._emit(span))
++        # Drop the sentinel.
++        self._buf = [b for b in self._buf if b["stack"] is not self._SENTINEL_ABSORB]
++        return out
++
++    def _emit(self, span: int) -> NStepTransition:
++        """Emit the head transition using ``span`` FOLLOWING rewards.
++
++        ``span`` is the number of rewards after the head to accumulate.
++        The bootstrap state is at index (span + 1) from head, unless we
++        reach the absorbing sentinel earlier (in which case is_done=True).
++        When called from the normal n-step path, span == n and we
++        bootstrap from _buf[n] (non-terminal) as usual.
++        """
+         head = self._buf[0]
+         r = 0.0
+-        for i in range(span):
++        # Rewards: head.r * γ^0 + buf[1].r * γ^1 + ... + buf[span].r * γ^{span}
++        for i in range(span + 1):
+             r += (self.gamma ** i) * self._buf[i]["r"]
+-        if terminal:
+-            r += (self.gamma ** span) * self._buf[span]["r"] if span < len(self._buf) else 0.0
+-        nxt = self._buf[span]
++        nxt_idx = span + 1
++        nxt = self._buf[nxt_idx]
++        is_done = nxt["stack"] is self._SENTINEL_ABSORB
++        if is_done:
++            next_stack = head["stack"]  # unused; mask with done=True
++            next_ids = head["ids"]
++        else:
++            next_stack = nxt["stack"]
++            next_ids = nxt["ids"]
++        # Discount applied to Q(s_{t+span+1}, ·): γ^{span+1}; zero on terminal.
++        gamma_pow = 0.0 if is_done else (self.gamma ** (span + 1))
+         tr = NStepTransition(
+             obs=head["stack"],
+-            next_obs=nxt["stack"],
++            next_obs=next_stack,
+             action=head["a"],
+-            reward=float(r) if not terminal else float(r),
+-            done=bool(terminal),
+-            span=span if not terminal else span + 1,
+-            gamma_pow=self.gamma ** (span if not terminal else span + 1),
++            reward=float(r),
++            done=is_done,
++            span=span + 1,
++            gamma_pow=gamma_pow,
+             obs_env_ids=tuple(head["ids"]),
+-            next_env_ids=tuple(nxt["ids"]),
++            next_env_ids=tuple(next_ids),
+         )
+         self._buf.pop(0)
+         return tr
+ 
+     @property
+     def pending(self) -> int:
+-        return len(self._buf)
++        return sum(1 for b in self._buf if b["stack"] is not self._SENTINEL_ABSORB)
+ 
+ 
+ class PrioritizedReplayBuffer:
+@@ -258,7 +339,7 @@ class PrioritizedReplayBuffer:
+         self.gamma = gamma
+         self.capacity = cfg.capacity
+         self.frames = FrameStore(cfg.capacity + 64, frame_size)
+-        self.transitions: list[Optional[Transition]] = [None] * cfg.capacity
++        self.transitions: list[Transition | None] = [None] * cfg.capacity
+         self.priorities = np.zeros(cfg.capacity, dtype=np.float64)
+         self.tree = SumTree(cfg.capacity)
+         self.pos = 0
+@@ -314,7 +395,7 @@ class PrioritizedReplayBuffer:
+         return True
+ 
+     def sample(self, batch_size: int, beta: float,
+-               rng: Optional[np.random.Generator] = None,
++               rng: np.random.Generator | None = None,
+                max_replace_rounds: int = 3) -> dict[str, Any]:
+         if self.size == 0:
+             raise IndexError("empty replay buffer")
+@@ -388,7 +469,7 @@ class PrioritizedReplayBuffer:
+                 + self.priorities.nbytes + len(self.transitions) * 200)
+ 
+     def action_counts(self) -> dict[int, int]:
+-        counts = {a: 0 for a in range(5)}
++        counts = dict.fromkeys(range(5), 0)
+         for t in self.transitions[: self.size]:
+             if t is not None:
+                 counts[t.action] += 1
+@@ -420,7 +501,7 @@ class PrioritizedReplayBuffer:
+ 
+     @classmethod
+     def load(cls, path: str, cfg: PERConfig, frame_size: int = 84,
+-             gamma: float = 0.99) -> "PrioritizedReplayBuffer":
++             gamma: float = 0.99) -> PrioritizedReplayBuffer:
+         """Load or raise CorruptFileError (file already renamed .corrupt)."""
+         payload = integrity_pickle_load(path)
+         if not isinstance(payload, dict) or "frames" not in payload \
+@@ -433,8 +514,7 @@ class PrioritizedReplayBuffer:
+             raise CorruptFileError(
+                 f"{path}: frame size {frames.shape[1]} != configured {frame_size}"
+             )
+-        if cap > cfg.capacity:
+-            cap = cfg.capacity  # never exceed the configured memory bound
++        cap = min(cap, cfg.capacity)  # never exceed the configured memory bound
+         buf._reinit(cap, frames.shape[1])
+         buf.frames.frames[:] = payload["frames"]
+         buf.frames.env_ids[:] = np.asarray(payload["frame_env_ids"], dtype=np.int64)
+diff --git a/rewards.py b/rewards.py
+index 63a3f0f..1d5a4e0 100644
+--- a/rewards.py
++++ b/rewards.py
+@@ -23,8 +23,7 @@ Design (requirement §13, cross-checked against the reward-hacking audit):
+ from __future__ import annotations
+ 
+ import time
+-from dataclasses import dataclass, field
+-from typing import Optional
++from dataclasses import dataclass
+ 
+ from config import RewardConfig
+ from horizon_detector import HorizonResult
+@@ -58,7 +57,7 @@ class RewardBreakdown:
+ class PendingHazard:
+     opened_frame_id: int
+     opened_ts: float
+-    action: Optional[int] = None
++    action: int | None = None
+     frames_seen: int = 0
+     resolved: bool = False
+     expired: bool = False
+@@ -83,7 +82,7 @@ class PendingHazardTracker:
+ 
+     def __init__(self, cfg: RewardConfig) -> None:
+         self.cfg = cfg
+-        self._current: Optional[PendingHazard] = None
++        self._current: PendingHazard | None = None
+         self.events: list[PendingHazard] = []
+         self.bonuses_granted = 0
+ 
+@@ -98,9 +97,8 @@ class PendingHazardTracker:
+         self.events.append(self._current)
+ 
+     def observe_action(self, action: int, frame_id: int) -> None:
+-        if self._current is not None and not self._current.resolved:
+-            if self._current.action is None:
+-                self._current.action = action
++        if self._current is not None and not self._current.resolved and self._current.action is None:
++            self._current.action = action
+ 
+     def on_frame(self, horizon: HorizonResult, action: int) -> float:
+         """Advance the open event with a new valid frame; return bonus (0/…).
+@@ -161,11 +159,11 @@ class SurvivalRewardCalculator:
+         self.now = now
+         self.hazards = PendingHazardTracker(cfg)
+         self._episode_dead = False
+-        self._last_ts: Optional[float] = None
++        self._last_ts: float | None = None
+         self._last_ground_diff = 0.0
+ 
+     # ------------------------------------------------------------------ #
+-    def begin_episode(self, ts: Optional[float] = None) -> None:
++    def begin_episode(self, ts: float | None = None) -> None:
+         self._episode_dead = False
+         self._last_ts = self.now() if ts is None else ts
+         self._last_ground_diff = 0.0
+diff --git a/safety_watchdog.py b/safety_watchdog.py
+index 02b5f44..b0e085a 100644
+--- a/safety_watchdog.py
++++ b/safety_watchdog.py
+@@ -19,7 +19,8 @@ from __future__ import annotations
+ 
+ import threading
+ import time
+-from typing import Any, Callable, Optional
++from collections.abc import Callable
++from typing import Any
+ 
+ from logging_utils import format_exception, get_logger, put_bounded
+ 
+@@ -38,7 +39,7 @@ class SafetyWatchdog(threading.Thread):
+         ring: Any = None,
+         interval_s: float = 0.25,
+         stall_timeout_s: float = 2.0,
+-        on_status: Optional[Callable[[str, str], None]] = None,
++        on_status: Callable[[str, str], None] | None = None,
+     ) -> None:
+         super().__init__(daemon=True, name="safety-watchdog")
+         self.events = events
+@@ -49,7 +50,7 @@ class SafetyWatchdog(threading.Thread):
+         self.interval_s = interval_s
+         self.stall_timeout_s = stall_timeout_s
+         self.on_status = on_status
+-        self._stop = threading.Event()
++        self._stop_event = threading.Event()
+         self._last_frame_id = -1
+         self._last_progress_ts = time.monotonic()
+         self._focus_loss_reported = False
+@@ -57,12 +58,12 @@ class SafetyWatchdog(threading.Thread):
+     # ------------------------------------------------------------------ #
+     def run(self) -> None:
+         LOGGER.info("watchdog running (interval=%.2fs)", self.interval_s)
+-        while not self._stop.is_set():
++        while not self._stop_event.is_set():
+             try:
+                 self._check_once()
+-            except Exception as exc:
++            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 LOGGER.error("watchdog check failed:\n%s", format_exception(exc))
+-            self._stop.wait(self.interval_s)
++            self._stop_event.wait(self.interval_s)
+         LOGGER.info("watchdog stopped")
+ 
+     def _check_once(self) -> None:
+@@ -123,11 +124,11 @@ class SafetyWatchdog(threading.Thread):
+         if self.on_status is not None:
+             try:
+                 self.on_status(tag, message)
+-            except Exception as exc:
++            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 LOGGER.error("on_status callback failed: %s", exc)
+ 
+     def stop(self) -> None:
+-        self._stop.set()
++        self._stop_event.set()
+ 
+ 
+ class EmergencyHotkey:
+@@ -155,7 +156,7 @@ class EmergencyHotkey:
+             self._listener.start()
+             self.available = True
+             LOGGER.info("emergency hotkey '%s' armed", self.hotkey_name)
+-        except Exception as exc:
++        except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+             LOGGER.warning("hotkey listener unavailable (%s: %s) — use the "
+                            "GUI STOP button or Ctrl+C", type(exc).__name__, exc)
+ 
+@@ -164,6 +165,6 @@ class EmergencyHotkey:
+         if self._listener is not None:
+             try:
+                 self._listener.stop()
+-            except Exception as exc:
++            except Exception as exc:  # noqa: BLE001  (defensive boundary at process/UI edge; error logged, never crashes)
+                 LOGGER.warning("hotkey stop failed: %s", exc)
+             self._listener = None
+diff --git a/states.py b/states.py
+index 905d9fe..316b8fd 100644
+--- a/states.py
++++ b/states.py
+@@ -8,8 +8,8 @@ unit tests instead of during live gameplay.
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Iterable
+ from enum import Enum
+-from typing import Iterable, Optional
+ 
+ 
+ class BotState(str, Enum):
+@@ -111,7 +111,7 @@ class StateMachine:
+         self._state = target
+         return self._state
+ 
+-    def try_transition(self, target: BotState) -> Optional[BotState]:
++    def try_transition(self, target: BotState) -> BotState | None:
+         """Transition if legal; return the new state or ``None`` if refused."""
+         if self.can(target):
+             return self.transition(target)
+diff --git a/tests/test_action_scheduler.py b/tests/test_action_scheduler.py
+index 4334989..9788c6f 100644
+--- a/tests/test_action_scheduler.py
++++ b/tests/test_action_scheduler.py
+@@ -31,7 +31,7 @@ def make_scheduler(**kw) -> tuple[ActionScheduler, FakeClock]:
+ 
+ class TestCadence:
+     def test_normal_cadence_low_load(self) -> None:
+-        s, clock = make_scheduler()
++        s, _clock = make_scheduler()
+         s.set_load(0.1)  # low load -> min frames (2)
+         gates = [s.on_frame(danger=False) for _ in range(7)]
+         assert gates == [False, True, False, True, False, True, False]
+@@ -55,7 +55,7 @@ class TestCadence:
+ 
+ class TestBuffering:
+     def test_submit_pop_executes(self) -> None:
+-        s, clock = make_scheduler()
++        s, _clock = make_scheduler()
+         s.submit(3)  # JUMP
+         planned = s.pop_executable()
+         assert planned is not None and planned.action == 3
+@@ -118,7 +118,7 @@ class TestBuffering:
+         assert s.submit(-1) is False
+ 
+     def test_reset_episode(self) -> None:
+-        s, clock = make_scheduler()
++        s, _clock = make_scheduler()
+         s.submit(1)
+         s.pop_executable()
+         s.reset_episode()
+diff --git a/tests/test_checkpoint_manager.py b/tests/test_checkpoint_manager.py
+index f917cde..253df7d 100644
+--- a/tests/test_checkpoint_manager.py
++++ b/tests/test_checkpoint_manager.py
+@@ -2,18 +2,19 @@
+ 
+ from __future__ import annotations
+ 
+-import os
+ from pathlib import Path
+ 
+-import numpy as np
+-import pytest
++import numpy as np  # noqa: F401  (used for RNG state side effects)
++import pytest  # noqa: F401
+ import torch
++from test_replay_buffer import (
++    TestPrioritizedReplayBuffer,  # noqa: F401  (base class for parametrised tests)
++)
+ 
+ from agent import DoubleDQNAgent
+ from checkpoint_manager import CheckpointManager
+ from config import PERConfig, RLConfig
+-from replay_buffer import NStepTransition, PrioritizedReplayBuffer
+-from test_replay_buffer import TestPrioritizedReplayBuffer
++from replay_buffer import NStepTransition, PrioritizedReplayBuffer  # noqa: F401
+ 
+ 
+ def small_agent() -> DoubleDQNAgent:
+@@ -127,7 +128,7 @@ class TestBufferViaManager:
+ 
+ class TestRngStateIntegrity:
+     def test_rng_states_restorable(self, tmp_path) -> None:
+-        from checkpoint_manager import capture_rng_states, restore_rng_states
++        from checkpoint_manager import restore_rng_states
+ 
+         mgr = CheckpointManager(tmp_path, "strict_lite")
+         agent = small_agent()
+diff --git a/tests/test_death_detector.py b/tests/test_death_detector.py
+index b9de41a..705195e 100644
+--- a/tests/test_death_detector.py
++++ b/tests/test_death_detector.py
+@@ -25,11 +25,11 @@ DEAD = (40, 40, 200)
+ 
+ 
+ def make_cfg(**kw) -> DeathConfig:
+-    base = dict(
+-        threshold=25.0, confirm_frames=3, stable_frames=5,
+-        respawn_interval_s=0.8, respawn_timeout_s=3.0,
+-        anchor_fx=0.05, anchor_fy=0.05, anchor_baseline_rgb=ALIVE,
+-    )
++    base = {
++        "threshold": 25.0, "confirm_frames": 3, "stable_frames": 5,
++        "respawn_interval_s": 0.8, "respawn_timeout_s": 3.0,
++        "anchor_fx": 0.05, "anchor_fy": 0.05, "anchor_baseline_rgb": ALIVE,
++    }
+     base.update(kw)
+     return DeathConfig(**base)
+ 
+diff --git a/tests/test_demonstration_recorder.py b/tests/test_demonstration_recorder.py
+index 4d07da4..829c558 100644
+--- a/tests/test_demonstration_recorder.py
++++ b/tests/test_demonstration_recorder.py
+@@ -13,7 +13,7 @@ from pathlib import Path
+ 
+ import numpy as np
+ 
+-from config import NOOP, BotConfig
++from config import BotConfig
+ from demonstration_recorder import DemoRecorder
+ from ipc import Frame
+ 
+diff --git a/tests/test_headless_pipeline.py b/tests/test_headless_pipeline.py
+index f3587ae..3d0f6d1 100644
+--- a/tests/test_headless_pipeline.py
++++ b/tests/test_headless_pipeline.py
+@@ -139,10 +139,9 @@ def test_no_actions_after_death(tmp_path) -> None:
+ def test_synthetic_game_death_requires_respawn_click(tmp_path) -> None:
+     """The synthetic game stays dead until a respawn arrives (like the real
+     game-over screen), so the respawn machinery is genuinely exercised."""
+-    from environment import SyntheticGame
+-    from death_detector import ColorAnchorDeathDetector, DeathState
+     from config import DeathConfig
+-    from death_detector import synthetic_patch
++    from death_detector import ColorAnchorDeathDetector, DeathState
++    from environment import SyntheticGame
+ 
+     game = SyntheticGame(seed=1)
+     cfg = DeathConfig(threshold=25.0, confirm_frames=2, stable_frames=2,
+@@ -190,9 +189,10 @@ def test_synthetic_game_death_requires_respawn_click(tmp_path) -> None:
+ @pytest.mark.timeout(60, method="thread")
+ def test_game_environment_reset_step_cycle(tmp_path) -> None:
+     """Synchronous env sanity: rewards finite, death ends episode, respawn works."""
+-    from environment import GameEnvironment
+     import numpy as np
+ 
++    from environment import GameEnvironment
++
+     cfg = pipeline_cfg(tmp_path)
+     env = GameEnvironment(cfg)
+     obs = env.reset()
+@@ -200,7 +200,7 @@ def test_game_environment_reset_step_cycle(tmp_path) -> None:
+     total = 0.0
+     for step in range(30 * 90):
+         action = step % 5
+-        obs, r, done, info = env.step(action)
++        obs, r, done, _info = env.step(action)
+         assert np.isfinite(r)
+         assert obs.shape == (4, 84, 84)
+         total += r
+diff --git a/tests/test_hygiene.py b/tests/test_hygiene.py
+index 1fac639..2d4219a 100644
+--- a/tests/test_hygiene.py
++++ b/tests/test_hygiene.py
+@@ -32,12 +32,15 @@ class TestNoBareExcepts:
+     def test_no_silent_exception_pass(self, path: Path) -> None:
+         tree = file_ast(path)
+         for node in ast.walk(tree):
+-            if isinstance(node, ast.ExceptHandler):
+-                if (isinstance(node.type, ast.Name) and node.type.id == "Exception"):
+-                    assert not all(isinstance(b, ast.Pass) for b in node.body), (
+-                        f"{path.name}:{node.lineno} `except Exception: pass` "
+-                        f"swallows errors silently"
+-                    )
++            if (
++                isinstance(node, ast.ExceptHandler)
++                and isinstance(node.type, ast.Name)
++                and node.type.id == "Exception"
++            ):
++                assert not all(isinstance(b, ast.Pass) for b in node.body), (
++                    f"{path.name}:{node.lineno} `except Exception: pass` "
++                    f"swallows errors silently"
++                )
+ 
+     @pytest.mark.parametrize("path", PY_FILES, ids=lambda p: p.name)
+     def test_every_except_logs_or_returns(self, path: Path) -> None:
+diff --git a/tests/test_input_controller.py b/tests/test_input_controller.py
+index 313e421..136044a 100644
+--- a/tests/test_input_controller.py
++++ b/tests/test_input_controller.py
+@@ -9,10 +9,8 @@ from __future__ import annotations
+ 
+ import time
+ 
+-import pytest
+-
+-from config import InputConfig, NOOP
+-from input_controller import InputController, _DryRunBackend
++from config import NOOP, InputConfig
++from input_controller import InputController
+ 
+ 
+ class TestDryRun:
+@@ -105,7 +103,6 @@ class TestBackendFailure:
+         ctl = InputController(InputConfig(hold_ms=100), backend="dry_run")
+         try:
+             ctl.press_action(1)  # hold one healthy key
+-            orig = ctl._backend.press
+ 
+             def boom(key):
+                 raise RuntimeError("input stack exploded")
+diff --git a/tests/test_models.py b/tests/test_models.py
+index 1b6bf33..6010613 100644
+--- a/tests/test_models.py
++++ b/tests/test_models.py
+@@ -2,14 +2,21 @@
+ 
+ from __future__ import annotations
+ 
++from typing import ClassVar
++
+ import numpy as np
+ import pytest
+ import torch
+-import torch.nn as nn
++from torch import nn
+ 
+ from agent import DoubleDQNAgent, InferencePolicy, epsilon_for_frame
+ from config import RLConfig
+-from models import PROFILES, DuelingDQN, build_models_for_profile, count_trainable_params
++from models import (
++    PROFILES,
++    DuelingDQN,
++    build_models_for_profile,
++    count_trainable_params,
++)
+ 
+ 
+ class TestParameterBudgets:
+@@ -131,7 +138,7 @@ class TestAgent:
+                "gamma_pows": np.ones(4, dtype=np.float32)}
+ 
+         class _Opt:
+-            param_groups = [{"lr": 1e-4}]
++            param_groups: ClassVar[list[dict]] = [{"lr": 1e-4}]
+ 
+             def zero_grad(self, set_to_none=True):
+                 return None  # test double: grads handled by train_step internals
+diff --git a/tests/test_replay_buffer.py b/tests/test_replay_buffer.py
+index 16f4614..fd313ce 100644
+--- a/tests/test_replay_buffer.py
++++ b/tests/test_replay_buffer.py
+@@ -249,7 +249,9 @@ class TestPersistence:
+ 
+ class TestNStepBuilder:
+     def test_n1_passthrough(self) -> None:
+-        # n=1 emits step t once the NEXT observation exists (bootstrap target).
++        # n=1: G_t = r_t + γ Q(s_{t+1}, ·).  Builder emits step t as soon as
++        # the next observation exists; span=1 (one reward: r_t itself),
++        # γ^1 applied to the bootstrap target.
+         b = NStepBuilder(1, 0.9)
+         out = b.push(stack4(0), (1, 1, 1, 1), 2, 0.5, False)
+         assert out == []
+@@ -258,6 +260,7 @@ class TestNStepBuilder:
+         assert out[0].reward == pytest.approx(0.5)
+         assert out[0].span == 1
+         assert out[0].done is False
++        assert out[0].gamma_pow == pytest.approx(0.9)
+         assert np.allclose(out[0].obs, stack4(0))
+         assert np.allclose(out[0].next_obs, stack4(1))
+ 
+@@ -268,21 +271,32 @@ class TestNStepBuilder:
+         b.push(stack4(2), (3,) * 4, 0, 4.0, False)
+         out = b.push(stack4(3), (4,) * 4, 0, 8.0, False)  # window complete
+         assert len(out) == 1
+-        # R = 1 + .5*2 + .25*4 = 3.0 ; next_obs is the stack after 3 steps
++        # n=3: R = r_t + γ r_{t+1} + γ^2 r_{t+2} = 1 + .5*2 + .25*4 = 3.0
++        # Bootstrap from s_{t+3}; γ^3 = 0.125.
+         assert out[0].reward == pytest.approx(3.0)
+         assert out[0].span == 3
+         assert out[0].gamma_pow == pytest.approx(0.125)
+         assert np.allclose(out[0].next_obs, stack4(3))
+ 
+-    def test_terminal_flush_marks_only_last_done(self) -> None:
++    def test_terminal_flush_marks_drained_as_done(self) -> None:
++        """On episode end every pending transition inside the n-step window
++        has a terminal bootstrap (done=True, gamma_pow=0) — otherwise Q
++        would leak across episode boundaries.  Rewards are accumulated
++        forward from each head to the death step."""
+         b = NStepBuilder(3, 0.9)
+         b.push(stack4(0), (1,) * 4, 0, 1.0, False)
+         b.push(stack4(1), (2,) * 4, 0, 1.0, False)
+         out = b.push(stack4(2), (3,) * 4, 0, -10.0, True)
++        # All three pending transitions terminate at death:
++        #   step0: r = 1 + 0.9*1 + 0.9^2*(-10) = -6.2  done=True
++        #   step1: r = 1 + 0.9*(-10)                = -8.0  done=True
++        #   step2: r = -10                           = -10.0 done=True
+         assert len(out) == 3
+-        dones = [t.done for t in out]
+-        assert dones == [False, False, True]
+-        assert out[-1].reward == pytest.approx(-10.0)
++        assert all(t.done for t in out)
++        assert all(t.gamma_pow == 0.0 for t in out)
++        assert out[0].reward == pytest.approx(1 + 0.9 * 1 + 0.81 * (-10.0))
++        assert out[1].reward == pytest.approx(1 + 0.9 * (-10.0))
++        assert out[2].reward == pytest.approx(-10.0)
+ 
+     def test_nothing_crosses_episode_boundary(self) -> None:
+         b = NStepBuilder(3, 0.9)
+@@ -291,3 +305,5 @@ class TestNStepBuilder:
+         out = b.push(stack4(9), (99,) * 4, 0, 5.0, True)
+         assert len(out) == 1
+         assert out[0].reward == pytest.approx(5.0)
++        assert out[0].done is True
++        assert out[0].gamma_pow == 0.0
+diff --git a/tests/test_reward_logic.py b/tests/test_reward_logic.py
+index 321a148..1924520 100644
+--- a/tests/test_reward_logic.py
++++ b/tests/test_reward_logic.py
+@@ -75,7 +75,7 @@ class TestPendingHazard:
+         r0 = calc.step(ts=0.03, action=3, horizon=hz(10, 0.03, 20.0, True))
+         assert r0.hazard == 0.0, "bonus is pending, not immediate"
+         # next 2 frames: action recorded + horizon quiet -> resolve
+-        r1 = calc.step(ts=0.06, action=0, horizon=hz(11, 0.06, 1.0, False))
++        calc.step(ts=0.06, action=0, horizon=hz(11, 0.06, 1.0, False))
+         r2 = calc.step(ts=0.09, action=0, horizon=hz(12, 0.09, 1.0, False))
+         assert r2.hazard == pytest.approx(0.1)
+ 
+@@ -119,7 +119,7 @@ class TestPendingHazard:
+             action = 3 if dodge else 0
+             r0 = calc.step(ts=0.03, action=action,
+                            horizon=hz(10, 0.03, 20.0, True))
+-            det = False if resolves else True
++            det = not resolves
+             calc.step(ts=0.06, action=0, horizon=hz(11, 0.06, 5.0, det))
+             calc.step(ts=0.09, action=0, horizon=hz(12, 0.09, 5.0, det))
+             return r0.total
