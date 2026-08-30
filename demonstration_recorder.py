@@ -216,6 +216,10 @@ class DemoRecorder:
                 self._recompute_current()
 
     # -- public read-outs for the GUI's live "data collection" view ------ #
+    def keyboard_active(self) -> bool:
+        """True when a real keyboard hook is listening (else NOOP-only)."""
+        return bool(self._tap.available)
+
     def current_action(self) -> int:
         with self._lock:
             return int(self._current_action)

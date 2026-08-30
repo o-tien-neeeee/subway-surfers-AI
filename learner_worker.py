@@ -323,8 +323,15 @@ class Learner:
     def pretrain(self, demos_dir: str, report=print) -> dict[str, Any]:
         from dataset import DemonstrationDataset, validate_directory
 
+        put_bounded(self.metrics_q, {"type": "log", "level": "info",
+                                     "src": "learner",
+                                     "msg": f"BC: đang kiểm tra demo trong {demos_dir}…"})
         episodes, reports = validate_directory(demos_dir)
         valid = [e for e, r in zip(episodes, reports) if r.ok]
+        put_bounded(self.metrics_q, {"type": "log", "level": "info",
+                                     "src": "learner",
+                                     "msg": f"BC: {len(valid)}/{len(episodes)} episode hợp lệ "
+                                            f"(cần >= {self.cfg.bc.min_episodes})"})
         if len(valid) < self.cfg.bc.min_episodes:
             msg = (f"Only {len(valid)} valid demo episodes in {demos_dir}; "
                    f"need >= {self.cfg.bc.min_episodes}. BC skipped — online "
@@ -375,6 +382,10 @@ class Learner:
                                          "src": "learner",
                                          "msg": f"BC epoch {row['epoch']} "
                                                 f"val_acc={row['val_acc']:.3f}"})
+        put_bounded(self.metrics_q, {"type": "log", "level": "info",
+                                     "src": "learner",
+                                     "msg": f"BC: hoàn tất {len(history)} epoch, "
+                                            f"val_acc={history[-1]['val_acc']:.3f}, đang lưu checkpoint…"})
         self.bc_history = history
         self.agent.sync_target()
         self._publish(force=True)

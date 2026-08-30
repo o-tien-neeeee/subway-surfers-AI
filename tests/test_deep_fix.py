@@ -1508,3 +1508,39 @@ class TestInstantDeathDiagnostic:
         assert "CHẾT NGAY LIÊN TIẾP" in src
         # the streak must reset on a surviving episode, else it never re-arms
         assert "self._instant_death_streak = 0" in src
+
+
+# --------------------------------------------------------------------- #
+# 23. Explicit state logging for demo recording and BC pretraining
+# --------------------------------------------------------------------- #
+class TestExplicitStateLogging:
+    """The user could not see what demo recording / pretraining were doing.
+    Both must log their state explicitly to the GUI log."""
+
+    def _gui(self) -> str:
+        return (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+
+    def test_demo_start_stop_and_progress_are_logged(self) -> None:
+        src = self._gui()
+        assert "=== BẮT ĐẦU QUAY DEMO ===" in src
+        assert "=== DỪNG QUAY DEMO ===" in src
+        assert "đang ghi demo:" in src, "periodic progress must be logged"
+        assert "keyboard_active()" in src, "hook status must be surfaced"
+
+    def test_pretrain_start_and_done_are_logged(self) -> None:
+        src = self._gui()
+        assert "=== BẮT ĐẦU TIỀN-HUẤN LUYỆN (BC) ===" in src
+        assert "_on_pretrain_done" in src
+        assert 'kind == "pretrain_done"' in src
+        assert "TIỀN-HUẤN LUYỆN HOÀN TẤT" in src
+        assert "TIỀN-HUẤN LUYỆN BỎ QUA" in src
+
+    def test_learner_emits_progress_to_gui_queue(self) -> None:
+        src = (Path(__file__).resolve().parent.parent / "learner_worker.py") \
+            .read_text(encoding="utf-8")
+        # dataset validation + completion must go through metrics_q (not just
+        # report=print, which only reaches the learner's stdout)
+        assert src.count('BC: đang kiểm tra demo') == 1
+        assert 'episode hợp lệ' in src
+        assert 'BC: hoàn tất' in src

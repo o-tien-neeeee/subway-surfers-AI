@@ -1103,9 +1103,21 @@ class ControlGUI:
                                            _RingReader(ring))
         self._demo_recorder.start()
         self._demo_t0 = time.monotonic()
+        self._demo_last_log_t = 0.0
         self._arm_demo_hotkey()
         self.btn_demo.configure(text="■ Dừng demo (F9)")
         self.status_var.set("ĐANG quay demo — chơi đi! F9 / nút để dừng.")
+        # DEEP-FIX: log rõ trạng thái để người dùng biết quá trình thu thập.
+        r = self.cfg.region
+        self.log("=== BẮT ĐẦU QUAY DEMO ===")
+        self.log(f"vùng {r.width}x{r.height} | thư mục: {self.cfg.paths.demos_dir}"
+                 f" | chân trời={self.cfg.perception.horizon_frac:.2f}")
+        if self._demo_recorder.keyboard_active():
+            self.log("bàn phím: ĐANG NGHE — chơi bằng mũi tên (trái/phải/nhảy/lướt).")
+        else:
+            self.log("⚠ bàn phím: KHÔNG KHẢ DỤNG — demo sẽ TOÀN NOOP, không dùng "
+                     "cho tiền-huấn luyện được! Cần chạy trên máy có bàn phím thật.")
+        self.log("F9 hoặc nút ■ để dừng & lưu. Đang ghi…")
 
     def _stop_demo_recording(self) -> None:
         self._disarm_demo_hotkey()
@@ -1116,18 +1128,28 @@ class ControlGUI:
         self._demo_recorder = None
         self.btn_demo.configure(text="● Quay demo (F9 dừng)")
         self._set_state(BotState.READY)
+        self.log("=== DỪNG QUAY DEMO ===")
         if path:
             self.status_var.set(f"Demo saved: {path}")
-            self.log(f"demo saved: {path}")
+            self.log(f"đã lưu: {path}")
+            self.log("kiểm tra: python app.py --validate-demos "
+                     f"{self.cfg.paths.demos_dir}")
         else:
             self.status_var.set("Đã dừng quay demo (không lưu).")
+            self.log("không lưu (0 khung — preview có chạy không?).")
 
     def run_pretrain(self) -> None:
         if self.app is None:
             self.status_var.set("Bắt đầu train trước (learner giữ việc tiền-huấn luyện).")
             return
+        self._pre_pretrain_state = self.sm.state
         self._set_state(BotState.PRETRAINING)
         self.app.command("pretrain", demos_dir=str(self.cfg.paths.demos_dir))
+        # DEEP-FIX: log rõ để người dùng biết BC đang chạy (trước đây im lặng).
+        self.log("=== BẮT ĐẦU TIỀN-HUẤN LUYỆN (BC) ===")
+        self.log(f"thư mục demos: {self.cfg.paths.demos_dir}")
+        self.log("learner đang kiểm tra demo rồi học bắt chước — xem log bên dưới.")
+        self.status_var.set("Đang tiền-huấn luyện BC… xem log.")
 
     # ------------------------------------------------------------------ #
     # Polling loop (the ONLY place worker data reaches Tk)
@@ -1162,7 +1184,15 @@ class ControlGUI:
             self.log(f"demo pump error: {type(exc).__name__}: {exc}")
             return
         if got:
-            self.metric_vars["episode_id"].set(f"demo frames: {rec.frame_count()}")
+            frames = rec.frame_count()
+            self.metric_vars["episode_id"].set(f"demo frames: {frames}")
+            # DEEP-FIX: log tiến trình ~2s/lần để người dùng THẤY dữ liệu đang vào.
+            now = time.monotonic()
+            if now - getattr(self, "_demo_last_log_t", 0.0) >= 2.0:
+                self._demo_last_log_t = now
+                label = self._ACTION_STYLE.get(rec.current_action(), ("?", None))[0]
+                self.log(f"đang ghi demo: {frames} khung, "
+                         f"{now - self._demo_t0:.1f}s, hành động: {label}")
 
     def _poll_metrics(self) -> None:
         if self.app is None:
@@ -1200,6 +1230,8 @@ class ControlGUI:
                 self.metric_vars["profile"].set(str(d.get("profile", "—")))
                 if d.get("held_keys"):
                     self.log(f"WARNING held keys: {d['held_keys']}")
+            elif kind == "pretrain_done":
+                self._on_pretrain_done(msg.get("result", {}))
             elif kind == "log":
                 self.log(f"[{msg.get('src')}] {msg.get('msg')}")
             elif kind == "error":
@@ -1227,6 +1259,34 @@ class ControlGUI:
         self.metric_vars["epsilon"].set(f"{snap['epsilon']:.3f}")
         if self.sm.state is BotState.RUNNING and snap.get("dead"):
             self._set_state(BotState.DEAD)
+
+    def _on_pretrain_done(self, res: dict) -> None:
+        """Log a clear Vietnamese summary when behaviour cloning finishes."""
+        status = res.get("status")
+        if status == "ok":
+            hist = res.get("history") or []
+            last = hist[-1] if hist else {}
+            self.log("=== TIỀN-HUẤN LUYỆN HOÀN TẤT ===")
+            self.log(f"{len(hist)} epoch | val_acc cuối="
+                     f"{float(last.get('val_acc', 0)):.3f} | "
+                     f"train_acc={float(last.get('train_acc', 0)):.3f}")
+            self.log("đã lưu checkpoint best + latest — bot đã biết bắt chước, "
+                     "sẵn sàng train RL tiếp.")
+            self.status_var.set("Tiền-huấn luyện xong. Sẵn sàng train.")
+        else:
+            self.log("=== TIỀN-HUẤN LUYỆN BỎ QUA ===")
+            self.log(f"lý do: {res.get('reason', 'không rõ')} — cần >= "
+                     f"{self.cfg.bc.min_episodes} demo hợp lệ trong "
+                     f"{self.cfg.paths.demos_dir}.")
+            self.log("hãy quay demo (chơi thật) rồi bấm Tiền-huấn luyện lại; "
+                     "train RL vẫn chạy bình thường không cần BC.")
+            self.status_var.set("BC bỏ qua (thiếu demo hợp lệ). Xem log.")
+        # restore the control state so the UI is not stuck in PRETRAINING
+        target = getattr(self, "_pre_pretrain_state", BotState.READY)
+        try:
+            self._set_state(target)
+        except InvalidTransitionError:
+            self._set_state(BotState.READY)
 
     def _show_error(self, msg: dict) -> None:
         self.status_var.set(f"ERROR in {msg.get('src')}: {msg.get('error')}")
