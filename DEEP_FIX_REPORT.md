@@ -8,7 +8,7 @@
 
 | | Trước | Sau |
 |---|---|---|
-| `pytest tests` | **1 failed, 388 passed** (`-x`) — 403 test thu thập | **449 passed, 0 failed** trong 80 s |
+| `pytest tests` | **1 failed, 388 passed** (`-x`) — 403 test thu thập | **473 passed, 0 failed** trong 79 s |
 | Test treo | `test_gui_side_survives_actor_crash` **treo 600 s** rồi bị pytest-timeout giết | qua trong ~55 s (cả cụm multiprocess) |
 | Test hồi quy mới | — | **+46** (41 trong `tests/test_deep_fix.py`, +5 test đã có) |
 | Test mới **fail trên code gốc** | — | **34/41** (7 còn lại là test "chốt"/bằng chứng, liệt kê ở §3.3) |
@@ -260,7 +260,7 @@ Tác giả nối một đầu và tin rằng đầu kia tồn tại. Dấu hiệ
 
 > **Tôi nghi `_end_episode` trộn đồng hồ giữa hai process** (`_episode_start_ts` là `monotonic` của capture, so với `monotonic` của actor). Tra lại: `CLOCK_MONOTONIC` là system-wide trên Linux, và Windows cũng vậy → phép trừ **có nghĩa**. Tôi không sửa, chỉ clamp ≥ 0 và ghi chú. Ngược lại `perf_counter` vs `monotonic` **trong cùng một process** thì Python tự tuyên bố là không so sánh được. Phân biệt được hai trường hợp này quan trọng hơn là "thấy đồng hồ khác nhau thì báo lỗi".
 
-## 3.3 Test cases (bắt buộc ≥ 5) — tất cả nằm trong `tests/test_deep_fix.py`, 41 test
+## 3.3 Test cases (bắt buộc ≥ 5) — `tests/test_deep_fix.py` (44 test) + `tests/test_tk_api_surface.py` (10 test) + `tests/test_input_controller.py` (26 test)
 
 **Đã kiểm chứng hai chiều:** chạy trên code đã sửa → **41/41 pass**; chạy trên code gốc (`git stash` 17 file nguồn) → **34/41 fail**.
 
@@ -355,7 +355,7 @@ Giờ mọi reader có cửa sổ đọc chồng lấn pha ghi đều thấy `0`
 **Kiểm chứng sau khi sửa:**
 - `tests/test_deep_fix.py` → **41/41 pass**, trong đó test hammer đọc > 100 episode thật và **0 lần rách**.
 - Test thứ tự (`test_publish_invalidates_before_writing_the_payload`) xác định: ghi đầu tiên phải là `(last_episode_done_id, 0)`, ghi cuối phải là `(last_episode_done_id, 7)`.
-- Toàn suite → **449 passed, 0 failed**.
+- Toàn suite → **473 passed, 0 failed**.
 - Chạy thật `app.py --headless --steps 1500`: `new best model (survival_s rolling=5.50, window=[3.97, 7.37, 5.17])` — cửa sổ 3 episode đầy đủ, `best_model.pth` + `.sha256` sinh ra, và cửa sổ invalidate (micro-giây) **không làm mất episode nào**: `runs/headless_report.json` ghi đủ **12/12 episode** (id 1–12, `survival_s` mean 3.50 s, std 1.86).
 
 **Bài học tôi rút ra:** một test race chỉ có giá trị khi nó chứng minh được rằng nó *đã chạy*. `assert reads > 100` là assertion rẻ nhất và quan trọng nhất trong cả file.
@@ -403,8 +403,8 @@ Nói rõ để bạn không tưởng là đã xong:
 ```bash
 cd /home/user/subway-surfers-AI
 
-# 1. Toàn bộ test (449)
-OMP_NUM_THREADS=1 python3 -m pytest tests -q --timeout=400        # 449 passed
+# 1. Toàn bộ test (473)
+OMP_NUM_THREADS=1 python3 -m pytest tests -q --timeout=400        # 473 passed
 
 # 2. Test hồi quy mới, và chứng minh chúng bắt được bug cũ
 OMP_NUM_THREADS=1 python3 -m pytest tests/test_deep_fix.py -q     # 41 passed
@@ -424,3 +424,207 @@ git diff --stat
 ```
 
 **Môi trường đã dựng để chạy được test:** `torch 2.13.0`, `numpy 2.4.6`, `opencv-python-headless 5.0.0`, `pytest 9.1.1`, `psutil`, `pytest-timeout` (cài bằng `pip --break-system-packages`; `download.pytorch.org` bị chặn trong sandbox nên torch lấy từ PyPI — bản `+cu130` nhưng code assert `device.type == "cpu"` nên vẫn chạy CPU-only).
+
+---
+
+# PHẦN 7 — VÒNG 2: 4 LỖI PHÁT HIỆN KHI CHẠY TRÊN MÁY THẬT (Windows)
+
+Bạn chạy commit `28f25f8` trên máy Windows và báo "vẫn dính cả đống lỗi".
+Cả 4 lỗi dưới đây **đều là lỗi thật**, và điều quan trọng hơn: **cả 4 đều
+nằm đúng vào điểm mù của vòng 1** — những đường code chỉ chạy khi có màn hình
+thật, bàn phím thật, hoặc process con thật. Suite 449 test xanh trên Linux CI
+nhưng không hề chạm tới chúng.
+
+## Trước hết: tại sao vòng 1 bỏ sót?
+
+| Lỗi | Vì sao test không bắt được |
+|---|---|
+| `winfovrootheight` | Không test nào tạo Tk root — CI không có display. Toàn bộ `gui.py` (923 dòng) được thực thi **0 lần**. |
+| `backend_name == "auto"` | Test cũ chỉ xanh **vì** pynput luôn fail trên Linux. Nó pass ở CI và fail ở Windows — cùng một test, hai kết quả. |
+| DPI awareness gọi quá muộn | Chỉ có tác dụng (hoặc thất bại) trên Windows có scaling. |
+| `Thread._stop` bị shadow | Crash xảy ra trong `_bootstrap` của **process con**, *sau khi* log của ta đã báo shutdown sạch. |
+
+Đây không phải 4 lỗi rời rạc — chúng là **một lớp lỗi**: *code không được
+thực thi thì không được kiểm chứng*. Phần này sửa lỗi **và** đóng điểm mù.
+
+---
+
+## 7.1 🔴 `gui.py:294` — `winfovrootheight()` (thiếu dấu gạch dưới)
+
+**Triệu chứng (log của bạn):**
+```
+AttributeError: '_tkinter.tkapp' object has no attribute 'winfovrootheight'
+  File "gui.py", line 144, in _accept
+  File "gui.py", line 294, in _region_accepted
+```
+
+**Nguồn gốc:** lỗi này **có sẵn từ commit gốc `948f7c3`, dòng 294** — không
+phải do vòng 1 gây ra. Tôi đã xác minh bằng `git show 948f7c3:gui.py`.
+
+**Gốc rễ (suy luận về tư duy người viết):** dòng 293 ngay trên viết
+`winfo_vrootwidth()` **đúng**, dòng 294 viết `winfovrootheight()` **sai**.
+Người viết gõ cặp width/height liên tiếp, tay trượt mất hai dấu `_` ở dòng
+thứ hai. Vì dòng trên đúng nên khi đọc lướt cả cặp trông vẫn "hợp lý" —
+đây chính là lý do tôi, khi "đọc từng dòng", vẫn bỏ qua: **mắt so khớp mẫu
+(một cặp width/height) chứ không so khớp từng ký tự.**
+
+**Hậu quả:** không chỉ Windows. Bấm "Select region" → kéo chọn → thả chuột
+→ **crash trên mọi hệ điều hành**. Không thể hiệu chuẩn vùng bắt màn hình,
+tức là không thể chạy bot. Lặp lại 3 lần trong log của bạn = 3 lần bấm thử.
+
+**Đã sửa:** `winfo_vrootheight()`.
+
+**Chống tái diễn — `tests/test_tk_api_surface.py` (mới, 10 test).** Vấn đề:
+sandbox này không có `tkinter`, nên không thể `import gui`. Test do đó
+**chỉ parse `gui.py` bằng `ast`** và đối chiếu mọi tên thuộc tính Tk với API
+thật, lấy từ **nguồn CPython 3.13** (tải qua `gh api`, không phải trí nhớ):
+
+- Ưu tiên 1: module `tkinter` đang cài (chạy trên máy bạn, có thẩm quyền).
+- Ưu tiên 2: danh sách vendored từ CPython 3.13, gồm **toàn bộ họ
+  `winfo_*`/`wm_*` (80 tên)** — để một lỗi gõ sai mới trong họ này bị bắt
+  dù hôm nay `gui.py` chưa dùng.
+
+Hai chi tiết kỹ thuật đáng ghi lại, vì chúng quyết định test có false
+positive hay không:
+- tkinter định nghĩa **alias** dạng `geometry = wm_geometry` và **alias nối
+  tiếp** `pack = configure = config = pack_configure`. Regex naive bỏ sót cả
+  hai → báo nhầm `geometry`, `pack`, `title` là không tồn tại.
+- Test **tự kiểm chứng**: nó chèn lại đúng lỗi cũ vào bản sao và yêu cầu bộ
+  quét phải bắt được. Một linter pass trên input hỏng thì tệ hơn không có
+  linter.
+
+**Đã kiểm chứng:** chèn lại lỗi → **4 test fail**; sửa → pass.
+
+## 7.2 🟠 `input_controller.py` — `backend_name` không bao giờ resolve
+
+```python
+self.backend_name = backend        # "auto"  ← đây là YÊU CẦU, không phải câu trả lời
+...
+except Exception:
+    self.backend_name = "dry_run"  # chỉ nhánh THẤT BẠI được ghi
+```
+
+**Gốc rễ:** tác giả gán `backend_name` từ tham số để thuộc tính luôn tồn tại,
+rồi chỉ cập nhật ở nhánh degrade — vì điều tác giả nghĩ tới là *"ghi nhận
+khi bị hạ cấp"*, không phải *"ghi nhận backend nào đang sống"*. Trên máy tác
+giả điều này vô hại, vì **không có chỗ nào đọc trường này** ngoài hai phép
+so `== "dry_run"` — mà hai phép so đó lại *tình cờ* cho kết quả đúng. Đây
+là **trường chẩn đoán chỉ ghi không đọc (write-only diagnostic)**: lỗi nằm
+yên cho tới khi có người đầu tiên đọc nó, và người đó là test này.
+
+**Đã sửa:** mọi đường `return` trong `_make_backend` đều gán tên backend cụ
+thể. Kèm theo:
+- **Validate input** — `backend="pynpt"` (gõ sai) trước đây rơi thẳng vào
+  nhánh `auto` và **âm thầm bấm phím thật** dưới một cái tên không ai yêu
+  cầu. Nay raise `ValueError`.
+- `requested_backend` giữ lại yêu cầu gốc, và `is_dry_run` thay cho chuỗi
+  magic lặp ở 2 chỗ.
+- `environment.py` **log ra** requested vs resolved — để trường này thực sự
+  được *đọc*, không tái diễn tình trạng write-only. Đã thấy dòng này chạy
+  thật: `input backend: dry_run`.
+
+## 7.3 🟠 `gui.py` — DPI awareness được gọi **sau khi** đã tạo cửa sổ
+
+```python
+def set_dpi_awareness() -> float:
+    """... return the Tk scale factor."""   # ← nói dối
+    ...
+    return 1.0                               # ← mọi nhánh đều trả 1.0 cứng
+```
+
+Ba lỗi trong một hàm:
+
+1. **Docstring nói dối.** Hứa trả "Tk scale factor", nhưng trả `1.0` cứng ở
+   *mọi* đường — kể cả đường thất bại. Caller nào tin nó sẽ coi màn hình
+   150% thành 100%.
+2. **Gọi quá muộn.** Windows chỉ chấp nhận `SetProcessDpiAwareness`
+   **trước khi cửa sổ đầu tiên được tạo**. Hàm này chỉ được gọi từ
+   `_region_accepted` (dòng 287) — tức là **sau** `tk.Tk()` (dòng 942), sau
+   khi user đã kéo xong vùng chọn. Lúc đó Windows trả `E_ACCESSDENIED`
+   (0x80070005) và `except Exception` **nuốt mất**.
+3. **Không kiểm tra mã trả về.** `SetProcessDpiAwareness` báo lỗi bằng
+   HRESULT chứ không raise, nên code cũ vẫn đặt `DPI_AWARENESS_SET = True`
+   dù Windows đã từ chối.
+
+**Hậu quả (chỉ trên Windows có scaling — đúng loại máy của bạn):** process ở
+chế độ DPI-unaware, Tk báo toạ độ **ảo hoá** còn `mss` bắt ảnh theo pixel
+**vật lý**. Vùng bạn kéo chọn **không phải** vùng bị capture. Không có thông
+báo nào.
+
+**Đã sửa:** gọi trước `tk.Tk()`; trả `bool` thật; phân biệt `E_ACCESSDENIED`
+và log rõ; `_region_accepted` cảnh báo khi tỉ lệ lệch.
+
+## 7.4 🔴 `safety_watchdog.py:57` — ghi đè `threading.Thread._stop`
+
+```python
+class SafetyWatchdog(threading.Thread):
+    def __init__(self, ...):
+        self._stop = threading.Event()   # ← đè lên method nội bộ của Thread
+```
+
+CPython's `Thread` có **method nội bộ tên `_stop`**. Gán thuộc tính cùng tên
+làm nó biến mất. Khi `join()` hoàn tất, `Thread._wait_for_tstate_lock()` gọi
+`self._stop()` → **`TypeError: 'Event' object is not callable`**.
+
+**Tôi tìm ra lỗi này bằng cách chạy thật `python app.py --headless`**, chứ
+không phải bằng đọc:
+```
+Process actor-worker:
+Traceback (most recent call last):
+  File "app.py", line 173, in _actor_entry
+    watchdog.join(timeout=1.0)
+  File "/usr/lib/python3.11/threading.py", line 1134, in _wait_for_tstate_lock
+    self._stop()
+TypeError: 'Event' object is not callable
+```
+**Mọi lần shutdown đều crash như vậy.** Lý do suite vẫn xanh: exception xảy
+ra trong `_bootstrap` của process con, *sau khi* log chính đã in "actor loop
+end" và "capture stop" — trông như một lần tắt sạch sẽ.
+
+**Đã sửa:** `_stop` → `_stop_event`. Đã kiểm chứng trước/sau bằng chính lệnh
+trên: traceback biến mất.
+
+**Chống tái diễn:** test cấu trúc duyệt mọi lớp con của `threading.Thread`
+trong repo và báo nếu có thuộc tính nào trùng tên với thuộc tính của
+`Thread` — bắt cả lớp lỗi, không chỉ riêng `_stop`.
+
+---
+
+## 7.5 Hai lỗi "trông như lỗi" mà tôi đã kiểm tra và **kết luận là không phải**
+
+- **`perception.py:189: undefined name 'torch'`** (pyflakes báo). Không phải
+  lỗi: `"torch.Tensor"` là **PEP 563 string annotation** (`from __future__
+  import annotations`), không bao giờ được evaluate; `import torch` nằm ngay
+  trong thân hàm; tác giả đã đánh dấu `# noqa: F821`.
+- **`environment.py:247-248: 'hz'/'dr' assigned but never used`**. Không phải
+  lỗi: `_ingest` chỉ được gọi từ `reset()` (đã xác minh: đúng 1 call site),
+  ở đó kết quả horizon/death cố ý bỏ đi. Chính hai lời gọi đó trong `step()`
+  thì **có** dùng.
+
+## 7.6 Hai lỗi trong **chính test của tôi**, tự bắt được
+
+Ghi lại vì chúng đáng tin hơn là giấu đi:
+
+1. `assert n.value.value == 1.0` — **`True == 1.0` là `True` trong Python**,
+   nên mọi `return True` đều bị coi là "hằng số 1.0". Đã sửa bằng cách kiểm
+   tra cả `isinstance(..., bool)`.
+2. `assert "scale = set_dpi_awareness()" not in src` — fail vì **chính comment
+   DEEP-FIX giải thích lỗi cũ có chứa chuỗi đó**. Đã chuyển sang assert trên
+   AST thay vì trên văn bản.
+
+## 7.7 Kiểm chứng (chạy thật)
+
+| Kiểm chứng | Trước | Sau |
+|---|---|---|
+| `pytest -q` (toàn bộ) | 1 failed | **473 passed, 0 failed** (78.7 s) |
+| `python app.py --headless --steps 300 --dry-run` | `TypeError: 'Event' object is not callable` khi shutdown | sạch, không traceback |
+| Test mới chạy trên **source gốc** (`git show HEAD:`) | — | **17/17 fail** — chứng minh không vacuous |
+| Quét toàn repo: `self.X` không được gán trong lớp/lớp cha | — | **0** (lỗi `winfovrootheight` là duy nhất của lớp này) |
+| `python -m compileall` toàn bộ module first-party | — | OK |
+| `python app.py --help`, `python profiling.py` | — | OK |
+
+> **Lưu ý trung thực:** sandbox này không có `tkinter`, không có display, và
+> không phải Windows. `gui.py` **không thể import được ở đây**. Mọi khẳng
+> định về `gui.py` đều dựa trên phân tích AST + đối chiếu API CPython 3.13,
+> **không** dựa trên việc chạy GUI. Ba lỗi 7.1/7.3 cần bạn xác nhận lại trên
+> máy Windows thật.

@@ -35,21 +35,67 @@ LOGGER = get_logger("gui")
 DPI_AWARENESS_SET = False
 
 
-def set_dpi_awareness() -> float:
-    """Ask Windows for per-monitor DPI awareness; return the Tk scale factor."""
-    global DPI_AWARENESS_SET
-    if platform.system() == "Windows" and not DPI_AWARENESS_SET:
-        try:
-            import ctypes
+def set_dpi_awareness() -> bool:
+    """Ask Windows for per-monitor DPI awareness.
 
-            try:
-                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
-            except Exception:
-                ctypes.windll.user32.SetProcessDPIAware()
-            DPI_AWARENESS_SET = True
-        except Exception as exc:
-            LOGGER.warning("DPI awareness not set: %s", exc)
-    return 1.0
+    DEEP-FIX: three defects fixed together.
+
+    1. The signature promised "the Tk scale factor" but the body returned a
+       hardcoded ``1.0`` on every path, including the failure path.  A caller
+       that trusted it would silently treat a 150%-scaled desktop as 100%.
+       It now returns whether awareness was actually established -- a value
+       that is true by construction.
+
+    2. Windows only honours ``SetProcessDpiAwareness`` *before the first
+       window is created*.  It was being called from ``_region_accepted``,
+       i.e. long after ``tk.Tk()`` exists, where it fails with
+       ``E_ACCESSDENIED`` (0x80070005).  The bare ``except`` swallowed that,
+       so on a scaled Windows desktop the process stayed DPI-unaware: Tk
+       reported *virtualised* screen coordinates while mss captured *physical*
+       pixels, and the recorded region fractions pointed at the wrong part of
+       the screen.  ``run_gui`` now calls this before ``tk.Tk()``.
+
+    3. The return code was never inspected.  ``SetProcessDpiAwareness``
+       reports failure in its HRESULT return value, not by raising, so the
+       old code marked ``DPI_AWARENESS_SET = True`` even when Windows had
+       refused the request.
+    """
+    global DPI_AWARENESS_SET
+    if platform.system() != "Windows":
+        return True                      # X11/Wayland have no process DPI mode
+    if DPI_AWARENESS_SET:
+        return True
+    try:
+        import ctypes
+
+        try:
+            # S_OK == 0.  E_ACCESSDENIED (0x80070005) means a window already
+            # exists, which is the "called too late" signature.
+            hr = ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
+            if hr == 0:
+                DPI_AWARENESS_SET = True
+                return True
+            if hr == -2147024891:        # E_ACCESSDENIED
+                LOGGER.warning(
+                    "DPI awareness refused (E_ACCESSDENIED): this must be set "
+                    "before the first window is created. Screen coordinates "
+                    "may be virtualised, so the selected region may not match "
+                    "what the capture sees."
+                )
+                return False
+            LOGGER.warning("SetProcessDpiAwareness returned HRESULT %#x", hr)
+            return False
+        except Exception:
+            # Older Windows without shcore: fall back to the user32 call,
+            # which returns non-zero on success.
+            if ctypes.windll.user32.SetProcessDPIAware():
+                DPI_AWARENESS_SET = True
+                return True
+            LOGGER.warning("SetProcessDPIAware() returned 0 (failure)")
+            return False
+    except Exception as exc:
+        LOGGER.warning("DPI awareness not set: %s", exc)
+        return False
 
 
 # --------------------------------------------------------------------- #
@@ -284,14 +330,34 @@ class ControlGUI:
         RegionSelector(self.root, self._region_accepted, self._region_cancelled)
 
     def _region_accepted(self, left: int, top: int, w: int, h: int) -> None:
-        scale = set_dpi_awareness()
+        # DEEP-FIX: `scale = set_dpi_awareness()` assigned a value nothing
+        # ever read (the function always returned 1.0), which hid the fact
+        # that calling it here is far too late to matter.  run_gui() now sets
+        # awareness before tk.Tk(); this call is kept only as an idempotent
+        # safety net for anyone entering this path directly.
+        dpi_aware = set_dpi_awareness()
         self.root.update_idletasks()
         try:
             dpi_scale = self.root.winfo_fpixels("1i") / 96.0
         except tk.TclError:
             dpi_scale = 1.0
+        # DEEP-FIX: make the virtualised-coordinate mismatch visible instead
+        # of silently recording region fractions in the wrong space.
+        if not dpi_aware and abs(dpi_scale - 1.0) > 0.01:
+            self.log(f"WARNING: desktop scaling is {dpi_scale:.2f}x but the "
+                     "process is DPI-unaware; the saved region may not match "
+                     "the captured pixels.")
+            LOGGER.warning("DPI mismatch: Tk scale %.3f, process DPI-unaware",
+                           dpi_scale)
         sw = self.root.winfo_vrootwidth()
-        sh = self.root.winfovrootheight()
+        # DEEP-FIX: this was `winfovrootheight()` -- the underscores were
+        # missing, so accepting a region selection raised AttributeError
+        # from the Tkinter callback and calibration could never complete.
+        # The neighbouring line spelled winfo_vrootwidth() correctly, which
+        # is what made it read plausibly.  Reported from a real Windows
+        # run; it fails identically on every platform because no test
+        # builds a Tk root (there is no display in CI).
+        sh = self.root.winfo_vrootheight()
         r = self.cfg.region
         r.left, r.top, r.width, r.height = int(left), int(top), int(w), int(h)
         r.screen_width, r.screen_height = int(sw), int(sh)
@@ -932,6 +998,9 @@ def run_gui(cli_args: Any = None) -> int:
         cfg = BotConfig.load(cli_args.config)
     else:
         cfg = BotConfig()
+    # DEEP-FIX: must happen before the first window exists, or Windows
+    # refuses it and every screen coordinate is virtualised.
+    set_dpi_awareness()
     root = tk.Tk()
     try:
         root.state("zoomed")

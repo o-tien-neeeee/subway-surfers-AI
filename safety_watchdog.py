@@ -54,7 +54,17 @@ class SafetyWatchdog(threading.Thread):
         # between paused and running.
         self.stall_recovery_s = max(0.0, float(stall_recovery_s))
         self.on_status = on_status
-        self._stop = threading.Event()
+        # DEEP-FIX: this was `self._stop = threading.Event()`.  CPython's
+        # threading.Thread defines an *internal method* named `_stop`, and
+        # assigning an attribute with that name shadows it.  When join()
+        # finished, Thread._wait_for_tstate_lock() called `self._stop()`
+        # and raised `TypeError: 'Event' object is not callable`, killing
+        # the actor-worker process with a traceback on every shutdown.
+        # The exception escaped the main flow entirely -- it happened in
+        # the child process's _bootstrap, after our own logging had
+        # already reported a clean exit -- which is why a green test
+        # suite and a clean-looking log coexisted with a crash.
+        self._stop_event = threading.Event()
         self._last_frame_id = -1
         self._last_progress_ts = time.monotonic()
         self._focus_loss_reported = False
@@ -64,12 +74,12 @@ class SafetyWatchdog(threading.Thread):
     # ------------------------------------------------------------------ #
     def run(self) -> None:
         LOGGER.info("watchdog running (interval=%.2fs)", self.interval_s)
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():  # DEEP-FIX: renamed, see __init__
             try:
                 self._check_once()
             except Exception as exc:
                 LOGGER.error("watchdog check failed:\n%s", format_exception(exc))
-            self._stop.wait(self.interval_s)
+            self._stop_event.wait(self.interval_s)
         LOGGER.info("watchdog stopped")
 
     def _check_once(self) -> None:
@@ -166,7 +176,7 @@ class SafetyWatchdog(threading.Thread):
                 LOGGER.error("on_status callback failed: %s", exc)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
 
 class EmergencyHotkey:

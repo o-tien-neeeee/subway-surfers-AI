@@ -379,6 +379,18 @@ class BotActor:
                                           cooldown_ms=cfg.input.cooldown_ms)
         self.scheduler.ttl_ms = float(cfg.input.action_ttl_ms)
         self.input = InputController(cfg.input, backend=input_backend)
+        # DEEP-FIX: report requested vs *resolved* backend.  `backend_name`
+        # used to echo the request and nothing ever read it, which is why a
+        # half-maintained value survived a release.  A run that asked for
+        # real input and silently got dry_run now says so on the first line
+        # of the log instead of producing an episode of NOOPs.
+        if self.input.requested_backend != self.input.backend_name:
+            LOGGER.warning(
+                "input backend degraded: requested %r but %r is live",
+                self.input.requested_backend, self.input.backend_name,
+            )
+        else:
+            LOGGER.info("input backend: %s", self.input.backend_name)
         model = DuelingDQN.from_profile(cfg.rl.profile,
                                         cfg.perception.frame_stack,
                                         cfg.perception.ground_size)

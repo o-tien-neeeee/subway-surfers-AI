@@ -834,3 +834,86 @@ class TestRespawnOrdering:
                 break
         assert last is not None and last.action == "FAILED"
         assert ctl.clicks <= 12
+
+
+# --------------------------------------------------------------------- #
+# 14. A Thread subclass must not shadow threading.Thread's internals
+# --------------------------------------------------------------------- #
+class TestThreadInternalShadowing:
+    """``SafetyWatchdog`` shadowed ``Thread._stop`` and crashed on shutdown.
+
+    Symptom of the original bug: every headless run ended with
+
+        Process actor-worker:
+        Traceback (most recent call last):
+          ...
+          File ".../threading.py", line 1134, in _wait_for_tstate_lock
+            self._stop()
+        TypeError: 'Event' object is not callable
+
+    CPython's ``threading.Thread`` has an *internal method* called ``_stop``.
+    Assigning ``self._stop = threading.Event()`` replaces that method with an
+    Event, so when ``join()`` completed and called ``self._stop()`` it blew
+    up.  The crash happened in the child process's ``_bootstrap``, after our
+    own logging had already announced a clean shutdown -- which is exactly
+    why a passing test suite and a tidy log coexisted with a hard crash on
+    every single run.
+    """
+
+    def test_watchdog_joins_without_raising(self) -> None:
+        """Direct reproduction: start it, stop it, join it."""
+        from safety_watchdog import SafetyWatchdog
+
+        wd = SafetyWatchdog(events={}, input_controller=None, counters=None,
+                            metrics_q=None, interval_s=0.02)
+        wd.start()
+        time.sleep(0.05)
+        wd.stop()
+        wd.join(timeout=5.0)          # <- raised TypeError before the fix
+        assert not wd.is_alive(), "watchdog thread did not exit"
+
+    def test_no_thread_subclass_shadows_a_thread_internal(self) -> None:
+        """Generalise: catch the whole class of bug, not just ``_stop``.
+
+        Any instance attribute a ``threading.Thread`` subclass assigns that
+        collides with a name on ``Thread`` itself is a latent crash -- it may
+        not fire today (only ``_stop`` is called by ``join``), but the next
+        CPython release is free to use any of these names internally.
+        """
+        import ast
+
+        thread_attrs = set(dir(threading.Thread))
+        offenders: list[str] = []
+        for path in sorted(Path(__file__).resolve().parent.parent.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+                bases = [b.id if isinstance(b, ast.Name) else
+                         getattr(b, "attr", "") for b in cls.bases]
+                if "Thread" not in bases:
+                    continue
+                for node in ast.walk(cls):
+                    if (isinstance(node, ast.Attribute)
+                            and isinstance(node.value, ast.Name)
+                            and node.value.id == "self"
+                            and isinstance(node.ctx, ast.Store)
+                            and node.attr in thread_attrs):
+                        offenders.append(f"{path.name}:{node.lineno} "
+                                         f"{cls.name}.{node.attr}")
+        assert not offenders, (
+            f"Thread subclass(es) overwrite attributes that threading.Thread "
+            f"already defines: {offenders}.  Rename them -- see the class "
+            f"docstring for the shutdown crash this caused."
+        )
+
+    def test_stop_event_is_a_real_event(self) -> None:
+        """The replacement attribute must still behave like the old one."""
+        from safety_watchdog import SafetyWatchdog
+
+        wd = SafetyWatchdog(events={}, input_controller=None, counters=None,
+                            metrics_q=None, interval_s=0.02)
+        assert isinstance(wd._stop_event, threading.Event)
+        assert not wd._stop_event.is_set()
+        wd._stop_event.set()
+        assert wd._stop_event.is_set()
+        # Thread._stop must still be the method CPython expects.
+        assert callable(threading.Thread._stop)
