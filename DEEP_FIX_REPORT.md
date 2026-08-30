@@ -874,3 +874,44 @@ Hướng dẫn.
 > "thấy" tiếng Việt; việc dịch được kiểm chứng bằng test chuỗi + compile. Bạn
 > chạy `python app.py` trên Windows để thấy UI Việt và preview có hình ở cả
 > bước 3 & 4.
+
+---
+
+## Phần 13 — Vòng 8 (v1.9.0): Hướng dẫn A–Z, chân trời hiển thị, test-click không bị chặn focus, preflight
+
+**Bối cảnh:** người dùng chạy thật trên Windows và báo "dùng chẳng hiểu gì… click test ko được… chân trời ko thấy hiện". Log cho thấy calibration ĐÚNG (`region locked`, `anchor rgb=(43,141,201) std=0.00`, `dead sample distance=201.0`) nhưng: (1) `test click … BLOCKED (focus?)` ×8; (2) đường chân trời không bao giờ vẽ lên preview; (3) chết ngay frame 33 (distance≈200 ≈ dead-sample) ⇒ capture đang đọc trạng thái chết/bị che.
+
+### Bảng chẩn đoán
+
+| Mức độ | Loại lỗi | Vị trí | Mô tả | Hậu quả | Gốc rễ (suy luận mindset) |
+|---|---|---|---|---|---|
+| Cao | UX/logic | `gui.py::_respawn_test` | Cổng "chỉ bấm khi Chrome focus" (dành cho lúc CHƠI) cũng chặn cú test click lúc hiệu chuẩn | Người dùng đang ở cửa sổ Tk nên Chrome không focus → mọi cú test `BLOCKED` | Tác giả tái dùng `InputController.click()` mặc định `confirm_focus=True` mà không nghĩ rằng ngữ cảnh hiệu chuẩn khác ngữ cảnh chơi |
+| Cao | UX | `gui.py::_update_preview` | Preview chỉ blit frame, không vẽ overlay | "chân trời ko thấy hiện" — người dùng không biết đường split ở đâu | Tác giả coi preview là "xem ảnh thô", quên rằng calibration cần thấy marker |
+| Trung | UX | `gui.py` | Không có hướng dẫn sử dụng | "dùng chẳng hiểu gì" | Tool nghiên cứu, tác giả giả định người dùng đã biết quy trình |
+| Trung | Robustness | `gui.py::start_training` | Không kiểm tra capture trước khi chạy | Chạy trên màn thua/vùng bị che → chết ngay, lãng phí | Tác giả tin calibration đã đủ đảm bảo |
+| Thấp | Bug tiềm ẩn | `version.py::CHANGELOG` | Thiếu dấu phẩy → 1.8/1.7/1.6/1.5 bị gộp thành 1 chuỗi | Changelog hiển thị sai | Lỗi đánh máy, không có test |
+
+### Các sửa đổi (mỗi chỗ có `# DEEP-FIX:`)
+
+1. **`_update_preview`** vẽ overlay bằng `PIL.ImageDraw` trước khi tạo `PhotoImage`: đường chân trời XANH tại `horizon_frac*dh`, vòng ĐỎ tại anchor chết, vòng XANH tại điểm hồi sinh (toạ độ phân số ⇒ đúng tỉ lệ trên thumbnail 420×260).
+2. **`_respawn_test`** gọi `ctl.click(x, y, confirm_focus=False)` — cổng focus chỉ dành cho gameplay; cú test có hộp xác nhận riêng.
+3. **Tab "❓ Hướng dẫn"** (`HELP_AZ`) — quy trình A–Z tiếng Việt: điều kiện trước (Chrome focus, không che vùng, tắt hardware accel nếu đen), 6 bước, phím tắt F8/F9, và mục giải quyết rắc rối (BLOCKED, focus lost, chết ngay, preview đen).
+4. **`_preflight_capture_check`** gọi trong `start_training`: bắt 1 frame, cảnh báo nếu ĐEN hoặc neo khác xa baseline (`patch_rgb_distance > threshold`) ⇒ "vùng đang hiện màn THUA hoặc bị che".
+5. **`version.py`**: `APP_VERSION → 1.9.0`; sửa 4 dấu phẩy thiếu trong CHANGELOG.
+
+### Test cases (5 mới, `TestCalibrationVisibleAndTestClick` + `TestChangelogNotMerged`)
+
+1. `test_preview_draws_horizon_and_markers` — preview phải `ImageDraw.Draw`, vẽ `dr.line` (chân trời) và ≥2 `dr.ellipse` (marker).
+2. `test_test_click_bypasses_focus_gate` — `_respawn_test` dùng `confirm_focus=False`.
+3. `test_a_to_z_help_tab_exists_and_is_vietnamese` — tab Hướng dẫn tồn tại, đủ BƯỚC 1/6, hardware acceleration, CLICK VÀO CỬA, F8.
+4. `test_click_focus_gate_still_protects_gameplay` — `InputController.click` mặc định vẫn `confirm_focus=True` (bypass chỉ scoped cho test).
+5. `test_start_runs_preflight_capture_check` — `start_training` gọi preflight, dùng `patch_rgb_distance` thật.
+6. `test_each_entry_has_distinct_version` — mỗi entry CHANGELOG chỉ chứa đúng 1 tag phiên bản (chống gộp chuỗi).
+
+**Kết quả:** `pytest -q` → **507 passed** (81 s). Test_deep_fix: 72.
+
+### My Reasoning
+
+Calibration của người dùng thực ra ĐÚNG — vấn đề là *không nhìn thấy* và *bị chặn oan*. Đường chân trời và marker phải được vẽ lên chính preview (toạ độ phân số để đúng tỉ lệ thumbnail). Cổng focus là đúng cho gameplay (tránh bấm nhầm khi người dùng gõ phím) nhưng sai cho cú test có xác nhận — nên bypass có chủ đích, không bỏ cổng. Chết-ngay là hệ quả môi trường (vùng bị che/màn thua) nên thêm preflight phát hiện sớm thay vì đoán. Changelog gộp chuỗi là bug thật tìm thấy khi bump version — sửa và khoá bằng test.
+
+**Chưa kiểm chứng được trong sandbox:** không có display/Chrome/pynput — việc vẽ overlay và tab hướng dẫn chỉ xác minh bằng compile + test cấu trúc/chuỗi, chưa thấy bằng mắt.

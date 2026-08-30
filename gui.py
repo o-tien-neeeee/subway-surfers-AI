@@ -103,6 +103,38 @@ def set_dpi_awareness() -> bool:
 # --------------------------------------------------------------------- #
 # Step 1: region selection overlay
 # --------------------------------------------------------------------- #
+HELP_AZ = """HƯỚNG DẪN SỬ DỤNG TỪ A–Z
+────────────────────────────
+ĐIỀU KIỆN TRƯỚC (máy Windows thật):
+ • Mở Chrome vào poki.com/en/g/subway-surfers, game ĐANG chạy, KHÔNG thu nhỏ.
+ • Đặt cửa sổ điều khiển này sang MÀN HÌNH/ vị trí KHÔNG che vùng game.
+ • Nếu preview ĐEN: Chrome → Cài đặt → tắt "Use hardware acceleration", rồi chọn lại vùng.
+
+BƯỚC 1 – Chọn vùng: bấm "Chọn vùng", kéo khung CHỈ quanh vùng game (không dính
+   thanh trình duyệt). Enter = chọn, Esc = huỷ, R = làm lại.
+BƯỚC 2 – Khoá vùng: "Bật preview" để thấy game; ổn thì "Khoá vùng".
+BƯỚC 3 – Neo màu (sống/chết): "Bật preview"; bấm vào một điểm UI ổn định luôn
+   hiện khi sống (góc thanh điểm). "Hiệu chuẩn SỐNG (2s)" khi game đang chạy.
+   Vòng ĐỎ trên preview là vị trí neo.
+BƯỚC 4 – Nút hồi sinh: "Bật preview"; bấm đúng nút "chơi lại" trên màn thua.
+   Vòng XANH là điểm hồi sinh. "Test click (hỏi trước)" để thử (không cần focus).
+BƯỚC 5 – Chân trời: kéo thanh trượt (mặc định 25%). Đường XANH NGANG trên preview
+   là ranh giới chân trời / mặt đất — phải thấy nó.
+BƯỚC 6 – Chạy: "▶ Bắt đầu train". QUAN TRỌNG: ngay sau khi bấm, hãy CLICK VÀO CỬA
+   SỔ CHROME để game có focus — bot chỉ chơi khi Chrome focus (để không bấm nhầm
+   khi bạn đang gõ). F8 = dừng khẩn cấp. F9 = dừng quay demo.
+
+GIẢI QUYẾT RẮC RỐI:
+ • "test click ... BLOCKED (focus?)": bản cũ bắt Chrome focus cả khi test — đã sửa,
+   nút Test giờ bỏ qua cổng focus (vẫn hỏi xác nhận).
+ • "Browser focus lost — pausing": bình thường khi bạn đang ở cửa sổ này; hãy click
+   vào Chrome để bot chơi tiếp.
+ • Chết ngay 0.2s khi vừa chạy: vùng chọn đang bị che hoặc game chưa ở trạng thái
+   sống — kiểm tra cửa sổ không che vùng, và game đang chạy trước khi Bắt đầu.
+ • Preview đen: tắt hardware acceleration của Chrome (xem trên).
+"""
+
+
 class RegionSelector:
     """Fullscreen semi-transparent overlay for click-and-drag selection."""
 
@@ -298,12 +330,14 @@ class ControlGUI:
         self.step4 = ttk.Frame(self.nb, padding=10)
         self.step5 = ttk.Frame(self.nb, padding=10)
         self.step6 = ttk.Frame(self.nb, padding=10)
+        self.step_help = ttk.Frame(self.nb, padding=10)
         for name, tab in (("1 Chọn vùng", self.step1),
                           ("2 Khoá vùng", self.step2),
                           ("3 Neo màu (sống/chết)", self.step3),
                           ("4 Nút hồi sinh", self.step4),
                           ("5 Vùng chân trời", self.step5),
-                          ("6 Chạy & số liệu", self.step6)):
+                          ("6 Chạy & số liệu", self.step6),
+                          ("❓ Hướng dẫn", self.step_help)):
             self.nb.add(tab, text=name)
 
         self._build_step1()
@@ -312,11 +346,21 @@ class ControlGUI:
         self._build_step4()
         self._build_step5()
         self._build_step6()
+        self._build_help()
 
         # -- error/status strip
         self.status_var = tk.StringVar(value="Calibration required (steps 1-5).")
         ttk.Label(outer, textvariable=self.status_var, foreground="#a00",
                   wraplength=900).pack(fill=tk.X, pady=(4, 0))
+
+    # help ------------------------------------------------------------- #
+    def _build_help(self) -> None:
+        f = self.step_help
+        txt = tk.Text(f, wrap="word", font=("Segoe UI", 10), background="#101418",
+                      foreground="#e6e9ee", insertbackground="#e6e9ee")
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert("end", HELP_AZ)
+        txt.configure(state=tk.DISABLED)
 
     # step 1 ----------------------------------------------------------- #
     def _build_step1(self) -> None:
@@ -424,6 +468,24 @@ class ControlGUI:
 
         img = img.copy()
         img.thumbnail((420, 260))
+        # DEEP-FIX: vẽ lớp overlay hiệu chuẩn lên preview để bạn NHÌN THẤY
+        # những gì mình đã chỉnh: đường phân cách chân trời (xanh), điểm neo
+        # (đỏ) và điểm hồi sinh (xanh lá).  Trước đây "chân trời" không hề hiện
+        # nên bạn không biết mình chỉnh gì.  Toạ độ dùng phân số nên đúng tỉ lệ
+        # với ảnh thumbnail.
+        from PIL import ImageDraw
+        dw, dh = img.size
+        dr = ImageDraw.Draw(img)
+        hf = float(self.cfg.perception.horizon_frac)
+        dr.line([(0, int(hf * dh)), (dw, int(hf * dh))], fill=(46, 204, 113), width=2)
+        if getattr(self.cfg.death, "anchor_fx", -1.0) >= 0:
+            ax = self.cfg.death.anchor_fx * dw
+            ay = self.cfg.death.anchor_fy * dh
+            dr.ellipse([ax - 4, ay - 4, ax + 4, ay + 4], outline=(255, 59, 48), width=2)
+        if self.cfg.input.respawn_set():
+            rx = self.cfg.input.respawn_fx * dw
+            ry = self.cfg.input.respawn_fy * dh
+            dr.ellipse([rx - 5, ry - 5, rx + 5, ry + 5], outline=(46, 204, 113), width=2)
         self.preview_img = ImageTk.PhotoImage(img)
         self.preview_label.configure(image=self.preview_img)
         self._latest_preview = img  # for click/anchor sampling (fractions)
@@ -672,8 +734,12 @@ class ControlGUI:
 
         ctl = InputController(self.cfg.input, backend="auto")
         try:
-            ok = ctl.click(x, y)
-            self.log(f"test click at ({x},{y}): {'sent' if ok else 'BLOCKED (focus?)'}")
+            # DEEP-FIX: cổng "chỉ bấm khi Chrome focus" là cho LÚC CHƠI, không
+            # dành cho nút Test hiệu chuẩn — bạn đang bấm trên cửa sổ GUI nên
+            # Chrome không focus và cú test luôn bị "BLOCKED (focus?)".  Cú test
+            # đã được bạn xác nhận bằng hộp thoại, nên bỏ cổng focus ở đây.
+            ok = ctl.click(x, y, confirm_focus=False)
+            self.log(f"test click at ({x},{y}): {'đã gửi' if ok else 'THẤT BẠI'}")
         finally:
             ctl.dispose()
 
@@ -780,6 +846,28 @@ class ControlGUI:
     # ------------------------------------------------------------------ #
     # Training control
     # ------------------------------------------------------------------ #
+    def _preflight_capture_check(self) -> None:
+        """Grab one frame and warn if the capture looks broken/dead so the user
+        fixes the region/focus BEFORE a run that would instantly die."""
+        from perception import mean_luma, patch_rgb_distance
+        patch = self._grab_anchor_patch()
+        if patch is None:
+            self.log("preflight: KHÔNG bắt được frame — kiểm tra vùng chọn.")
+            return
+        if float(mean_luma(patch)) < 8.0:
+            self.log("⚠ preflight: frame ĐEN — vùng bị che hoặc hardware "
+                     "acceleration. Sửa trước khi train.")
+            return
+        d = self.cfg.death
+        if d.anchor_baseline_rgb[0] >= 0:
+            dist = float(patch_rgb_distance(patch, d.anchor_baseline_rgb))
+            if dist > d.threshold:
+                self.log(f"⚠ preflight: neo KHÁC xa lúc sống "
+                         f"(d={dist:.0f} > {d.threshold}) — vùng đang hiện màn "
+                         "THUA hoặc bị che. Vào màn game SỐNG rồi bấm lại.")
+            else:
+                self.log(f"preflight OK: neo khớp lúc sống (d={dist:.0f}).")
+
     def start_training(self) -> None:
         if self.app is not None:
             self.status_var.set("Đang chạy rồi.")
@@ -787,6 +875,7 @@ class ControlGUI:
         warnings = self.cfg.validate()
         for w in warnings:
             self.log(f"config warning: {w}")
+        self._preflight_capture_check()
         from app import BotApplication
 
         try:

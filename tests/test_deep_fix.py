@@ -1323,3 +1323,76 @@ class TestUIIsVietnamese:
         for en in ('"Start preview"', '"Lock region"', '"Calibrate ALIVE (2s)"',
                    '"Start training"', '"Live metrics"', '"Training log"'):
             assert en not in src, f"English UI string still present: {en}"
+
+
+# --------------------------------------------------------------------- #
+# 21. Calibration must be VISIBLE and the test click must not be focus-gated
+# --------------------------------------------------------------------- #
+class TestCalibrationVisibleAndTestClick:
+    """From a real Windows log: the horizon line never appeared on the preview
+    ("chân trời ko thấy hiện"), and every calibration test click printed
+    ``BLOCKED (focus?)`` because the gameplay focus gate also guarded the
+    user-confirmed test click.  Guard both fixes.
+    """
+
+    def _src(self) -> str:
+        return (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+
+    def test_preview_draws_horizon_and_markers(self) -> None:
+        src = self._src()
+        assert "ImageDraw.Draw(img)" in src, "preview must be annotated"
+        assert "horizon_frac" in src and "dr.line(" in src, \
+            "the horizon split line must be drawn on the preview"
+        assert src.count("dr.ellipse(") >= 2, \
+            "anchor and respawn markers must be drawn on the preview"
+
+    def test_test_click_bypasses_focus_gate(self) -> None:
+        src = self._src()
+        assert "ctl.click(x, y, confirm_focus=False)" in src, (
+            "the user-confirmed calibration test click must not be blocked by "
+            "the gameplay Chrome-focus gate")
+
+    def test_a_to_z_help_tab_exists_and_is_vietnamese(self) -> None:
+        src = self._src()
+        assert "HELP_AZ" in src and '"❓ Hướng dẫn"' in src
+        for phrase in ("BƯỚC 1", "BƯỚC 6", "hardware acceleration",
+                       "CLICK VÀO CỬA", "F8"):
+            assert phrase in src, f"help must cover {phrase!r}"
+
+    def test_click_focus_gate_still_protects_gameplay(self) -> None:
+        """The bypass must be scoped to the test click: the default click still
+        confirms focus (safety for real gameplay)."""
+        from input_controller import InputController
+        from config import InputConfig
+        import inspect
+        sig = inspect.signature(InputController.click)
+        assert sig.parameters["confirm_focus"].default is True, (
+            "gameplay clicks must still require focus by default")
+
+    def test_start_runs_preflight_capture_check(self) -> None:
+        """Start must pre-check the capture so a covered region / dead screen is
+        flagged before a run that would instantly die (the log showed an
+        episode dying at frame 33, distance ~ dead-sample)."""
+        src = self._src()
+        assert "self._preflight_capture_check()" in src
+        assert "def _preflight_capture_check" in src
+        assert "patch_rgb_distance" in src, "preflight must use the real API"
+
+
+class TestChangelogNotMerged:
+    """A missing comma once silently concatenated two changelog entries into one
+    string.  Every entry must start with its own distinct version tag."""
+
+    def test_each_entry_has_distinct_version(self) -> None:
+        import re
+        from version import CHANGELOG
+        tags = [re.match(r"^(\d+\.\d+\.\d+)", e) for e in CHANGELOG]
+        assert all(m for m in tags), "every changelog entry starts with a version"
+        versions = [m.group(1) for m in tags]  # type: ignore[union-attr]
+        assert len(versions) == len(set(versions)), (
+            f"merged/duplicate changelog entries: {versions}")
+        # a merged entry would contain a second "X.Y.Z —" tag inside it
+        for entry in CHANGELOG:
+            inner = re.findall(r"\d+\.\d+\.\d+ —", entry)
+            assert len(inner) == 1, f"merged changelog entry: {entry!r}"
