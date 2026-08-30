@@ -19,6 +19,7 @@ Design rules
 from __future__ import annotations
 
 import dataclasses
+import os
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -404,7 +405,16 @@ class BotConfig:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True)
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(self.to_json(), encoding="utf-8")
+        # DEEP-FIX: this used to be a plain write_text.  A crash, power loss or
+        # full disk mid-write left a truncated config.json that BotConfig.load
+        # could not parse -- bricking the next start and silently discarding
+        # the user's calibration.  Write to a temp file then os.replace, which
+        # is atomic on NTFS/ext4, so readers always see a complete file.
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(self.to_json(), encoding="utf-8")
+        os.replace(str(tmp), str(p))
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BotConfig":

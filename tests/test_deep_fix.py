@@ -1109,3 +1109,109 @@ class TestBlackCaptureGuard:
         assert mean_luma(white) == pytest.approx(255.0, abs=1e-6)
         grey = np.full((4, 4, 3), 128, dtype=np.uint8)
         assert 127.0 <= mean_luma(grey) <= 129.0
+
+
+# --------------------------------------------------------------------- #
+# 17. Activation-memory estimate must not double-count composite modules
+# --------------------------------------------------------------------- #
+class TestActivationMemoryEstimate:
+    """``estimate_activation_memory_mb`` hooked containers AND their children.
+
+    The selector matched ``ConvBlock``/``DepthwiseSeparableConv`` by class
+    name *and* their inner ``nn.Conv2d`` children by ``isinstance``.  A
+    container's output tensor is identical to its last child's output, so it
+    was summed twice (measured 2.06 MB vs the true 1.67 MB for strict_lite --
+    a 1.23x inflation on the number used to size profiles for a 12 GB box).
+    """
+
+    def test_single_conv_is_counted_exactly_once(self) -> None:
+        import torch.nn as nn
+        from profiling import estimate_activation_memory_mb
+
+        conv = nn.Conv2d(3, 8, 3, padding=1)
+        # output (1,8,8,8) = 512 elems * 4 bytes = 2048 B
+        expected_mb = (1 * 8 * 8 * 8) * 4 / 1048576
+        got = estimate_activation_memory_mb(conv, (3, 8, 8))
+        assert got == pytest.approx(expected_mb, rel=1e-3), (
+            f"a lone Conv2d should contribute exactly its output bytes, "
+            f"got {got} expected {expected_mb}")
+
+    def test_composite_container_is_not_double_counted(self) -> None:
+        """A ConvBlock's estimate must equal the sum over its LEAF children,
+        not leaf-children + the container's (duplicated) output."""
+        import torch
+        import torch.nn as nn
+        from models import ConvBlock
+        from profiling import estimate_activation_memory_mb
+
+        block = ConvBlock(3, 8, 3)          # children: Conv2d, GroupNorm, ReLU
+        leaf_bytes = 0
+        handles = []
+        def leaf_hook(m, i, o):
+            nonlocal leaf_bytes
+            if isinstance(o, torch.Tensor):
+                leaf_bytes += o.numel() * o.element_size()
+        for m in block.modules():
+            if next(m.children(), None) is None:   # leaves only = ground truth
+                handles.append(m.register_forward_hook(leaf_hook))
+        with torch.inference_mode():
+            block(torch.zeros(1, 3, 8, 8))
+        for h in handles:
+            h.remove()
+        got = estimate_activation_memory_mb(block, (3, 8, 8))
+        assert got == pytest.approx(leaf_bytes / 1048576, rel=1e-3), (
+            f"ConvBlock estimate {got} MB != leaf-only ground truth "
+            f"{leaf_bytes / 1048576} MB (double count would be larger)")
+
+    def test_wrapping_in_anonymous_container_adds_nothing(self) -> None:
+        import torch.nn as nn
+        from profiling import estimate_activation_memory_mb
+
+        conv = nn.Conv2d(3, 8, 3, padding=1)
+        a = estimate_activation_memory_mb(conv, (3, 8, 8))
+        b = estimate_activation_memory_mb(nn.Sequential(conv), (3, 8, 8))
+        assert a == pytest.approx(b, rel=1e-6), "containers must contribute 0"
+
+
+# --------------------------------------------------------------------- #
+# 18. A failed config save must never corrupt the existing config.json
+# --------------------------------------------------------------------- #
+class TestConfigSaveAtomicity:
+    """``BotConfig.save`` used to be a plain ``write_text``: a crash or full
+    disk mid-write left a truncated config.json that ``load`` could not parse,
+    bricking the next start and silently discarding the user's calibration.
+    It is now write-to-temp + ``os.replace`` (atomic on NTFS/ext4).
+    """
+
+    def test_save_then_load_round_trip(self, tmp_path: Path) -> None:
+        from config import BotConfig
+        p = tmp_path / "config.json"
+        cfg = BotConfig()
+        cfg.seed = 4242
+        cfg.save(p)
+        assert not (tmp_path / "config.json.tmp").exists(), "no temp litter"
+        loaded = BotConfig.load(str(p))
+        assert loaded.seed == 4242
+
+    def test_failed_save_leaves_original_intact(self, tmp_path: Path,
+                                                 monkeypatch) -> None:
+        import os as _os
+        from config import BotConfig
+        p = tmp_path / "config.json"
+        original = BotConfig(); original.seed = 1
+        original.save(p)
+
+        def boom(src, dst):
+            raise OSError("simulated disk failure during replace")
+        monkeypatch.setattr(_os, "replace", boom)
+
+        newer = BotConfig(); newer.seed = 2
+        caught = None
+        try:
+            newer.save(p)
+        except OSError as exc:
+            caught = exc                 # the failure must surface, not vanish
+        assert caught is not None, "save must propagate the failure"
+        # The on-disk config must still be the ORIGINAL, parseable file.
+        assert BotConfig.load(str(p)).seed == 1, (
+            "a failed save corrupted the existing config.json")

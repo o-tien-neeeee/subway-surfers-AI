@@ -85,11 +85,18 @@ def estimate_activation_memory_mb(model: nn.Module, input_shape: tuple[int, ...]
                 if isinstance(o, torch.Tensor):
                     act_bytes[0] += o.numel() * o.element_size()
 
+    # DEEP-FIX: hook LEAF modules only.  The old selector matched the composite
+    # containers (ConvBlock / DepthwiseSeparableConv, matched by class name)
+    # AND their inner Conv2d children (matched by isinstance).  A container's
+    # output tensor is identical to its last child's output, so it was counted
+    # twice -- inflating the activation-memory estimate used to size profiles
+    # for a 12 GB / i5-7200U box.  Leaves only yields a clean sum of every
+    # intermediate activation.
     for m in model.modules():
-        if m.__class__.__name__ in (
-            "Conv2d", "Linear", "GroupNorm", "ReLU", "AdaptiveAvgPool2d",
-            "DepthwiseSeparableConv", "ConvBlock",
-        ) or isinstance(m, (nn.Conv2d, nn.Linear, nn.GroupNorm)):
+        if next(m.children(), None) is not None:
+            continue                      # container; its leaves are hooked below
+        if isinstance(m, (nn.Conv2d, nn.Linear, nn.GroupNorm, nn.ReLU,
+                          nn.AdaptiveAvgPool2d)):
             handles.append(m.register_forward_hook(hook))
     device = next(model.parameters()).device
     was_training = model.training

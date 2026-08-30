@@ -742,3 +742,47 @@ Hai lỗi cộng hưởng:
 > perception; bạn cần chạy `python app.py` trên Windows để thấy preview có hình.
 > Nếu vẫn đen: tắt **hardware acceleration** của Chrome, đảm bảo game không bị
 > che, và chọn lại vùng — dashboard/report giờ sẽ nói rõ lý do thay vì im lặng.
+
+---
+
+# PHẦN 10 — VÒNG 5: audit module chưa đụng (profiling, config) — **v1.6.0**
+
+## 10.1 🟠 `profiling.estimate_activation_memory_mb` đếm trùng module kép
+
+Selector cũ khớp `ConvBlock`/`DepthwiseSeparableConv` **theo tên lớp** VÀ khớp
+`nn.Conv2d` con của chúng **theo isinstance**. Output của một container trùng
+chính output của child cuối, nên bị cộng **hai lần**.
+
+**Đo được:** strict_lite = 2.06 MB (cũ) vs 1.67 MB (đúng) — **lệch 1.23×** trên
+con số dùng để chọn profile cho máy i5-7200U/12 GB.
+
+**Gốc rễ:** tác giả liệt kê tên lớp để "không bỏ sót", quên rằng
+`model.modules()` đã đệ quy vào trong container — liệt kê cả hai cấp là đếm
+trùng. **Sửa:** chỉ hook **leaf module** (không có con).
+
+## 10.2 🟠 `config.save()` không atomic
+
+`write_text` trực tiếp: crash / hết đĩa giữa chừng để lại `config.json` cụt →
+`load` không parse được → **lần khởi động sau gạch luôn**, mất calibration của
+user. Repo đã có chuẩn atomic (`os.replace`) cho checkpoint nhưng config thì
+chưa. **Sửa:** ghi `.tmp` rồi `os.replace` (atomic trên NTFS/ext4).
+
+## 10.3 Test mới (`tests/test_deep_fix.py`)
+
+- `TestActivationMemoryEstimate` (3 test): Conv2d đơn đếm đúng byte; ConvBlock
+  = tổng leaf; bọc container không thêm gì.
+- `TestConfigSaveAtomicity` (2 test): round-trip; **save thất bại không phá file
+  gốc** (monkeypatch `os.replace` raise → file cũ vẫn nguyên, parse được).
+- Trên source gốc: 2 test chủ chốt **fail** → không vacuous.
+
+## 10.4 Kiểm chứng
+
+| Kiểm chứng | Kết quả |
+|---|---|
+| `pytest -q` | **495 passed, 0 failed** (trước 490) |
+| Overcount đo trước/sau | 2.06 → 1.67 MB (1.23×) |
+| `tests/test_hygiene.py` | 194 passed |
+
+> Đã bump `APP_VERSION` → **1.6.0** (hiển thị ở title Tk, log `app.py`, dashboard,
+> report). Các module còn lại (`action_scheduler`, `horizon_detector`, `metrics`)
+> tôi đọc kỹ và kết luận **đúng**, không sửa — tránh vá đắp.
