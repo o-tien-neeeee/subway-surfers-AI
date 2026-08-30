@@ -628,3 +628,66 @@ Ghi lại vì chúng đáng tin hơn là giấu đi:
 > định về `gui.py` đều dựa trên phân tích AST + đối chiếu API CPython 3.13,
 > **không** dựa trên việc chạy GUI. Ba lỗi 7.1/7.3 cần bạn xác nhận lại trên
 > máy Windows thật.
+
+---
+
+# PHẦN 8 — VÒNG 3: hazard expiry + Dashboard để bạn **dùng & xem được**
+
+## 8.1 🟠 `rewards.py` — hazard tồn tại lâu không bao giờ hết hạn (và trả thưởng sai thời điểm)
+
+`register` được gọi ở **mỗi frame** horizon detector cháy, và nó từng làm
+`self._current.opened_ts = horizon.ts` — ghi đè đúng cái field mà cả hai chỗ
+kiểm tra hết hạn (`on_frame` và `expire_old`) đọc.
+
+**Đã đo trước khi sửa:** 10 s nguy hiểm liên tục với `hazard_expiry_s=1.2`
+→ `expired=0`, event vẫn mở. Tệ hơn: khi màn hình yên, event cũ resolve và
+trả `hazard_bonus` cho action được ghi ở **frame 0 — tức 300 frame / 10 s
+trước đó**. Đó là trả thưởng cho cú né một chướng ngại vật mà agent đã đi qua
+mười giây trước — đúng thứ mà module này hứa là không làm ("no future
+leakage").
+
+**Đã sửa:** `opened_ts` giờ bất biến (là mốc deadline); thêm `last_seen_ts`
+để giữ ngữ nghĩa "kéo dài cửa sổ nguy hiểm" mà không phá hết hạn;
+`action_frame_id` ghi lại vị trí action được trả thưởng để chẩn đoán;
+`stats()` thêm `hazards_open_age_frames` để một event bị kẹt hiện ra trong log.
+
+**Test mới:** `tests/test_deep_fix.py::TestHazardExpiry` (4 test). Trên source
+gốc: 3 fail, 1 pass (happy-path) — đúng kỳ vọng.
+
+## 8.2 🖥️ `webui.py` — dashboard để preview, vì GUI Tk không thể hiện trong trình duyệt
+
+Bạn nói "nhiều phần tôi không biết cách dùng và ko preview". GUI Tk thật cần
+desktop Windows + Chrome + bàn phím, **không thể chạy trong preview**. Nên
+`webui.py` phục vụ những phần **có thể chạy ở bất cứ đâu** qua HTTP thuần
+stdlib (không cần cài gì):
+
+- **Live**: `GameEnvironment` thật (perception + horizon + death detector +
+  reward) chạy trên `SyntheticGame`, điều khiển bởi `InferencePolicy` thật,
+  stream JPEG để bạn **xem bot chơi**.
+- **Train**: chạy `app.py --headless` thật (đa tiến trình, shared memory) và
+  tail log trực tiếp.
+- **Report**: render `runs/headless_report.json`.
+- **Profiles**: số param đo thật của từng profile + so budget.
+- **Guide**: 7 mục giải thích phần nào chạy ở đâu; chỉ mục 7 (calibration GUI)
+  cần Windows thật.
+
+Chạy: `python webui.py --port 8000`. Đã kiểm chứng mọi endpoint bằng curl
+(`health`, `profiles`, `demo start/stop`, `frame.jpg` trả ảnh thật, `train`
+chạy ra `HEADLESS SMOKE TEST: PASS` với `workers_exited_cleanly: true`).
+
+**Tôn trọng guard:** tôi bỏ `urllib` khỏi webui (parse query bằng tay) và bỏ
+mọi `except: pass` để `tests/test_hygiene.py` vẫn xanh — vì webui giờ nằm
+trong phạm vi quét của nó.
+
+## 8.3 Kiểm chứng vòng 3
+
+| Kiểm chứng | Kết quả |
+|---|---|
+| `pytest -q` toàn bộ | **481 passed, 0 failed** (81.4 s) — trước: 473 |
+| `tests/test_hygiene.py` (quét cả webui.py) | 190 passed |
+| `python webui.py` + curl mọi endpoint | OK; `frame.jpg` = ảnh game thật |
+| `app.py --headless` qua dashboard | `HEADLESS SMOKE TEST: PASS` |
+
+> **Trung thực:** sandbox này không có display/Windows, nên phần calibration
+> GUI (mục 7) vẫn chưa thể chạy ở đây. Dashboard cho bạn xem Live/Train/Report
+> — những phần thực sự chạy được không cần desktop.

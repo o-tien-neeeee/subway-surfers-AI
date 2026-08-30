@@ -917,3 +917,127 @@ class TestThreadInternalShadowing:
         assert wd._stop_event.is_set()
         # Thread._stop must still be the method CPython expects.
         assert callable(threading.Thread._stop)
+
+
+# --------------------------------------------------------------------- #
+# 15. A persistent hazard must expire, not wedge the tracker
+# --------------------------------------------------------------------- #
+def _hz(frame_id: int, ts: float, detected: bool):
+    from horizon_detector import HorizonResult
+    return HorizonResult(
+        frame_id=frame_id, ts=ts,
+        change_score=40.0 if detected else 0.0,
+        raw_score=40.0 if detected else 0.0,
+        changed_ratio=0.8 if detected else 0.0,
+        detected=detected, confidence=0.9 if detected else 0.0,
+    )
+
+
+class TestHazardExpiry:
+    """``register`` overwrote the field both expiry checks read.
+
+    ``register`` is called on every frame the horizon detector fires, and it
+    did ``self._current.opened_ts = horizon.ts``.  So a hazard that stayed
+    visible kept pushing its own deadline one frame ahead and the event never
+    expired.  Measured before the fix: 10 s of continuous danger with
+    ``hazard_expiry_s=1.2`` left ``expired=0`` and the event still open.
+
+    The knock-on effect was worse than a missing expiry.  When the screen
+    finally went quiet, the stale event resolved and paid ``hazard_bonus``
+    credited to the action recorded on frame 0 -- 300 frames / 10 s earlier.
+    That is a reward for dodging an obstacle the agent passed ten seconds
+    ago, i.e. corrupted credit assignment, in the one module whose docstring
+    promises "no future leakage".
+    """
+
+    FPS = 30.0
+
+    def test_continuous_hazard_expires(self) -> None:
+        from config import RewardConfig
+        from rewards import PendingHazardTracker
+
+        cfg = RewardConfig()
+        tr = PendingHazardTracker(cfg)
+        for f in range(int(self.FPS * 10)):          # 10 s, expiry is 1.2 s
+            ts = f / self.FPS
+            h = _hz(f, ts, detected=True)
+            tr.register(h)
+            tr.on_frame(h, 1)
+            tr.expire_old(ts)
+        st = tr.stats()
+        assert st["hazards_expired"] > 0, (
+            f"a hazard held for 10 s never expired (hazard_expiry_s="
+            f"{cfg.hazard_expiry_s}); stats={st}"
+        )
+        assert st["hazards_total"] > 1, (
+            "one event monopolised the tracker for the whole run; overlapping "
+            "hazards should mint a fresh event once the previous one expires"
+        )
+
+    def test_no_bonus_is_credited_to_an_ancient_action(self) -> None:
+        """The credit-assignment half of the bug."""
+        from config import RewardConfig
+        from rewards import PendingHazardTracker, DODGE_ACTIONS
+
+        cfg = RewardConfig()
+        tr = PendingHazardTracker(cfg)
+        dodge = next(iter(sorted(DODGE_ACTIONS)))
+        noop = 0
+        grants = []
+        for f in range(int(self.FPS * 12)):
+            ts = f / self.FPS
+            detected = f < int(self.FPS * 10)
+            h = _hz(f, ts, detected)
+            if detected:
+                tr.register(h)
+            action = dodge if f == 0 else noop       # dodge once, then nothing
+            bonus = tr.on_frame(h, action)
+            tr.expire_old(ts)
+            if bonus:
+                grants.append((f, tr.events[-1].opened_frame_id))
+        for grant_frame, opened_frame in grants:
+            gap = grant_frame - opened_frame
+            assert gap <= cfg.hazard_resolve_frames + 2, (
+                f"bonus at frame {grant_frame} was credited to an event "
+                f"opened at frame {opened_frame} ({gap} frames earlier); a "
+                f"dodge that old must not be paid out"
+            )
+
+    def test_a_normal_dodge_still_earns_its_bonus(self) -> None:
+        """Guard against over-correcting: the happy path must keep working."""
+        from config import RewardConfig
+        from rewards import PendingHazardTracker, DODGE_ACTIONS
+
+        cfg = RewardConfig()
+        tr = PendingHazardTracker(cfg)
+        dodge = next(iter(sorted(DODGE_ACTIONS)))
+        total = 0.0
+        for f in range(10):
+            ts = f / self.FPS
+            h = _hz(f, ts, detected=f == 0)
+            if h.detected:
+                tr.register(h)
+            total += tr.on_frame(h, dodge)
+            tr.expire_old(ts)
+        assert total == pytest.approx(cfg.hazard_bonus), (
+            f"a clean dodge followed by quiet frames should earn exactly "
+            f"{cfg.hazard_bonus}, got {total}"
+        )
+
+    def test_opened_ts_is_never_mutated_by_register(self) -> None:
+        from config import RewardConfig
+        from rewards import PendingHazardTracker
+
+        cfg = RewardConfig()
+        tr = PendingHazardTracker(cfg)
+        tr.register(_hz(0, 100.0, detected=True))
+        opened = tr.events[0].opened_ts
+        for f in range(1, 50):
+            tr.register(_hz(f, 100.0 + f / self.FPS, detected=True))
+        assert tr.events[0].opened_ts == opened, (
+            "opened_ts is the expiry deadline anchor and must be immutable"
+        )
+        assert tr.events[0].last_seen_ts > opened, (
+            "the 'extend the danger window' semantics should still be "
+            "recorded, just not on the deadline field"
+        )

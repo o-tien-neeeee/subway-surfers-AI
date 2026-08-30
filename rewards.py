@@ -57,12 +57,22 @@ class RewardBreakdown:
 @dataclass
 class PendingHazard:
     opened_frame_id: int
+    #: DEEP-FIX: immutable.  This is the deadline anchor for hazard_expiry_s.
+    #: It used to be overwritten on every re-registration, which is the bug.
     opened_ts: float
+    #: DEEP-FIX: the "extend the window" semantics now live here, where they
+    #: cannot interfere with expiry.
+    last_seen_ts: float = 0.0
     action: Optional[int] = None
+    action_frame_id: Optional[int] = None
     frames_seen: int = 0
     resolved: bool = False
     expired: bool = False
     granted: bool = False
+
+    def __post_init__(self) -> None:
+        if self.last_seen_ts == 0.0:
+            self.last_seen_ts = self.opened_ts
 
 
 class PendingHazardTracker:
@@ -88,9 +98,22 @@ class PendingHazardTracker:
         self.bonuses_granted = 0
 
     def register(self, horizon: HorizonResult) -> None:
-        if self._current is not None and not self._current.resolved:
+        if self._current is not None and not self._current.resolved \
+                and not self._current.expired:
             # Extend the existing danger window instead of double-rewarding.
-            self._current.opened_ts = horizon.ts
+            # DEEP-FIX: this line used to be `self._current.opened_ts =
+            # horizon.ts`, overwriting the very field both expiry checks read.
+            # `register` is called on *every* frame the horizon detector fires,
+            # so a hazard that stayed visible kept pushing its own deadline
+            # one frame ahead, forever.  Verified: after 10 s of continuous
+            # danger with hazard_expiry_s=1.2, expired=0 and the event was
+            # still open.  Worse, when the screen finally went quiet the stale
+            # event resolved and paid out a bonus credited to the action
+            # recorded on frame 0 -- 300 frames / 10 s of gameplay earlier.
+            # A reward for a dodge at an obstacle the agent passed ten seconds
+            # ago is exactly the credit-assignment corruption this module
+            # exists to prevent.
+            self._current.last_seen_ts = horizon.ts
             return
         self._current = PendingHazard(
             opened_frame_id=horizon.frame_id, opened_ts=horizon.ts
@@ -98,9 +121,13 @@ class PendingHazardTracker:
         self.events.append(self._current)
 
     def observe_action(self, action: int, frame_id: int) -> None:
-        if self._current is not None and not self._current.resolved:
+        if self._current is not None and not self._current.resolved \
+                and not self._current.expired:
             if self._current.action is None:
                 self._current.action = action
+                # DEEP-FIX: record *where* the credited action came from so a
+                # stale credit is diagnosable instead of silent.
+                self._current.action_frame_id = frame_id
 
     def on_frame(self, horizon: HorizonResult, action: int) -> float:
         """Advance the open event with a new valid frame; return bonus (0/…).
@@ -150,6 +177,12 @@ class PendingHazardTracker:
             "hazards_resolved": resolved,
             "hazards_expired": sum(1 for e in self.events if e.expired),
             "bonuses": self.bonuses_granted,
+            # DEEP-FIX: observability for the wedge above.  If this is large
+            # the tracker is holding an event open far past hazard_expiry_s.
+            "hazards_open_age_frames": (
+                0 if self._current is None or not self.has_open_event
+                else self._current.frames_seen
+            ),
         }
 
 
