@@ -120,7 +120,7 @@ class RegionSelector:
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.info = self.canvas.create_text(
             20, 20, anchor="nw", fill="white", font=("Consolas", 12),
-            text="Drag to select the game region | Enter=accept | Esc=cancel | R=reset",
+            text="Kéo chuột khoanh vùng GAME | Enter=chọn | Esc=huỷ | R=làm lại",
         )
         self.rect_id: Optional[int] = None
         self.start_xy: Optional[tuple[int, int]] = None
@@ -283,10 +283,10 @@ class ControlGUI:
         state_row = ttk.Frame(outer)
         state_row.pack(fill=tk.X, pady=(0, 6))
         self.state_var = tk.StringVar(value=self.sm.state.value)
-        ttk.Label(state_row, text="State:", font=("TkDefaultFont", 11, "bold")).pack(side=tk.LEFT)
+        ttk.Label(state_row, text="Trạng thái:", font=("TkDefaultFont", 11, "bold")).pack(side=tk.LEFT)
         ttk.Label(state_row, textvariable=self.state_var, foreground="#0a5",
                   font=("TkDefaultFont", 12, "bold")).pack(side=tk.LEFT, padx=6)
-        self.dpi_var = tk.StringVar(value="DPI scale: unknown")
+        self.dpi_var = tk.StringVar(value="Tỉ lệ DPI: chưa rõ")
         ttk.Label(state_row, textvariable=self.dpi_var).pack(side=tk.RIGHT)
 
         # -- steps notebook
@@ -298,12 +298,12 @@ class ControlGUI:
         self.step4 = ttk.Frame(self.nb, padding=10)
         self.step5 = ttk.Frame(self.nb, padding=10)
         self.step6 = ttk.Frame(self.nb, padding=10)
-        for name, tab in (("1 Select region", self.step1),
-                          ("2 Lock region", self.step2),
-                          ("3 Colour anchor", self.step3),
-                          ("4 Respawn click", self.step4),
-                          ("5 Horizon", self.step5),
-                          ("6 Train", self.step6)):
+        for name, tab in (("1 Chọn vùng", self.step1),
+                          ("2 Khoá vùng", self.step2),
+                          ("3 Neo màu (sống/chết)", self.step3),
+                          ("4 Nút hồi sinh", self.step4),
+                          ("5 Vùng chân trời", self.step5),
+                          ("6 Chạy & số liệu", self.step6)):
             self.nb.add(tab, text=name)
 
         self._build_step1()
@@ -321,12 +321,12 @@ class ControlGUI:
     # step 1 ----------------------------------------------------------- #
     def _build_step1(self) -> None:
         f = self.step1
-        ttk.Label(f, text="Step 1 — drag a rectangle around the GAME area only.\n"
-                          "Do not include browser UI; the bot keys arrow keys, so "
-                          "the page must not scroll.", wraplength=700).pack(anchor="w")
+        ttk.Label(f, text="Bước 1 — kéo một hình chữ nhật CHỈ quanh vùng GAME.\n"
+                          "Đừng gồm thanh trình duyệt; bot bấm phím mũi tên nên "
+                          "trang không được cuộn.", wraplength=700).pack(anchor="w")
         self.region_var = tk.StringVar(value="no region selected")
         ttk.Label(f, textvariable=self.region_var, font=("Consolas", 11)).pack(pady=6)
-        ttk.Button(f, text="Select region (fullscreen overlay)",
+        ttk.Button(f, text="Chọn vùng (overlay toàn màn hình)",
                    command=self.start_region_select).pack(pady=4)
 
     def start_region_select(self) -> None:
@@ -370,15 +370,15 @@ class ControlGUI:
         r.frac_top = top / max(1, sh)
         r.frac_width = w / max(1, sw)
         r.frac_height = h / max(1, sh)
-        self.region_var.set(f"region: {left},{top} {w}x{h}  "
+        self.region_var.set(f"vùng: {left},{top} {w}x{h}  "
                             f"(fractions {r.frac_left:.3f},{r.frac_top:.3f}, "
                             f"{r.frac_width:.3f},{r.frac_height:.3f})  "
-                            f"DPI scale {dpi_scale:.2f}")
-        self.dpi_var.set(f"DPI scale: {dpi_scale:.2f} ({sw}x{sh} virtual)")
+                            f"tỉ lệ DPI {dpi_scale:.2f}")
+        self.dpi_var.set(f"Tỉ lệ DPI: {dpi_scale:.2f} ({sw}x{sh} ảo)")
         self.log(f"region selected: {left},{top} {w}x{h} dpi={dpi_scale:.2f}")
         self._set_state(BotState.CALIBRATING)
         self.nb.select(self.step2)
-        self.status_var.set("Region selected — continue with step 2 (lock).")
+        self.status_var.set("Đã chọn vùng — sang bước 2 (khoá).")
 
     def _region_cancelled(self, reason: str) -> None:
         self.log(f"region selection: {reason}")
@@ -387,8 +387,8 @@ class ControlGUI:
     # step 2 ----------------------------------------------------------- #
     def _build_step2(self) -> None:
         f = self.step2
-        ttk.Label(f, text="Step 2 — lock the region. A live preview starts; "
-                          "validate size and stability, then re-select if needed.",
+        ttk.Label(f, text="Bước 2 — khoá vùng. Preview trực tiếp chạy; "
+                          "kiểm tra kích thước/ổn định, chọn lại nếu cần.",
                   wraplength=700).pack(anchor="w")
         self.lock_var = tk.StringVar(value="not locked")
         ttk.Label(f, textvariable=self.lock_var).pack(pady=4)
@@ -396,13 +396,13 @@ class ControlGUI:
         self.preview_label.pack(pady=4)
         btns = ttk.Frame(f)
         btns.pack(pady=4)
-        ttk.Button(btns, text="Start preview", command=self.start_preview).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Lock region", command=self.lock_region).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Re-select", command=self.start_region_select).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Bật preview", command=self.start_preview).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Khoá vùng", command=self.lock_region).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Chọn lại", command=self.start_region_select).pack(side=tk.LEFT, padx=4)
 
     def start_preview(self) -> None:
         if not self.cfg.region.is_set():
-            self.status_var.set("Select a region first (step 1).")
+            self.status_var.set("Chọn vùng trước (bước 1).")
             return
         self._stop_preview()
         self.preview = PreviewGrabber(self.cfg.region.to_monitor())
@@ -435,17 +435,24 @@ class ControlGUI:
         self._anchor_photo = self.preview_img
         self.anchor_canvas.create_image(0, 0, anchor="nw",
                                         image=self._anchor_photo, tags="preview")
+        # DEEP-FIX: bước 4 (nút hồi sinh) cũng từng là một hộp đen — ảnh preview
+        # không được vẽ lên respawn_canvas nên bạn phải click mò.  Vẽ cùng frame.
+        self.respawn_canvas.delete("preview")
+        self.respawn_canvas.delete("marker")
+        self._respawn_photo = self.preview_img
+        self.respawn_canvas.create_image(0, 0, anchor="nw",
+                                         image=self._respawn_photo, tags="preview")
         # DEEP-FIX: luminance readout so a broken capture is obvious.
         import numpy as _np
         lum = float(_np.asarray(img, dtype=_np.float32).mean())
         if lum < 8.0:
             self.preview_luma_var.set(
-                f"capture luma {lum:.0f}/255 — BLACK! capture is broken: game "
+                f"độ sáng {lum:.0f}/255 — ĐEN! capture hỏng: game "
                 "occluded / wrong region / hardware acceleration")
         elif lum > 247.0:
-            self.preview_luma_var.set(f"capture luma {lum:.0f}/255 — pure WHITE, wrong region?")
+            self.preview_luma_var.set(f"độ sáng {lum:.0f}/255 — TRẮNG tinh, sai vùng?")
         else:
-            self.preview_luma_var.set(f"capture luma {lum:.0f}/255 — OK")
+            self.preview_luma_var.set(f"độ sáng {lum:.0f}/255 — OK")
 
     _latest_preview: Optional[Any] = None
     _preview_full_size: Optional[Any] = None
@@ -453,7 +460,7 @@ class ControlGUI:
     def lock_region(self) -> None:
         r = self.cfg.region
         if not r.is_set():
-            self.status_var.set("Cannot lock: no region selected.")
+            self.status_var.set("Không khoá được: chưa chọn vùng.")
             return
         if r.width < 240 or r.height < 320:
             self.status_var.set(
@@ -462,26 +469,26 @@ class ControlGUI:
             )
             return
         if r.width * r.height > self.cfg.capture.max_region_pixels:
-            self.status_var.set("Region exceeds max_region_pixels; re-select smaller.")
+            self.status_var.set("Vùng quá lớn; chọn lại nhỏ hơn.")
             return
         self._set_state(BotState.READY)
-        self.lock_var.set(f"locked: {r.width}x{r.height} at {r.left},{r.top}")
+        self.lock_var.set(f"đã khoá: {r.width}x{r.height} tại {r.left},{r.top}")
         self.log("region locked")
         self.nb.select(self.step3)
-        self.status_var.set("Region locked — continue with step 3 (colour anchor).")
+        self.status_var.set("Đã khoá vùng — sang bước 3 (neo màu).")
 
     # step 3 ----------------------------------------------------------- #
     def _build_step3(self) -> None:
         f = self.step3
-        ttk.Label(f, text="Step 3 — click a STABLE UI element that is visible while "
-                          "ALIVE and changes/covers on game-over (score bar corner, "
-                          "coin counter...). The 5x5 patch is baselined with a median "
-                          "and a stability score.", wraplength=700).pack(anchor="w")
+        ttk.Label(f, text="Bước 3 — bấm vào một điểm UI ỔN ĐỊNH luôn hiện khi "
+                          "SỐNG và đổi/mất khi thua (góc thanh điểm, "
+                          "bộ đếm xu...). Miếng 5x5 lấy trung vị làm gốc "
+                          "và điểm ổn định.", wraplength=700).pack(anchor="w")
         self.anchor_canvas = tk.Canvas(f, width=420, height=260, bg="grey15",
                                        cursor="crosshair")
         self.anchor_canvas.pack(pady=6)
         self.anchor_canvas.bind("<ButtonPress-1>", self._anchor_clicked)
-        self.anchor_var = tk.StringVar(value="anchor: not set")
+        self.anchor_var = tk.StringVar(value="neo: chưa đặt")
         ttk.Label(f, textvariable=self.anchor_var, font=("Consolas", 10)).pack()
         # DEEP-FIX: live readout of how "readable" the capture is.
         # A black or white capture is instantly visible here instead of
@@ -491,16 +498,16 @@ class ControlGUI:
                   font=("Consolas", 10), foreground="#080").pack()
         row = ttk.Frame(f)
         row.pack(pady=4)
-        ttk.Button(row, text="Start preview", command=self.start_preview).pack(side=tk.LEFT, padx=3)
-        ttk.Button(row, text="Calibrate ALIVE (2s)", command=self._anchor_calibrate_alive).pack(side=tk.LEFT, padx=3)
-        ttk.Button(row, text="Capture DEAD sample", command=self._anchor_capture_dead).pack(side=tk.LEFT, padx=3)
-        ttk.Label(f, text="Tip: run the alive calibration while the game is running; "
+        ttk.Button(row, text="Bật preview", command=self.start_preview).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row, text="Hiệu chuẩn SỐNG (2s)", command=self._anchor_calibrate_alive).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row, text="Lấy mẫu CHẾT", command=self._anchor_capture_dead).pack(side=tk.LEFT, padx=3)
+        ttk.Label(f, text="Mẹo: chạy hiệu chuẩn SỐNG khi game đang chạy; "
                           "capture the dead sample later on the game-over screen.",
                   wraplength=700).pack()
 
     def _anchor_clicked(self, ev) -> None:
         if self._latest_preview is None:
-            self.anchor_var.set("anchor: start the preview first, then click")
+            self.anchor_var.set("neo: bật preview trước, rồi bấm")
             return
         # scale click -> region fraction
         w, h = self._latest_preview.size
@@ -513,7 +520,7 @@ class ControlGUI:
         self.anchor_canvas.delete("marker")
         self.anchor_canvas.create_oval(ev.x - 5, ev.y - 5, ev.x + 5, ev.y + 5,
                                        outline="#ff3b30", width=2, tags="marker")
-        self.anchor_var.set(f"anchor position: fx={fx:.3f} fy={fy:.3f} "
+        self.anchor_var.set(f"vị trí neo: fx={fx:.3f} fy={fy:.3f} "
                             f"(abs {int(fx * self.cfg.region.width)},"
                             f"{int(fy * self.cfg.region.height)}) — now calibrate ALIVE")
         self.log(f"anchor position set: fx={fx:.3f} fy={fy:.3f}")
@@ -540,11 +547,11 @@ class ControlGUI:
 
     def _anchor_calibrate_alive(self) -> None:
         if self.cfg.death.anchor_fx < 0:
-            self.status_var.set("Click the anchor position on the preview first.")
+            self.status_var.set("Bấm vị trí neo trên preview trước.")
             return
         self.anchor_frames = []
         self.anchor_t0 = time.monotonic()
-        self.status_var.set("ALIVE calibration running — keep the game visible...")
+        self.status_var.set("Đang hiệu chuẩn SỐNG — giữ game hiện...")
         self.root.after(100, self._anchor_alive_tick)
 
     def _anchor_alive_tick(self) -> None:
@@ -556,7 +563,7 @@ class ControlGUI:
             self.root.after(100, self._anchor_alive_tick)
             return
         if len(self.anchor_frames) < 8:
-            self.status_var.set("Too few anchor samples; is the preview running? Retry.")
+            self.status_var.set("Quá ít mẫu neo; preview có chạy không? Thử lại.")
             return
         from perception import (patch_stability, is_degenerate_patch,
                                  mean_luma)
@@ -586,7 +593,7 @@ class ControlGUI:
         )
         if ok:
             self.log(f"anchor calibrated: rgb={baseline} std={std:.2f}")
-            self.status_var.set("Anchor calibrated — continue with step 4.")
+            self.status_var.set("Đã hiệu chuẩn neo — sang bước 4.")
             self._maybe_ready()
         else:
             self.status_var.set(
@@ -598,7 +605,7 @@ class ControlGUI:
     def _anchor_capture_dead(self) -> None:
         patch = self._grab_anchor_patch()
         if patch is None:
-            self.status_var.set("Capture DEAD sample failed (no region/anchor).")
+            self.status_var.set("Lấy mẫu CHẾT thất bại (chưa có vùng/neo).")
             return
         import numpy as np
 
@@ -615,30 +622,34 @@ class ControlGUI:
     # step 4 ----------------------------------------------------------- #
     def _build_step4(self) -> None:
         f = self.step4
-        ttk.Label(f, text="Step 4 — click the restart/respawn button on the "
-                          "game-over screen. Nothing is clicked automatically; the "
-                          "test button asks for confirmation first.", wraplength=700
+        ttk.Label(f, text="Bước 4 — bấm vào nút chơi lại/hồi sinh trên "
+                          "màn hình thua. Không gì được click tự động; "
+                          "nút Test sẽ hỏi xác nhận trước.", wraplength=700
                   ).pack(anchor="w")
         self.respawn_canvas = tk.Canvas(f, width=420, height=260, bg="grey15",
                                         cursor="crosshair")
         self.respawn_canvas.pack(pady=6)
         self.respawn_canvas.bind("<ButtonPress-1>", self._respawn_clicked)
-        self.respawn_var = tk.StringVar(value="respawn point: not set")
+        self.respawn_var = tk.StringVar(value="điểm hồi sinh: chưa đặt")
         ttk.Label(f, textvariable=self.respawn_var).pack()
         row = ttk.Frame(f)
         row.pack(pady=4)
-        ttk.Button(row, text="Start preview", command=self.start_preview).pack(side=tk.LEFT, padx=3)
-        ttk.Button(row, text="Test click (asks first)", command=self._respawn_test).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row, text="Bật preview", command=self.start_preview).pack(side=tk.LEFT, padx=3)
+        ttk.Button(row, text="Test click (hỏi trước)", command=self._respawn_test).pack(side=tk.LEFT, padx=3)
 
     def _respawn_clicked(self, ev) -> None:
         if self._latest_preview is None:
-            self.respawn_var.set("respawn: start the preview first, then click")
+            self.respawn_var.set("hồi sinh: bật preview trước, rồi bấm")
             return
         w, h = self._latest_preview.size
         self.cfg.input.respawn_fx = ev.x / max(1, w)
         self.cfg.input.respawn_fy = ev.y / max(1, h)
+        # DEEP-FIX: khoanh tròn vị trí đã chọn để bạn thấy rõ mình bấm vào đâu.
+        self.respawn_canvas.delete("marker")
+        self.respawn_canvas.create_oval(ev.x - 6, ev.y - 6, ev.x + 6, ev.y + 6,
+                                        outline="#2ecc71", width=2, tags="marker")
         self.respawn_var.set(
-            f"respawn point: fx={self.cfg.input.respawn_fx:.3f} "
+            f"điểm hồi sinh: fx={self.cfg.input.respawn_fx:.3f} "
             f"fy={self.cfg.input.respawn_fy:.3f} (abs "
             f"{self.cfg.region.left + int(self.cfg.input.respawn_fx * self.cfg.region.width)},"
             f"{self.cfg.region.top + int(self.cfg.input.respawn_fy * self.cfg.region.height)})"
@@ -647,14 +658,14 @@ class ControlGUI:
 
     def _respawn_test(self) -> None:
         if not self.cfg.input.respawn_set():
-            self.status_var.set("Set the respawn point first.")
+            self.status_var.set("Đặt điểm hồi sinh trước.")
             return
         x = self.cfg.region.left + int(self.cfg.input.respawn_fx * self.cfg.region.width)
         y = self.cfg.region.top + int(self.cfg.input.respawn_fy * self.cfg.region.height)
         if not messagebox.askyesno(
-            "Confirm test click",
-            f"Click at absolute screen position ({x}, {y}) once?\n"
-            "Move the mouse to a screen corner to abort (pyautogui failsafe).",
+            "Xác nhận test click",
+            f"Bấm một lần tại toạ độ màn hình ({x}, {y})?\n"
+            "Di chuột vào góc màn hình để huỷ (failsafe pyautogui).",
         ):
             return
         from input_controller import InputController
@@ -669,22 +680,22 @@ class ControlGUI:
     # step 5 ----------------------------------------------------------- #
     def _build_step5(self) -> None:
         f = self.step5
-        ttk.Label(f, text="Step 5 — horizon zone: the top slice of the region used "
-                          "for fast hazard detection. Default 25%.", wraplength=700
+        ttk.Label(f, text="Bước 5 — vùng chân trời: dải trên của vùng dùng "
+                          "để phát hiện vật cản nhanh. Mặc định 25%.", wraplength=700
                   ).pack(anchor="w")
-        self.horizon_var = tk.StringVar(value=f"horizon: {self.cfg.perception.horizon_frac*100:.0f}%")
+        self.horizon_var = tk.StringVar(value=f"chân trời: {self.cfg.perception.horizon_frac*100:.0f}%")
         self.horizon_scale = ttk.Scale(
             f, from_=15, to=40, value=self.cfg.perception.horizon_frac * 100,
             command=self._horizon_changed)
         self.horizon_scale.pack(fill=tk.X, pady=6)
         ttk.Label(f, textvariable=self.horizon_var).pack()
-        ttk.Label(f, text="The preview overlay shows the split line once the "
-                          "preview runs.", wraplength=700).pack()
+        ttk.Label(f, text="Overlay preview sẽ hiện đường phân cách khi "
+                          "preview chạy.", wraplength=700).pack()
 
     def _horizon_changed(self, value: str) -> None:
         pct = float(value)
         self.cfg.perception.horizon_frac = round(pct, 1) / 100.0
-        self.horizon_var.set(f"horizon: {self.cfg.perception.horizon_frac*100:.1f}% "
+        self.horizon_var.set(f"chân trời: {self.cfg.perception.horizon_frac*100:.1f}% "
                              f"({int(self.cfg.region.height * self.cfg.perception.horizon_frac)} px)")
 
     # step 6 ----------------------------------------------------------- #
@@ -692,39 +703,39 @@ class ControlGUI:
         f = self.step6
         ctrl = ttk.Frame(f)
         ctrl.pack(fill=tk.X)
-        self.btn_start = ttk.Button(ctrl, text="▶ Start training", command=self.start_training,
+        self.btn_start = ttk.Button(ctrl, text="▶ Bắt đầu train", command=self.start_training,
                                     state=tk.DISABLED)
         self.btn_start.pack(side=tk.LEFT, padx=3)
-        self.btn_pause = ttk.Button(ctrl, text="⏸ Pause", command=self.pause_training,
+        self.btn_pause = ttk.Button(ctrl, text="⏸ Tạm dừng", command=self.pause_training,
                                     state=tk.DISABLED)
         self.btn_pause.pack(side=tk.LEFT, padx=3)
-        self.btn_stop = ttk.Button(ctrl, text="⏹ Stop", command=self.stop_training,
+        self.btn_stop = ttk.Button(ctrl, text="⏹ Dừng", command=self.stop_training,
                                    state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=3)
-        self.btn_demo = ttk.Button(ctrl, text="● Record demo (F9 stop)",
+        self.btn_demo = ttk.Button(ctrl, text="● Quay demo (F9 dừng)",
                                    command=self.toggle_demo_recording, state=tk.DISABLED)
         self.btn_demo.pack(side=tk.LEFT, padx=3)
-        self.btn_pretrain = ttk.Button(ctrl, text="BC pretrain", command=self.run_pretrain,
+        self.btn_pretrain = ttk.Button(ctrl, text="Tiền-huấn luyện (BC)", command=self.run_pretrain,
                                        state=tk.DISABLED)
         self.btn_pretrain.pack(side=tk.LEFT, padx=3)
-        self.btn_emergency = ttk.Button(ctrl, text="⛔ EMERGENCY (F8)",
+        self.btn_emergency = ttk.Button(ctrl, text="⛔ KHẨN CẤP (F8)",
                                         command=self.emergency_stop)
         self.btn_emergency.pack(side=tk.RIGHT, padx=3)
 
-        metrics = ttk.Labelframe(f, text="Live metrics", padding=6)
+        metrics = ttk.Labelframe(f, text="Số liệu trực tiếp", padding=6)
         metrics.pack(fill=tk.BOTH, expand=True, pady=6)
         self.metric_vars: dict[str, tk.StringVar] = {}
         cols = [
-            ("state", "Process state"), ("survival_s", "Survival (s)"),
-            ("episode_id", "Episode"), ("score", "Score (not detectable: n/a)"),
-            ("fps", "Capture FPS"), ("eff_fps", "Effective FPS"),
-            ("dropped", "Dropped frames"), ("infer_p95", "Inference p95 (ms)"),
-            ("action_p95", "Action p95 (ms)"), ("epsilon", "Epsilon"),
-            ("avg_reward", "Avg reward (episode)"), ("td_loss", "TD loss"),
-            ("q_mean", "Mean Q"), ("buffer", "Replay buffer"),
-            ("learner_updates", "Learner updates"), ("cpu", "CPU %"),
-            ("ram", "RAM (GB)"), ("profile", "Model profile"),
-            ("best", "Best (rolling)"),
+            ("state", "Trạng thái"), ("survival_s", "Sống (s)"),
+            ("episode_id", "Màn"), ("score", "Điểm (n/a)"),
+            ("fps", "FPS capture"), ("eff_fps", "FPS hiệu dụng"),
+            ("dropped", "Frame rơi"), ("infer_p95", "Suy luận p95 (ms)"),
+            ("action_p95", "Hành động p95 (ms)"), ("epsilon", "Epsilon"),
+            ("avg_reward", "Thưởng TB (màn)"), ("td_loss", "Mất mát TD"),
+            ("q_mean", "Q TB"), ("buffer", "Replay buffer"),
+            ("learner_updates", "Bước learner"), ("cpu", "CPU %"),
+            ("ram", "RAM (GB)"), ("profile", "Profile model"),
+            ("best", "Tốt nhất"),
         ]
         for i, (key, label) in enumerate(cols):
             r, c = divmod(i, 3)
@@ -735,7 +746,7 @@ class ControlGUI:
                       ).grid(row=r, column=c * 2 + 1, sticky="w", padx=4, pady=2)
             self.metric_vars[key] = var
 
-        logframe = ttk.Labelframe(f, text="Training log", padding=4)
+        logframe = ttk.Labelframe(f, text="Nhật ký train", padding=4)
         logframe.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(logframe, height=10, width=110, font=("Consolas", 9))
         scroll = ttk.Scrollbar(logframe, command=self.log_text.yview)
@@ -771,7 +782,7 @@ class ControlGUI:
     # ------------------------------------------------------------------ #
     def start_training(self) -> None:
         if self.app is not None:
-            self.status_var.set("Already running.")
+            self.status_var.set("Đang chạy rồi.")
             return
         warnings = self.cfg.validate()
         for w in warnings:
@@ -792,7 +803,7 @@ class ControlGUI:
         self._set_state(BotState.RUNNING)
         self.btn_pause.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.NORMAL)
-        self.status_var.set("Training started. F8 = emergency stop.")
+        self.status_var.set("Đã bắt đầu train. F8 = dừng khẩn cấp.")
         self.log("training started")
 
     def pause_training(self) -> None:
@@ -811,7 +822,7 @@ class ControlGUI:
         if self.app is None:
             return
         self._set_state(BotState.STOPPING)
-        self.status_var.set("Stopping (saving model + buffer)...")
+        self.status_var.set("Đang dừng (lưu model + buffer)...")
         self.root.update_idletasks()
         if self.hotkey is not None:
             self.hotkey.stop()
@@ -819,14 +830,14 @@ class ControlGUI:
         self.app.shutdown()
         self.app = None
         self._set_state(BotState.STOPPED)
-        self.status_var.set("Stopped. Model, buffer and logs saved.")
+        self.status_var.set("Đã dừng. Đã lưu model, buffer, log.")
         for btn in (self.btn_pause, self.btn_stop):
             btn.configure(state=tk.DISABLED)
         self.btn_start.configure(state=tk.NORMAL)
         self.log("stopped cleanly")
 
     def emergency_stop(self) -> None:
-        self.log("EMERGENCY STOP (GUI)")
+        self.log("DỪNG KHẨN CẤP (GUI)")
         if self.app is not None:
             self.app.emergency_stop()
             self.stop_training()
@@ -838,7 +849,7 @@ class ControlGUI:
             self._stop_demo_recording()
             return
         if not self.cfg.region.is_set():
-            self.status_var.set("Select a region before recording demos.")
+            self.status_var.set("Chọn vùng trước khi quay demo.")
             return
         self._set_state(BotState.RECORDING_DEMO)
         from demonstration_recorder import DemoRecorder
@@ -869,8 +880,8 @@ class ControlGUI:
         self._demo_recorder = DemoRecorder(self.cfg, self.cfg.paths.demos_dir,
                                            _RingReader(ring))
         self._demo_recorder.start()
-        self.btn_demo.configure(text="■ Stop demo (F9)")
-        self.status_var.set("RECORDING demonstration — play! F9 / button stops.")
+        self.btn_demo.configure(text="■ Dừng demo (F9)")
+        self.status_var.set("ĐANG quay demo — chơi đi! F9 / nút để dừng.")
 
     def _stop_demo_recording(self) -> None:
         if self._demo_recorder is None:
@@ -878,17 +889,17 @@ class ControlGUI:
         path = self._demo_recorder.stop(done=True)
         self._demo_recorder.dispose()
         self._demo_recorder = None
-        self.btn_demo.configure(text="● Record demo (F9 stop)")
+        self.btn_demo.configure(text="● Quay demo (F9 dừng)")
         self._set_state(BotState.READY)
         if path:
             self.status_var.set(f"Demo saved: {path}")
             self.log(f"demo saved: {path}")
         else:
-            self.status_var.set("Demo recording stopped (nothing saved).")
+            self.status_var.set("Đã dừng quay demo (không lưu).")
 
     def run_pretrain(self) -> None:
         if self.app is None:
-            self.status_var.set("Start training first (the learner owns pretraining).")
+            self.status_var.set("Bắt đầu train trước (learner giữ việc tiền-huấn luyện).")
             return
         self._set_state(BotState.PRETRAINING)
         self.app.command("pretrain", demos_dir=str(self.cfg.paths.demos_dir))
@@ -1003,7 +1014,7 @@ class ControlGUI:
             self.log("learner process died — GUI stays alive; training paused")
             self.app.pause()
             self._set_state(BotState.PAUSED)
-            self.status_var.set("Learner crashed — gameplay paused. Check logs.")
+            self.status_var.set("Learner sập — tạm dừng chơi. Xem log.")
         if not alive["actor"]:
             # DEEP-FIX: this branch had no state guard, so after an actor
             # crash it fired on every 150 ms tick forever (~7 identical log
@@ -1012,7 +1023,7 @@ class ControlGUI:
             if self.sm.state is BotState.RUNNING or self.sm.state is BotState.PAUSED:
                 self.log("actor process died — stop and restart required")
                 self._set_state(BotState.ERROR)
-            self.status_var.set("Actor crashed — press Stop, then Start again.")
+            self.status_var.set("Actor sập — bấm Dừng, rồi Bắt đầu lại.")
 
     # ------------------------------------------------------------------ #
     def log(self, line: str) -> None:

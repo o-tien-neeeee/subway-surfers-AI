@@ -830,3 +830,47 @@ vacuous.
 | `pytest -q` | **498 passed, 0 failed** (78.5 s) — trước 495 |
 | Test chống shadow trên perception v1.5.0 | fail → bắt được duplicate |
 | `APP_VERSION` | **1.7.0** |
+
+---
+
+# PHẦN 12 — VÒNG 7: bước 4 hết đen + **toàn bộ GUI tiếng Việt** — **v1.8.0**
+
+Bạn phản ánh: *"phần respawn click cũng bị đen, chẳng hiểu cách dùng, chuyển
+hết sang tiếng Việt"*.
+
+## 12.1 🔴 Bước 4 (Nút hồi sinh) là hộp đen
+
+Giống bước 3, `respawn_canvas` không được vẽ ảnh preview nên bạn click mò.
+**Sửa:** `_update_preview` giờ vẽ cùng frame lên **cả** `anchor_canvas` (b3)
+lẫn `respawn_canvas` (b4); `_respawn_clicked` khoanh **vòng xanh** vào điểm đã
+chọn để bạn thấy rõ mình bấm vào đâu.
+
+## 12.2 🇳 Việt hoá toàn bộ giao diện Tk
+
+Dịch ~90 chuỗi hiển thị: tên 6 tab, mô tả từng bước, mọi nút, mọi thông báo
+trạng thái, readout (vùng/DPI/neo/hồi sinh/độ sáng), nhãn metrics, hộp thoại
+xác nhận, overlay chọn vùng. Log nội bộ sâu vẫn tiếng Anh (để chẩn đoán),
+nhưng mọi thứ bạn **nhìn** giờ là tiếng Việt.
+
+Dashboard (webui) cũng dịch nav: Trực tiếp / Train / Báo cáo / Profile /
+Hướng dẫn.
+
+## 12.3 Test chống tái diễn
+
+- `TestRespawnPreviewVisible`: `_update_preview` phải `create_image` lên cả
+  `respawn_canvas`; `_respawn_clicked` phải `create_oval` (marker).
+- `TestUIIsVietnamese`: các chuỗi Việt bắt buộc phải có; các chuỗi Anh cũ
+  (`"Start preview"`, `"Live metrics"`, tab `"4 Respawn click"`…) phải **không
+  còn** — để không ai lặng lẽ đảo UI về tiếng Anh.
+
+## 12.4 Kiểm chứng
+
+| Kiểm chứng | Kết quả |
+|---|---|
+| `pytest -q` | **502 passed, 0 failed** (81 s) — trước 498 |
+| `APP_VERSION` | **1.8.0** |
+
+> **Trung thực:** sandbox không có display nên tôi không tự mở cửa sổ Tk để
+> "thấy" tiếng Việt; việc dịch được kiểm chứng bằng test chuỗi + compile. Bạn
+> chạy `python app.py` trên Windows để thấy UI Việt và preview có hình ở cả
+> bước 3 & 4.

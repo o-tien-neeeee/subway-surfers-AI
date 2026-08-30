@@ -530,11 +530,11 @@ border-radius:0 7px 7px 0;color:var(--mut);font-size:13px;margin:0 0 14px}
   <span class="sub">screen-capture RL &middot; CPU-only PyTorch</span>
   <span class="sub"><span class="dot" id="dot"></span> <span id="dotT">idle</span></span>
   <nav>
-    <button data-t="live" class="pri">Live</button>
+    <button data-t="live" class="pri">Trực tiếp</button>
     <button data-t="train">Train</button>
-    <button data-t="report">Report</button>
-    <button data-t="profiles">Profiles</button>
-    <button data-t="guide">Guide</button>
+    <button data-t="report">Báo cáo</button>
+    <button data-t="profiles">Profile</button>
+    <button data-t="guide">Hướng dẫn</button>
   </nav>
 </header>
 <main>
@@ -571,7 +571,7 @@ border-radius:0 7px 7px 0;color:var(--mut);font-size:13px;margin:0 0 14px}
         </div>
       </div>
       <div class="card" style="margin-top:14px">
-        <h2>Metrics</h2>
+        <h2>Số liệu</h2>
         <div class="kv" id="kv"></div>
       </div>
     </div>
@@ -584,7 +584,7 @@ border-radius:0 7px 7px 0;color:var(--mut);font-size:13px;margin:0 0 14px}
   qua shared memory). <code>--dry-run</code> = không bấm phím thật. Kết quả ghi vào
   <code>runs/headless_report.json</code> (xem tab Report).</div>
   <div class="card">
-    <h2>Headless run</h2>
+    <h2>Chạy headless</h2>
     <div class="row">
       <label>steps</label>
       <input id="steps" type="number" value="600" min="50" max="20000" style="width:110px">

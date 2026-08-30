@@ -1261,3 +1261,65 @@ class TestNoShadowedBlackFrame:
         assert is_black_frame(dim, 4.0)
         bright = np.full((20, 20, 3), 30, dtype=np.uint8)  # luma 30
         assert not is_black_frame(bright, 4.0)
+
+
+# --------------------------------------------------------------------- #
+# 20. The step-4 respawn canvas must show the live preview (not a black box)
+# --------------------------------------------------------------------- #
+class TestRespawnPreviewVisible:
+    """Step 4 (respawn click) used to be a blank black canvas -- the preview
+    image was only drawn on step 2/3, so the user clicked the respawn point
+    blind.  Guard the fix structurally (gui.py cannot be imported headless).
+    """
+
+    def _src(self) -> str:
+        return (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+
+    def test_update_preview_draws_on_respawn_canvas(self) -> None:
+        import ast
+        tree = ast.parse(self._src())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_update_preview")
+        drawn = [
+            n.func.value.attr for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "create_image" and isinstance(n.func.value, ast.Attribute)
+        ]
+        assert "respawn_canvas" in drawn, (
+            "_update_preview must draw the live frame onto respawn_canvas so "
+            "the respawn point can be picked by sight, not blind")
+        assert "anchor_canvas" in drawn
+
+    def test_respawn_click_marks_the_point(self) -> None:
+        import ast
+        tree = ast.parse(self._src())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_respawn_clicked")
+        calls = {n.func.attr for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)}
+        assert "create_oval" in calls, "clicking respawn must leave a visible marker"
+
+
+class TestUIIsVietnamese:
+    """The user asked for the whole UI in Vietnamese.  Pin the key strings so a
+    future edit cannot silently revert the interface to English."""
+
+    def test_tabs_are_vietnamese(self) -> None:
+        src = self._src() if hasattr(self, "_src") else \
+            (Path(__file__).resolve().parent.parent / "gui.py").read_text(encoding="utf-8")
+        for vn in ("1 Chọn vùng", "2 Khoá vùng", "4 Nút hồi sinh", "6 Chạy & số liệu"):
+            assert vn in src, f"tab {vn!r} missing"
+        for en in ('"1 Select region"', '"4 Respawn click"', '"6 Train"'):
+            assert en not in src, f"English tab {en} still present"
+
+    def test_key_buttons_and_status_are_vietnamese(self) -> None:
+        src = (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+        for vn in ("Bật preview", "Khoá vùng", "Hiệu chuẩn SỐNG (2s)",
+                   "Test click (hỏi trước)", "Bắt đầu train", "KHẨN CẤP (F8)",
+                   "Số liệu trực tiếp", "Nhật ký train"):
+            assert vn in src, f"Vietnamese UI string missing: {vn}"
+        for en in ('"Start preview"', '"Lock region"', '"Calibrate ALIVE (2s)"',
+                   '"Start training"', '"Live metrics"', '"Training log"'):
+            assert en not in src, f"English UI string still present: {en}"
