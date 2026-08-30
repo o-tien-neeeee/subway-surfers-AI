@@ -417,6 +417,13 @@ class BotActor:
         self._duplicate_frames = 0
         self._env_ids: deque[int] = deque(maxlen=cfg.perception.frame_stack)
         self._episode_reward = 0.0
+        # DEEP-FIX: the user reported "AI không tiến triển sau 500 episode".
+        # The most common real cause is the bot dying almost instantly every
+        # episode (capture reads the dead/occluded state), so there is no
+        # survival signal to learn from.  Count consecutive instant deaths and
+        # say so loudly instead of letting 500 empty episodes pass in silence.
+        self._instant_death_streak = 0
+        self._instant_death_warned = False
         # DEEP-FIX: this was a float sentinel (0.0) meaning "no episode in
         # progress", so a legitimate frame timestamp of exactly 0.0 would
         # make the actor believe no episode had started and _end_episode()
@@ -665,6 +672,23 @@ class BotActor:
                            "data": stats.to_dict()})
         LOGGER.info("episode %d ended (%s): %.1fs reward=%.2f",
                     stats.episode_id, reason, stats.survival_s, stats.total_reward)
+        # DEEP-FIX: surface an instant-death loop -- the reason a long run can
+        # show "no progress" is that every episode ends before any dodge.
+        if survival < 1.0:
+            self._instant_death_streak += 1
+        else:
+            self._instant_death_streak = 0
+            self._instant_death_warned = False
+        if self._instant_death_streak >= 5 and not self._instant_death_warned:
+            self._instant_death_warned = True
+            LOGGER.warning(
+                "BOT ĐANG CHẾT NGAY LIÊN TIẾP (%d episode < 1s). Không có tín "
+                "hiệu sống sót để học — AI sẽ KHÔNG tiến bộ. Nguyên nhân thường "
+                "gặp: vùng chọn bị che / đang ở màn thua / neo màu sai. Hãy kiểm "
+                "tra lại vùng + hiệu chuẩn neo (bước 1-3) rồi chạy lại.",
+                self._instant_death_streak)
+            self._put_metrics({"type": "log", "level": "warning", "src": "actor",
+                               "msg": f"instant-death loop: {self._instant_death_streak} episodes < 1s"})
         # Publish for the learner's online best-model gate (single writer:
         # actor).  DEEP-FIX: go through the ordered helper -- payload first,
         # id last -- instead of writing the id first and letting the learner

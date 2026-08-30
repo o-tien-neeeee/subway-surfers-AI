@@ -141,30 +141,89 @@ class DemoRecorder:
         self._recording = False
         self._lock = threading.Lock()
         self._current_action = NOOP
+        # DEEP-FIX: a single scalar _current_action set on press / cleared on
+        # release is fragile — a missed release (focus change, alt-tab) left the
+        # action stuck forever, injecting phantom actions the player never
+        # pressed, and a second key overwrote the first.  Track the held keys
+        # explicitly and derive the current action from them.
+        self._held: dict[str, int] = {}
+        self._held_order: list[str] = []
+        self._mods: set[str] = set()
+        self._last_key_event_ts = time.monotonic()
+        self._stuck_warned = False
+        self._last_zone: Optional[np.ndarray] = None
         self._tap = KeyboardTap(self._handle_press, self._handle_release)
         self._stop_requested = threading.Event()
         self.episode_paths: list[str] = []
 
+    #: keys that are shortcuts, never game actions (alt-tab, ctrl-arrow …)
+    MODIFIER_KEYS = frozenset({
+        "alt", "alt_l", "alt_r", "alt_gr", "ctrl", "ctrl_l", "ctrl_r",
+        "cmd", "cmd_l", "cmd_r", "shift", "shift_l", "shift_r",
+    })
+    #: a held action with no key event for this long is treated as a stuck key
+    STUCK_CLEAR_S = 1.5
+
     # ------------------------------------------------------------------ #
-    def _handle_press(self, key_name: str) -> None:
+    def _map_action(self, key_name: str) -> Optional[int]:
         action = DEFAULT_KEY_TO_ACTION.get(key_name)
         # honour the configured keymap too (custom bindings)
         for a, name in self.cfg.input.keymap.items():
             if a != NOOP and name and name.lower() == key_name:
                 action = a
-        if action is not None:
+        return action
+
+    def _recompute_current(self) -> None:
+        """Most recently pressed key that is still held wins; else NOOP."""
+        for name in reversed(self._held_order):
+            if name in self._held:
+                self._current_action = self._held[name]
+                return
+        self._current_action = NOOP
+
+    def _handle_press(self, key_name: str) -> None:
+        if key_name in self.MODIFIER_KEYS:
             with self._lock:
-                self._current_action = action
+                self._mods.add(key_name)
+            return
+        action = self._map_action(key_name)
+        if action is None:
+            return
+        with self._lock:
+            self._last_key_event_ts = time.monotonic()
+            self._stuck_warned = False
+            # DEEP-FIX: ignore game keys while a modifier is held — alt-tab /
+            # ctrl-arrow used to leak into the demo as phantom actions.
+            if self._mods:
+                return
+            self._held[key_name] = action
+            if key_name in self._held_order:
+                self._held_order.remove(key_name)
+            self._held_order.append(key_name)
+            self._recompute_current()
 
     def _handle_release(self, key_name: str) -> None:
-        action = DEFAULT_KEY_TO_ACTION.get(key_name)
-        for a, name in self.cfg.input.keymap.items():
-            if a != NOOP and name and name.lower() == key_name:
-                action = a
-        if action is not None:
+        if key_name in self.MODIFIER_KEYS:
             with self._lock:
-                if self._current_action == action:
-                    self._current_action = NOOP
+                self._mods.discard(key_name)
+            return
+        with self._lock:
+            self._last_key_event_ts = time.monotonic()
+            if key_name in self._held:
+                del self._held[key_name]
+                if key_name in self._held_order:
+                    self._held_order.remove(key_name)
+                self._recompute_current()
+
+    # -- public read-outs for the GUI's live "data collection" view ------ #
+    def current_action(self) -> int:
+        with self._lock:
+            return int(self._current_action)
+
+    def last_zone(self) -> Optional[np.ndarray]:
+        """Copy of the last 84x84 ground zone actually appended (or None)."""
+        with self._lock:
+            return None if self._last_zone is None else self._last_zone.copy()
 
     # ------------------------------------------------------------------ #
     @property
@@ -186,6 +245,12 @@ class DemoRecorder:
         self._death.clear()
         self._score.clear()
         self._current_action = NOOP
+        self._held.clear()
+        self._held_order.clear()
+        self._mods.clear()
+        self._last_key_event_ts = time.monotonic()
+        self._stuck_warned = False
+        self._last_zone = None
         self._recording = True
         self._stop_requested.clear()
         # DEEP-FIX: surface a missing keyboard hook loudly.  Previously a
@@ -293,12 +358,28 @@ class DemoRecorder:
         z = self.pre.process(frame.image, frame.frame_id, frame.ts)
         if not z.valid or z.ground_gray is None:
             return False
+        zone = np.ascontiguousarray(z.ground_gray)
         # DEEP-FIX: every column is appended under the same lock so a
         # concurrent stop() can never see a ragged episode.
         with self._lock:
             if not self._recording:
                 return False
-            self._frames.append(np.ascontiguousarray(z.ground_gray))
+            # DEEP-FIX: a missed key-release left _current_action set forever,
+            # so frames kept recording an action the player was not pressing.
+            # If no key event arrived for STUCK_CLEAR_S, treat it as stuck.
+            if (self._current_action != NOOP and
+                    time.monotonic() - self._last_key_event_ts > self.STUCK_CLEAR_S):
+                if not self._stuck_warned:
+                    LOGGER.warning(
+                        "demo: clearing stuck action %d (no key event for "
+                        "%.1fs — likely a missed key-release)",
+                        self._current_action, self.STUCK_CLEAR_S)
+                    self._stuck_warned = True
+                self._held.clear()
+                self._held_order.clear()
+                self._current_action = NOOP
+            self._last_zone = zone
+            self._frames.append(zone)
             self._actions.append(int(self._current_action))
             self._ts.append(float(frame.ts))
             self._death.append(str(death_state))

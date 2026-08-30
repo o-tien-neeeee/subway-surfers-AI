@@ -21,11 +21,12 @@ schema, not the build, and must not be conflated with this one.
 """
 
 #: Bump on every behavioural change.  Format: MAJOR.MINOR.PATCH
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.10.0"
 
 #: Human-readable notes for the current build, newest first.  Kept short on
 #: purpose — the full reasoning lives in DEEP_FIX_REPORT.md.
 CHANGELOG = [
+    "1.10.0 — quay demo: F9 dừng THẬT (global hotkey), lớp phủ trực quan ● REC + hành động + vùng 84×84, sửa action ma (held-key set + chặn modifier + tự xoá phím kẹt); chẩn đoán bot chết-ngay liên tiếp.",
     "1.9.1 — tab Hướng dẫn bổ sung mục QUAY DEMO và TIỀN-HUẤN LUYỆN BC (giải thích + cách dùng).",
     "1.9.0 — tab HƯỚNG DẪN A–Z; preview vẽ đường chân trời + marker sống/hồi sinh; "
     "nút Test click bỏ cổng focus (không còn BLOCKED); preflight cảnh báo vùng bị che "

@@ -130,6 +130,10 @@ QUAY DEMO (dạy bot bằng cách BẠN chơi):
  • Cách dùng: (1) đã Chọn + Khoá vùng (bước 1-2); (2) bấm "● Quay demo (F9
    dừng)"; (3) CHƠI bằng phím mũi tên (trái / phải / nhảy / lướt) — ô
    "demo frames: N" đếm số khung đang ghi; (4) bấm F9 (hoặc nút) để dừng & lưu.
+ • KHI ĐANG QUAY, preview hiện lớp phủ trực quan: banner ● REC đỏ + số khung +
+   thời gian, ô "HĐ:" cho HÀNH ĐỘNG đang nhận (để bạn thấy phím có ăn không),
+   và ảnh vùng 84×84 thực sự đang được ghi (viền vàng).  Nếu "HĐ:" kẹt ở một
+   hành động dù bạn không bấm → phím bị kẹt, đã tự xoá sau 1.5s.
  • File lưu: demos/episode_YYYYmmdd_HHMMSS.npz (ghi atomic, không ghi đè).
  • Dòng lệnh: python app.py --record-demo
  • LƯU Ý QUAN TRỌNG: cần bàn phím thật + pynput.  Nếu không có hook bàn phím,
@@ -162,6 +166,13 @@ GIẢI QUYẾT RẮC RỐI:
  • Chết ngay 0.2s khi vừa chạy: vùng chọn đang bị che hoặc game chưa ở trạng thái
    sống — kiểm tra cửa sổ không che vùng, và game đang chạy trước khi Bắt đầu.
  • Preview đen: tắt hardware acceleration của Chrome (xem trên).
+ • "AI không tiến bộ dù đã train lâu": gần như luôn do bot CHẾT NGAY mỗi
+   episode (vùng bị che / màn thua / neo sai) nên không có tín hiệu sống sót
+   để học.  Log sẽ báo "BOT ĐANG CHẾT NGAY LIÊN TIẾP".  Khắc phục: quay lại
+   bước 1-3, đảm bảo game đang SỐNG và vùng không bị che, rồi train lại.  Chạy
+   preflight (tự động khi bấm Start) cũng cảnh báo điều này.
+ • Muốn bot học NHANH hơn: quay vài demo rồi chạy Tiền-huấn luyện BC (ở trên)
+   để bot bắt chước bạn trước, thay vì mò ngẫu nhiên.
 """
 
 
@@ -327,6 +338,13 @@ class ControlGUI:
         self.dead_sample_frames: list[Any] = []
         self.log_lines: list[str] = []
         self._demo_recorder: Optional[Any] = None
+        # DEEP-FIX: F9 was advertised everywhere ("F9 dừng") but never wired, so
+        # the user could not stop a recording from the game window.  A global
+        # pynput listener sets this event; the Tk loop (the only thread allowed
+        # to touch widgets) performs the actual stop.
+        self._demo_hotkey: Optional[Any] = None
+        self._demo_stop_req = threading.Event()
+        self._demo_t0 = 0.0
         self._build()
         self.root.after(self.POLL_MS, self._tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -487,6 +505,55 @@ class ControlGUI:
             self.preview.stop()
             self.preview = None
 
+    #: action id -> (nhãn, màu) cho lớp phủ quay demo
+    _ACTION_STYLE = {
+        0: ("KHÔNG", (120, 120, 120)),
+        1: ("← TRÁI", (52, 152, 219)),
+        2: ("→ PHẢI", (155, 89, 182)),
+        3: ("↑ NHẢY", (46, 204, 113)),
+        4: ("↓ LƯỚT", (230, 126, 34)),
+    }
+
+    def _draw_rec_overlay(self, img, dr) -> None:
+        """Draw the live data-collection HUD onto the preview while recording."""
+        from PIL import Image as _Image, ImageFont as _ImageFont
+        rec = self._demo_recorder
+        try:
+            action = int(rec.current_action())
+            frames = int(rec.frame_count())
+        except Exception:
+            return
+        elapsed = max(0.0, time.monotonic() - self._demo_t0)
+        try:
+            font = _ImageFont.truetype("arial.ttf", 15)
+        except Exception:
+            font = _ImageFont.load_default()
+        # --- REC banner (top-left) ---
+        label, color = self._ACTION_STYLE.get(action, ("?", (200, 0, 0)))
+        banner = f"● REC  {frames} khung  {elapsed:4.1f}s"
+        dr.rectangle([0, 0, 210, 22], fill=(180, 20, 20))
+        dr.text((6, 4), banner, fill=(255, 255, 255), font=font)
+        # --- current action chip (below banner) ---
+        dr.rectangle([0, 24, 150, 48], fill=color)
+        dr.text((8, 28), f"HĐ: {label}", fill=(255, 255, 255), font=font)
+        # --- the 84x84 ground zone actually being saved (bottom-right) ---
+        zone = rec.last_zone()
+        if zone is not None:
+            try:
+                import numpy as _np
+                zi = _Image.fromarray(_np.asarray(zone, dtype=_np.uint8)).convert("L")
+                zi = zi.resize((84, 84))
+                w, h = img.size
+                img.paste(zi, (w - 92, h - 108))
+                dr.rectangle([w - 93, h - 109, w - 7, h - 23],
+                             outline=(255, 255, 0), width=2)
+                dr.text((w - 92, h - 124), "vùng 84×84 đang ghi",
+                        fill=(255, 255, 0), font=font)
+            except Exception as exc:
+                if not getattr(self, "_rec_hud_warned", False):
+                    self._rec_hud_warned = True
+                    self.log(f"HUD vùng 84×84 lỗi: {type(exc).__name__}: {exc}")
+
     def _update_preview(self) -> None:
         if self.preview is None:
             return
@@ -516,6 +583,13 @@ class ControlGUI:
             rx = self.cfg.input.respawn_fx * dw
             ry = self.cfg.input.respawn_fy * dh
             dr.ellipse([rx - 5, ry - 5, rx + 5, ry + 5], outline=(46, 204, 113), width=2)
+        # DEEP-FIX: quay demo trước đây gần như vô hình — chỉ có một dòng chữ
+        # "demo frames: N" trong lưới số liệu, nên người dùng không biết dữ liệu
+        # đang được thu thập ra sao.  Vẽ ngay lên preview: banner REC đỏ, số
+        # khung, thời gian, HÀNH ĐỘNG đang nhận (để thấy phím ăn hay kẹt), và
+        # ảnh vùng 84x84 thực sự đang được ghi.
+        if self.sm.state is BotState.RECORDING_DEMO and self._demo_recorder is not None:
+            self._draw_rec_overlay(img, dr)
         self.preview_img = ImageTk.PhotoImage(img)
         self.preview_label.configure(image=self.preview_img)
         self._latest_preview = img  # for click/anchor sampling (fractions)
@@ -963,6 +1037,35 @@ class ControlGUI:
         else:
             self._set_state(BotState.STOPPED)
 
+    def _arm_demo_hotkey(self) -> None:
+        """Global F9 listener so recording can be stopped while the GAME has
+        focus.  A Tk key binding would never fire (focus is on Chrome)."""
+        if self._demo_hotkey is not None:
+            return
+        try:
+            from pynput import keyboard
+
+            def on_press(key):
+                if key == keyboard.Key.f9:
+                    self._demo_stop_req.set()
+
+            self._demo_hotkey = keyboard.Listener(on_press=on_press)
+            self._demo_hotkey.start()
+        except Exception as exc:
+            self._demo_hotkey = None
+            self.log(f"F9 không khả dụng ({type(exc).__name__}: {exc}) — "
+                     "dùng nút ■ Dừng demo.")
+
+    def _disarm_demo_hotkey(self) -> None:
+        h = self._demo_hotkey
+        self._demo_hotkey = None
+        self._demo_stop_req.clear()
+        if h is not None:
+            try:
+                h.stop()
+            except Exception as exc:
+                self.log(f"dừng hotkey demo thất bại: {exc}")
+
     def toggle_demo_recording(self) -> None:
         if self.sm.state is BotState.RECORDING_DEMO:
             self._stop_demo_recording()
@@ -999,10 +1102,13 @@ class ControlGUI:
         self._demo_recorder = DemoRecorder(self.cfg, self.cfg.paths.demos_dir,
                                            _RingReader(ring))
         self._demo_recorder.start()
+        self._demo_t0 = time.monotonic()
+        self._arm_demo_hotkey()
         self.btn_demo.configure(text="■ Dừng demo (F9)")
         self.status_var.set("ĐANG quay demo — chơi đi! F9 / nút để dừng.")
 
     def _stop_demo_recording(self) -> None:
+        self._disarm_demo_hotkey()
         if self._demo_recorder is None:
             return
         path = self._demo_recorder.stop(done=True)
@@ -1035,6 +1141,11 @@ class ControlGUI:
             # it already runs at a bounded rate, and it never blocks on I/O
             # longer than a few ring reads.
             self._pump_demo_recorder()
+            # DEEP-FIX: F9 arrives on the pynput thread; perform the stop here
+            # (Tk main thread) so widget updates stay thread-safe.
+            if self._demo_stop_req.is_set():
+                self._demo_stop_req.clear()
+                self._stop_demo_recording()
             self._poll_metrics()
             self._check_workers()
         except Exception as exc:

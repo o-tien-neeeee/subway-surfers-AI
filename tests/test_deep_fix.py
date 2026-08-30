@@ -1360,7 +1360,9 @@ class TestCalibrationVisibleAndTestClick:
                        "CLICK VÀO CỬA", "F8",
                        "QUAY DEMO", "TIỀN-HUẤN LUYỆN BC",
                        "--validate-demos", "--pretrain",
-                       "bc.min_episodes", "NOOP only"):
+                       "bc.min_episodes", "NOOP only",
+                       "● REC", "HĐ:", "vùng 84×84",
+                       "AI không tiến bộ", "CHẾT NGAY LIÊN TIẾP"):
             assert phrase in src, f"help must cover {phrase!r}"
 
     def test_click_focus_gate_still_protects_gameplay(self) -> None:
@@ -1399,3 +1401,110 @@ class TestChangelogNotMerged:
         for entry in CHANGELOG:
             inner = re.findall(r"\d+\.\d+\.\d+ —", entry)
             assert len(inner) == 1, f"merged changelog entry: {entry!r}"
+
+
+# --------------------------------------------------------------------- #
+# 22. Demo recorder: phantom actions, stoppability, live feedback
+# --------------------------------------------------------------------- #
+def _make_rec(tmp_path):
+    from config import BotConfig
+    from demonstration_recorder import DemoRecorder
+    cfg = BotConfig()
+    cfg.region.left, cfg.region.top = 120, 80
+    cfg.region.width, cfg.region.height = 480, 800
+    cfg.region.screen_width, cfg.region.screen_height = 1920, 1080
+    cfg.region.dpi_scale = 1.0
+    return DemoRecorder(cfg, tmp_path / "demos", lambda: None)
+
+
+class TestDemoRecorderPhantomActions:
+    """A single scalar _current_action set-on-press / clear-on-release left the
+    action stuck after a missed release (phantom actions the player never
+    pressed), let a second key overwrite the first, and leaked alt-tab arrows.
+    Guard the held-key-set rewrite."""
+
+    def test_held_key_most_recent_wins_and_release_is_scoped(self, tmp_path) -> None:
+        from config import NOOP, LEFT, RIGHT
+        rec = _make_rec(tmp_path)
+        rec._handle_press("left")
+        assert rec.current_action() == LEFT
+        rec._handle_press("right")
+        assert rec.current_action() == RIGHT
+        rec._handle_release("right")
+        assert rec.current_action() == LEFT, (
+            "releasing one key must not clear a different still-held key")
+        rec._handle_release("left")
+        assert rec.current_action() == NOOP
+
+    def test_modifier_guard_blocks_shortcuts(self, tmp_path) -> None:
+        from config import NOOP, LEFT
+        rec = _make_rec(tmp_path)
+        rec._handle_press("alt_l")
+        rec._handle_press("left")
+        assert rec.current_action() == NOOP, (
+            "an arrow pressed under a modifier (alt-tab) is not a game action")
+        rec._handle_release("left")
+        rec._handle_release("alt_l")
+        rec._handle_press("left")
+        assert rec.current_action() == LEFT
+
+    def test_stuck_action_auto_clears_on_missed_release(self, tmp_path) -> None:
+        import time
+        import numpy as np
+        from config import LEFT, NOOP
+        from ipc import Frame
+        rec = _make_rec(tmp_path)
+        rec.start()
+        rec._handle_press("left")
+        assert rec.current_action() == LEFT
+        rec._last_key_event_ts = time.monotonic() - (rec.STUCK_CLEAR_S + 0.5)
+        img = np.full((800, 480, 3), (40, 44, 60), dtype=np.uint8)
+        rec.tick(Frame(frame_id=1, ts=0.0, image=img))
+        assert rec.current_action() == NOOP, "a stuck action must be cleared"
+        rec.stop(done=False)
+
+    def test_public_readouts_for_hud(self, tmp_path) -> None:
+        import numpy as np
+        from ipc import Frame
+        rec = _make_rec(tmp_path)
+        rec.start()
+        img = np.full((800, 480, 3), (40, 44, 60), dtype=np.uint8)
+        rec.tick(Frame(frame_id=1, ts=0.0, image=img))
+        z = rec.last_zone()
+        assert z is not None and z.shape == (84, 84)
+        assert isinstance(rec.current_action(), int)
+        rec.stop(done=False)
+
+
+class TestDemoStopAndLiveHUD:
+    def _src(self) -> str:
+        return (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+
+    def test_f9_stop_hotkey_is_actually_wired(self) -> None:
+        src = self._src()
+        assert "keyboard.Key.f9" in src, "F9 was advertised but never bound"
+        assert "_arm_demo_hotkey" in src and "_disarm_demo_hotkey" in src
+        # the stop must be marshalled to the Tk thread (pynput runs its own)
+        assert "self._demo_stop_req.is_set()" in src
+
+    def test_recording_hud_is_drawn(self) -> None:
+        src = self._src()
+        assert "_draw_rec_overlay" in src
+        assert "BotState.RECORDING_DEMO" in src
+        assert "vùng 84×84 đang ghi" in src
+
+
+class TestInstantDeathDiagnostic:
+    """'AI không tiến triển sau 500 episode' is almost always the bot dying
+    instantly every episode (no survival signal).  The actor must say so loudly
+    instead of letting hundreds of empty episodes pass in silence."""
+
+    def test_actor_detects_instant_death_loop(self) -> None:
+        src = (Path(__file__).resolve().parent.parent / "environment.py") \
+            .read_text(encoding="utf-8")
+        assert "_instant_death_streak" in src
+        assert "survival < 1.0" in src
+        assert "CHẾT NGAY LIÊN TIẾP" in src
+        # the streak must reset on a surviving episode, else it never re-arms
+        assert "self._instant_death_streak = 0" in src

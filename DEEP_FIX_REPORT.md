@@ -949,3 +949,45 @@ Calibration của người dùng thực ra ĐÚNG — vấn đề là *không nh
 ### My Reasoning
 
 Người dùng "chẳng hiểu gì" vì demo/BC là hai workflow tách biệt khỏi 6 bước calibration, lại chỉ có nút bấm không giải thích. Thay vì đoán, tôi đọc `demonstration_recorder.py` (thấy bot không bấm phím, cần pynput thật, NOOP-only khi headless), `learner_worker.pretrain` (ngưỡng ≥2 episode, BC không auto-run), và `validate_episode` (tiêu chí INVALID) rồi viết đúng những gì code làm — kể cả các bẫy (episode toàn NOOP, BC bỏ qua khi thiếu demo, phải bật train trước khi bấm nút BC).
+
+---
+
+## Phần 15 — Vòng 9 (v1.10.0): Demo recorder — dừng được, thấy được, hết action ma; chẩn đoán "không tiến bộ"
+
+**Phàn nàn của người dùng:** (1) quay demo không hiển thị trực quan quá trình thu thập; (2) AI không tiến triển sau 500 episode; (3) không biết cách dùng demo; (4) "lỗi không dừng hay làm gì được"; (5) thỉnh thoảng có hành động lạ dù không bấm; (6) không hiểu tiền huấn luyện.
+
+### Bảng chẩn đoán
+
+| Mức độ | Loại lỗi | Vị trí | Mô tả | Hậu quả | Gốc rễ (suy luận mindset) |
+|---|---|---|---|---|---|
+| **Cao** | Logic/UI | `gui.py` | F9 được quảng cáo khắp nơi ("F9 dừng") nhưng **không hề có listener nào** | Người dùng đang focus Chrome nên không thể dừng quay demo bằng phím → "không dừng được" | Tác giả viết nhãn/help theo dự định, chưa từng nối dây hotkey; `EmergencyHotkey` chỉ nghe F8 |
+| **Cao** | UX | `gui.py::_pump_demo_recorder` | Phản hồi duy nhất là dòng chữ `demo frames: N` trong lưới số liệu | "không hiển thị trực quan quá trình thu thập" | Tác giả coi việc ghi là nền, không nghĩ người dùng cần THẤY dữ liệu đang vào |
+| **Cao** | Logic | `demonstration_recorder.py` | `_current_action` là scalar set-on-press/clear-on-release | Release bị lỡ (alt-tab/đổi focus) → action **kẹt mãi** = action ma; phím tắt alt-tab lọt vào demo; phím thứ 2 ghi đè phím 1 | Tác giả giả định press/release luôn đi đôi, không tính focus change trên Windows |
+| Trung | Robustness | `environment.py::_end_episode` | Chết ngay mỗi episode nhưng không cảnh báo | 500 episode rỗng trôi qua im lặng → "AI không tiến bộ" mà không biết vì sao | Tác giả log từng episode nhưng không phát hiện XU HƯỚNG chết liên tiếp |
+
+### Các sửa đổi (mỗi chỗ có `# DEEP-FIX:`)
+
+1. **F9 dừng THẬT** — `_arm_demo_hotkey` tạo pynput listener toàn cục (vì focus đang ở Chrome, Tk bind không ăn). Listener chỉ `set()` một `threading.Event`; **`_tick` (thread Tk) mới thực sự dừng** → đúng quy tắc "chỉ thread Tk đụng widget". `_disarm_demo_hotkey` gỡ khi dừng.
+2. **Lớp phủ trực quan khi quay** — `_draw_rec_overlay` vẽ lên preview: banner `● REC` đỏ + số khung + thời gian; ô `HĐ:` màu theo hành động đang nhận (KHÔNG/←/→/↑/↓) để thấy phím ăn hay kẹt; ảnh vùng **84×84 thực sự đang ghi** (viền vàng) ở góc.
+3. **Hết action ma** — `DemoRecorder` chuyển sang **held-key set**: `_held`/`_held_order`, action hiện tại = phím nhấn sau cùng còn giữ; release chỉ xoá đúng phím đó. **Chặn modifier** (alt/ctrl/cmd/shift): phím mũi tên dưới modifier (alt-tab) không thành hành động. **Tự xoá phím kẹt**: trong `tick`, nếu action ≠ NOOP mà không có sự kiện phím nào trong `STUCK_CLEAR_S=1.5s` → coi như lỡ release, xoá + log một lần.
+4. **Accessor công khai** — `current_action()`, `last_zone()` (copy 84×84) cho HUD; thread-safe.
+5. **Chẩn đoán chết-ngay** — `_end_episode` đếm `_instant_death_streak` (episode < 1s); tới 5 lần liên tiếp → log cảnh báo đậm "BOT ĐANG CHẾT NGAY LIÊN TIẾP… AI sẽ KHÔNG tiến bộ" + gợi ý kiểm tra vùng/neo; reset khi có episode sống.
+6. **Help** — mục QUAY DEMO thêm mô tả HUD; thêm mục troubleshooting "AI không tiến bộ" (chết ngay) và gợi ý dùng BC để học nhanh.
+
+### Test cases (7 mới)
+
+1. `test_held_key_most_recent_wins_and_release_is_scoped` — nhấn trái→TRÁI; nhấn phải→PHẢI; nhả phải→vẫn TRÁI (trái còn giữ); nhả trái→NOOP.
+2. `test_modifier_guard_blocks_shortcuts` — giữ alt + nhấn trái → NOOP; nhả alt, nhấn trái → TRÁI.
+3. `test_stuck_action_auto_clears_on_missed_release` — nhấn trái, đẩy `_last_key_event_ts` quá `STUCK_CLEAR_S`, `tick` → action về NOOP.
+4. `test_public_readouts_for_hud` — `last_zone()` trả ndarray 84×84, `current_action()` trả int.
+5. `test_f9_stop_hotkey_is_actually_wired` — `keyboard.Key.f9` + `_arm/_disarm_demo_hotkey` + `_demo_stop_req.is_set()` trong `_tick`.
+6. `test_recording_hud_is_drawn` — `_draw_rec_overlay` + `RECORDING_DEMO` + nhãn "vùng 84×84 đang ghi".
+7. `test_actor_detects_instant_death_loop` — `_instant_death_streak`, `survival < 1.0`, cảnh báo, và reset streak.
+
+**Kết quả:** `pytest -q` → **515 passed** (83 s). (2 lỗi hygiene `except Exception: pass` trong HUD đã sửa thành log-một-lần.)
+
+### My Reasoning
+
+Bốn phàn nàn đầu đều quy về demo recorder. "Không dừng được" = F9 chưa từng tồn tại → nối hotkey toàn cục nhưng dừng phải chạy trên thread Tk (pynput chạy thread riêng), nên dùng Event + `_tick`. "Không thấy gì" = vẽ HUD ngay lên preview, gồm cả action đang nhận (để tự phát hiện phím kẹt) và ảnh 84×84 đang ghi. "Action ma" = scalar press/release quá mỏng trên Windows (focus đổi làm lỡ release) → held-key set + chặn modifier + timeout tự xoá. "Không tiến bộ" gần như luôn là chết-ngay-mỗi-episode (đúng bằng chứng log các vòng trước: chết frame 33, distance≈dead-sample) → thêm chẩn đoán xu hướng thay vì im lặng.
+
+**Chưa kiểm chứng được trong sandbox:** không có display/Chrome/pynput — F9 hotkey, HUD vẽ lên Tk, và hành vi pynput thật chỉ xác minh bằng compile + test cấu trúc/logic thuần (held-key/modifier/stuck chạy được vì không cần display). Chẩn đoán chết-ngay kiểm bằng test cấu trúc, chưa chạy trên game thật.
