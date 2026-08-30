@@ -31,8 +31,17 @@ def rgb_to_gray(image: np.ndarray) -> np.ndarray:
 
 
 def is_black_frame(image: np.ndarray, threshold: float) -> bool:
-    """True when the whole region is essentially black (tab switch, load)."""
-    return float(image.mean()) < threshold
+    """True when the whole region is essentially black (tab switch, load).
+
+    DEEP-FIX: this is the SINGLE definition.  A later duplicate (added with the
+    calibration black-capture guard) silently shadowed this one at import time,
+    swapping the runtime ``ZonePreprocessor`` black check from ``image.mean()``
+    to a different formula behind everyone's back.  Use BT.601 luma here -- a
+    better blackness measure than a raw channel mean -- and keep it the only
+    implementation so callers and the config knob ``black_mean_threshold``
+    agree.
+    """
+    return mean_luma(image) < threshold
 
 
 def anchor_patch(image: np.ndarray, cx: int, cy: int, half: int = 2) -> Optional[np.ndarray]:
@@ -74,17 +83,6 @@ def mean_luma(rgb: np.ndarray) -> float:
     return float(
         (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).mean()
     )
-
-
-def is_black_frame(frame: np.ndarray, max_luma: float = 8.0) -> bool:
-    """True when the frame is (near) black — the signature of a failed capture.
-
-    mss returns a black block when the target is occluded, off-screen, or the
-    window is drawn by a hardware-accelerated surface that BitBlt cannot read
-    (the classic Chrome "hardware acceleration" case).  A black capture is
-    *useless* for calibration, so callers must treat it as an error, not data.
-    """
-    return mean_luma(frame) < max_luma
 
 
 def capture_problem(frame: np.ndarray) -> Optional[str]:

@@ -786,3 +786,47 @@ chưa. **Sửa:** ghi `.tmp` rồi `os.replace` (atomic trên NTFS/ext4).
 > Đã bump `APP_VERSION` → **1.6.0** (hiển thị ở title Tk, log `app.py`, dashboard,
 > report). Các module còn lại (`action_scheduler`, `horizon_detector`, `metrics`)
 > tôi đọc kỹ và kết luận **đúng**, không sửa — tránh vá đắp.
+
+---
+
+# PHẦN 11 — VÒNG 6: bắt regression do CHÍNH vòng 4 gây ra — **v1.7.0**
+
+## 11.1 🟠 `perception.py`: hai định nghĩa `is_black_frame`, cái sau **che** cái trước
+
+Khi thêm guard capture đen ở vòng 4, tôi đã thêm một `is_black_frame` thứ hai
+(sau `patch_stability`) mà **không để ý** module đã có sẵn một cái ở dòng 33 —
+đúng cái mà `ZonePreprocessor.process` (đường runtime) gọi với
+`cfg.black_mean_threshold`. Python giữ định nghĩa **cuối**, nên công thức phát
+hiện đen của đường runtime bị tráo từ `image.mean()` sang công thức mới sau
+lưng mọi người. Đây là vi phạm DRY + đổi hành vi ngầm — đúng lớp lỗi "không
+được lướt" mà prompt yêu cầu, và lần này là do tôi.
+
+**Sửa:** hợp nhất còn **một** định nghĩa (dùng luma BT.601, nhận `threshold`
+từ config), xoá bản trùng.
+
+**Test mới (`TestNoShadowedBlackFrame`, 3 test):** đúng 1 định nghĩa (parse
+AST); `ZonePreprocessor.process` trả `reason="black"` cho frame đen và hợp lệ
+cho frame thường (đường runtime thật); threshold tôn trọng config. Test
+"đúng 1 định nghĩa" **fail trên perception của v1.5.0** (có duplicate) → không
+vacuous.
+
+## 11.2 Đối chiếu spec, các khu vực kết luận **ĐÚNG** (không sửa)
+
+- `death_detector.py`: thang ALIVE→POSSIBLE_EVENT→DEAD_CANDIDATE→DEAD_CONFIRMED,
+  debounce, stable-frames khi hồi phục — khớp §7.
+- `replay_buffer`/`learner_worker`: **beta schedule** anneal `beta_start→1` theo
+  `beta_frames` (§12) — đã đạt.
+- `capture_worker.py`: đo `grab_timeout_s`, note drop, phát hiện geometry drift
+  (§6) — đã đạt.
+- `SurvivalRewardCalculator`: alive theo dt monotonic, death −10 một lần,
+  pixel-diff clip + mặc định tắt, clip tổng — khớp §13.
+- `dataset.split_by_episode`: chia theo **episode**, không leak frame val vào
+  train (§10) — đã đạt.
+
+## 11.3 Kiểm chứng
+
+| Kiểm chứng | Kết quả |
+|---|---|
+| `pytest -q` | **498 passed, 0 failed** (78.5 s) — trước 495 |
+| Test chống shadow trên perception v1.5.0 | fail → bắt được duplicate |
+| `APP_VERSION` | **1.7.0** |

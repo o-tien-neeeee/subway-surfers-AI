@@ -1068,7 +1068,7 @@ class TestBlackCaptureGuard:
         from perception import is_black_frame, capture_problem, mean_luma
 
         black = np.zeros((50, 50, 3), dtype=np.uint8)
-        assert is_black_frame(black)
+        assert is_black_frame(black, 8.0)
         msg = capture_problem(black)
         assert msg is not None and "BLACK" in msg
 
@@ -1077,7 +1077,7 @@ class TestBlackCaptureGuard:
 
         rng = np.random.default_rng(0)
         frame = rng.integers(40, 220, size=(50, 50, 3)).astype(np.uint8)
-        assert not is_black_frame(frame)
+        assert not is_black_frame(frame, 8.0)
         assert capture_problem(frame) is None
 
     def test_flat_patch_is_degenerate_even_when_stable(self) -> None:
@@ -1215,3 +1215,49 @@ class TestConfigSaveAtomicity:
         # The on-disk config must still be the ORIGINAL, parseable file.
         assert BotConfig.load(str(p)).seed == 1, (
             "a failed save corrupted the existing config.json")
+
+
+# --------------------------------------------------------------------- #
+# 19. There must be exactly ONE is_black_frame (no import-time shadowing)
+# --------------------------------------------------------------------- #
+class TestNoShadowedBlackFrame:
+    """Round 4 added a second ``is_black_frame`` that shadowed the one the
+    runtime ``ZonePreprocessor`` uses, silently swapping its black-detection
+    formula.  A duplicate top-level definition is a DRY violation and an
+    invisible behaviour change.  Pin both the structure and the runtime path.
+    """
+
+    def test_is_black_frame_is_defined_exactly_once(self) -> None:
+        import ast
+        src = (Path(__file__).resolve().parent.parent / "perception.py") \
+            .read_text(encoding="utf-8")
+        defs = [n.name for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.FunctionDef) and n.name == "is_black_frame"]
+        assert len(defs) == 1, f"is_black_frame defined {len(defs)} times: {defs}"
+
+    def test_runtime_preprocessor_flags_black_and_accepts_normal(self) -> None:
+        """The production perception path must skip black frames (§6)."""
+        from config import PerceptionConfig
+        from perception import ZonePreprocessor
+
+        cfg = PerceptionConfig()
+        pre = ZonePreprocessor(cfg, cfg.horizon_frac, anchor_xy=None,
+                               require_anchor=False)
+        black = np.zeros((100, 100, 3), dtype=np.uint8)
+        rb = pre.process(black, 1, 0.0)
+        assert not rb.valid and rb.reason == "black", (
+            f"a black frame must be invalid at runtime, got {rb.reason}")
+        normal = np.random.default_rng(0).integers(
+            40, 220, size=(100, 100, 3)).astype(np.uint8)
+        rn = pre.process(normal, 2, 0.0)
+        assert rn.valid and rn.ground_gray is not None
+
+    def test_black_threshold_respects_config(self) -> None:
+        """A frame whose luma is just under the configured threshold is black;
+        just over is not.  Guards the unified single definition."""
+        from perception import is_black_frame
+
+        dim = np.full((20, 20, 3), 3, dtype=np.uint8)    # luma 3
+        assert is_black_frame(dim, 4.0)
+        bright = np.full((20, 20, 3), 30, dtype=np.uint8)  # luma 30
+        assert not is_black_frame(bright, 4.0)

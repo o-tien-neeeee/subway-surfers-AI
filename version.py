@@ -21,11 +21,12 @@ schema, not the build, and must not be conflated with this one.
 """
 
 #: Bump on every behavioural change.  Format: MAJOR.MINOR.PATCH
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 #: Human-readable notes for the current build, newest first.  Kept short on
 #: purpose — the full reasoning lives in DEEP_FIX_REPORT.md.
 CHANGELOG = [
+    "1.7.0 — removed a shadowed duplicate is_black_frame (round-4 regression); runtime black-frame skip now uses the single, config-driven definition."
     "1.6.0 — activation-memory estimate no longer double-counts composite modules; config.save is atomic (failed save never bricks config.json)."
     "1.5.0 — black-capture guard in anchor calibration + live luminance readout; "
     "build version surfaced in GUI/log/webui/report.",
