@@ -368,7 +368,19 @@ class Learner:
                                          "src": "learner", "msg": msg})
             return {"status": "skipped", "reason": "not_enough_episodes"}
         report(f"BC dataset: {len(valid)}/{len(episodes)} valid episodes")
-        ds = DemonstrationDataset(valid, stack=self.cfg.perception.frame_stack)
+        ds = DemonstrationDataset(valid, stack=self.cfg.perception.frame_stack,
+                                  dodge_oversample=self.cfg.bc.dodge_oversample)
+        # DEEP-FIX ("why did the human press?"): surface how many of each dodge
+        # the demos contain, so a dodge the player never demonstrated is obvious
+        # (a dodge with 0 presses can never be learned).
+        _presses = ds.dodge_press_counts()
+        _names = {1: "trái", 2: "phải", 3: "nhảy", 4: "trượt"}
+        put_bounded(self.metrics_q, {
+            "type": "log", "level": "info", "src": "learner",
+            "msg": "🔍 TẠI SAO BẤM — số pha né trong demo: "
+                   + ", ".join(f"{_names[a]}={_presses.get(a, 0)}"
+                               for a in (1, 2, 3, 4))
+                   + f" | oversample khung né x{self.cfg.bc.dodge_oversample}"})
         train_idx, val_idx = ds.split_by_episode(self.cfg.bc.val_fraction,
                                                  seed=self.cfg.seed)
         if not val_idx:
@@ -413,6 +425,16 @@ class Learner:
                                      "src": "learner",
                                      "msg": f"BC: hoàn tất {len(history)} epoch, "
                                             f"val_acc={history[-1]['val_acc']:.3f}, đang lưu checkpoint…"})
+        # DEEP-FIX ("why did the human press?"): the headline val_acc is usually
+        # inflated by NOOP; the per-dodge accuracy is what decides survival.  Log
+        # it explicitly so a bot that "knows BC" but cannot dodge is diagnosable.
+        _pa = history[-1].get("per_action", {}) if history else {}
+        put_bounded(self.metrics_q, {
+            "type": "log", "level": "info", "src": "learner",
+            "msg": "🎯 accuracy sau BC theo action (né = sống còn): "
+                   + ", ".join(f"{_names[a]}={float(_pa.get(a, 0)):.2f}"
+                               for a in (1, 2, 3, 4))
+                   + f" | NOOP={float(_pa.get(0, 0)):.2f}"})
         self.bc_history = history
         self.agent.sync_target()
         # DEEP-FIX: tell the actor a good policy now exists so it stops playing

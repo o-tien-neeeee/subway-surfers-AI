@@ -1838,3 +1838,45 @@ class TestBcFirstGating:
         # was 150_000 (~83 min) -> a no-BC run never left epsilon~0.99 in a
         # session; 50_000 lets it start exploiting within ~10 min.
         assert RLConfig().epsilon_decay_frames <= 50_000
+
+
+def _mk_episode(actions):
+    import numpy as np
+    from dataset import Episode
+    n = len(actions)
+    return Episode(
+        path="x.npz",
+        frames=np.zeros((n, 84, 84), dtype=np.uint8),
+        actions=np.asarray(actions, dtype=np.int64),
+        timestamps=np.arange(n, dtype=np.float64) / 30.0,
+        done=np.array([False] * (n - 1) + [True]),
+    )
+
+
+class TestWhyPressOversampling:
+    """Round 19: 'why did the human press?' — dodges are rare but fatal, so BC
+    must oversample them instead of drowning them in NOOP."""
+
+    def test_dodge_press_counts(self) -> None:
+        from dataset import DemonstrationDataset
+        # NOOP NOOP LEFT LEFT NOOP JUMP NOOP -> LEFT pressed once, JUMP once
+        ds = DemonstrationDataset([_mk_episode([0, 0, 1, 1, 0, 3, 0])],
+                                  stack=4, dodge_oversample=1)
+        c = ds.dodge_press_counts()
+        assert c[1] == 1 and c[3] == 1 and c[0] == 0
+
+    def test_oversample_grows_only_dodge_frames(self) -> None:
+        from dataset import DemonstrationDataset
+        ep = _mk_episode([0, 0, 1, 1, 0, 3, 0])  # 4 NOOP + 3 dodge frames
+        assert len(DemonstrationDataset([ep], stack=4, dodge_oversample=1)) == 7
+        # 4 NOOP x1 + 3 dodge x4 = 16
+        assert len(DemonstrationDataset([ep], stack=4, dodge_oversample=4)) == 4 + 3 * 4
+
+    def test_oversample_off_is_legacy(self) -> None:
+        from dataset import DemonstrationDataset
+        ep = _mk_episode([0, 1, 0, 2, 0])
+        assert len(DemonstrationDataset([ep], stack=4)) == 5  # default off-by-count
+
+    def test_config_exposes_dodge_oversample(self) -> None:
+        from config import BCConfig
+        assert BCConfig().dodge_oversample >= 1

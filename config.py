@@ -290,6 +290,11 @@ class BCConfig:
     #: Minimum usable episodes; below this BC is refused with a GUI message.
     min_episodes: int = 2
     class_balance: str = "inverse_sqrt"
+    #: DEEP-FIX ("why did the human press?"): dodge actions are rare but decide
+    #: life-or-death, so plain BC drowns them in NOOP and never learns to dodge.
+    #: Each dodge frame is repeated this many times in BC training so the rare,
+    #: critical presses actually drive the gradient.  1 = off (legacy behaviour).
+    dodge_oversample: int = 4
 
 
 @dataclass

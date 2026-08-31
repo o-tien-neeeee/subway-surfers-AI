@@ -32,6 +32,8 @@ from typing import Optional
 
 import numpy as np
 
+from config import NOOP
+
 
 @dataclass
 class Episode:
@@ -247,17 +249,36 @@ class DemonstrationDataset:
     """Frame-stack BC dataset over validated episodes (memory-light)."""
 
     def __init__(self, episodes: list[Episode], stack: int = 4,
-                 deterministic: bool = True) -> None:
+                 deterministic: bool = True, dodge_oversample: int = 1) -> None:
         self.stack = stack
         self.deterministic = deterministic
+        self.dodge_oversample = max(1, int(dodge_oversample))
         self._episodes = episodes
         self._index: list[tuple[int, int]] = []  # (episode_idx, step)
+        # DEEP-FIX ("why did the human press?"): dodge actions are rare but
+        # decide life-or-death, so plain BC drowns them in NOOP frames and never
+        # learns to dodge — val_acc looks high only because NOOP dominates.  We
+        # count every key press and oversample the dodge frames so BC actually
+        # learns the trigger->dodge mapping.  The frame-stack at a dodge frame
+        # already contains the approaching obstacle, i.e. the "why".
+        self._dodge_presses: dict[int, int] = {a: 0 for a in range(5)}
         for ei, ep in enumerate(episodes):
+            actions = ep.actions
             for si in range(len(ep)):
+                a = int(actions[si])
                 self._index.append((ei, si))
+                if a != NOOP:
+                    if si == 0 or int(actions[si - 1]) != a:
+                        self._dodge_presses[a] = self._dodge_presses.get(a, 0) + 1
+                    for _ in range(self.dodge_oversample - 1):
+                        self._index.append((ei, si))
 
     def __len__(self) -> int:
         return len(self._index)
+
+    def dodge_press_counts(self) -> dict[int, int]:
+        """Per-action count of dodge initiations (key presses) in the demos."""
+        return dict(self._dodge_presses)
 
     def class_counts(self) -> dict[int, int]:
         counts = {a: 0 for a in range(5)}
