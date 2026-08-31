@@ -14,7 +14,7 @@ from typing import Any
 
 from agent import InferencePolicy
 from config import BotConfig
-from environment import GameEnvironment
+from environment import GameEnvironment, SyntheticGame
 from evaluation import EpisodeRecord, EvaluationReport
 from logging_utils import get_logger, setup_logging
 from models import DuelingDQN
@@ -47,7 +47,18 @@ def run_headless_evaluation(cfg: BotConfig, episodes: int,
     policy = load_policy(cfg)
     report = EvaluationReport()
     for ep in range(episodes):
-        env = GameEnvironment(cfg, game=None) if ep == 0 else GameEnvironment(cfg)
+        # DEEP-FIX: every episode used the SAME cfg.seed for both the
+        # synthetic game and the policy's exploration RNG, so all N
+        # "independent" evaluation episodes were bit-identical (verified:
+        # two SyntheticGame(cfg.seed) runs produce the same 20 frames, and
+        # two InferencePolicy(seed=cfg.seed) runs pick the same 10 random
+        # actions).  The Mann-Whitney p-value, the bootstrap CI and the
+        # "std" in the report were therefore computed on n copies of one
+        # sample -- statistics that look rigorous and mean nothing.  Each
+        # episode now gets its own derived seed.
+        ep_seed = int(cfg.seed) * 1_000_003 + ep
+        game = SyntheticGame(seed=ep_seed, fps=cfg.capture.target_fps)
+        env = GameEnvironment(cfg, game=game)
         obs = env.reset()
         total = 0.0
         steps = 0

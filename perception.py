@@ -31,8 +31,17 @@ def rgb_to_gray(image: np.ndarray) -> np.ndarray:
 
 
 def is_black_frame(image: np.ndarray, threshold: float) -> bool:
-    """True when the whole region is essentially black (tab switch, load)."""
-    return float(image.mean()) < threshold
+    """True when the whole region is essentially black (tab switch, load).
+
+    DEEP-FIX: this is the SINGLE definition.  A later duplicate (added with the
+    calibration black-capture guard) silently shadowed this one at import time,
+    swapping the runtime ``ZonePreprocessor`` black check from ``image.mean()``
+    to a different formula behind everyone's back.  Use BT.601 luma here -- a
+    better blackness measure than a raw channel mean -- and keep it the only
+    implementation so callers and the config knob ``black_mean_threshold``
+    agree.
+    """
+    return mean_luma(image) < threshold
 
 
 def anchor_patch(image: np.ndarray, cx: int, cy: int, half: int = 2) -> Optional[np.ndarray]:
@@ -66,6 +75,49 @@ def patch_stability(patch_samples: list[np.ndarray]) -> tuple[float, tuple[int, 
     stds = arr.std(axis=0)
     med = np.median(np.stack([p.reshape(-1, 3) for p in patch_samples]).reshape(-1, 3), axis=0)
     return float(stds.max()), (int(med[0]), int(med[1]), int(med[2]))
+
+
+def mean_luma(rgb: np.ndarray) -> float:
+    """ITU-R BT.601 luma of an HxWx3 uint8 array, in 0..255."""
+    arr = rgb.astype(np.float32)
+    return float(
+        (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).mean()
+    )
+
+
+def capture_problem(frame: np.ndarray) -> Optional[str]:
+    """Return a human-readable diagnosis if a capture is unusable, else None.
+
+    The anchor acceptance used to rely on "stability" alone, but a black or
+    single-colour frame is the *most* stable thing there is -- so a broken
+    capture passed the check with std=0.00 and was silently [ACCEPTED].
+    This inverts that: degenerate content is rejected up front.
+    """
+    if frame is None or frame.size == 0:
+        return "empty capture (grab returned no pixels)"
+    lum = mean_luma(frame)
+    if lum < 8.0:
+        return (
+            f"capture is BLACK (luma={lum:.1f}). Likely causes: the game window "
+            "is occluded/minimised, the selected region is off-screen, or the "
+            "browser uses hardware acceleration that screen capture cannot "
+            "read (Chrome: Settings → disable 'Use hardware acceleration')."
+        )
+    if lum > 247.0:
+        return f"capture is pure WHITE (luma={lum:.1f}); wrong region?"
+    return None
+
+
+def is_degenerate_patch(patch: np.ndarray) -> bool:
+    """True for a 5x5 patch with effectively no information (uniform colour).
+
+    A uniform patch -- black, white, or any flat colour -- tells us nothing
+    about liveness, so it must never be accepted as a calibration anchor.
+    """
+    if patch is None or patch.size == 0:
+        return True
+    arr = patch.astype(np.float32)
+    return float(arr.std()) < 1e-6
 
 
 @dataclass

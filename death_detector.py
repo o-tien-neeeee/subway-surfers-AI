@@ -227,16 +227,23 @@ class RespawnController:
         if not self._active:
             return RespawnStatus("WAIT", "inactive", t)
 
-        if t - self._start_ts > self.cfg.respawn_timeout_s:
-            self._active = False
-            return RespawnStatus("FAILED", "timeout", t)
-
+        # DEEP-FIX: the timeout used to be evaluated BEFORE the recovery
+        # check, so a game that came back on the very frame the deadline
+        # expired was reported as FAILED -- and BotActor._respawn_failed()
+        # responds by setting the global pause event, parking the whole bot
+        # even though the respawn had actually worked.  A recovery that has
+        # already happened is a fact; the deadline only governs whether to
+        # keep trying.
         if death_state is DeathState.ALIVE:
             self._stable += 1
             if self._stable >= self.cfg.stable_frames:
                 self._active = False
                 return RespawnStatus("RECOVERED", f"stable_{self._stable}", t)
             return RespawnStatus("WAIT", f"stabilising_{self._stable}", t)
+
+        if t - self._start_ts > self.cfg.respawn_timeout_s:
+            self._active = False
+            return RespawnStatus("FAILED", "timeout", t)
 
         self._stable = 0
         due = (t - self._last_click_ts) >= self.cfg.respawn_interval_s

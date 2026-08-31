@@ -179,3 +179,34 @@ def human_bytes(n: float) -> str:
 def metrics_message(src: str, data: dict[str, Any]) -> dict[str, Any]:
     """Uniform envelope for worker -> GUI metrics messages."""
     return {"type": "metrics", "src": src, "t": time.time(), "data": data}
+
+
+def summarize_learning_progress(history: list[float],
+                                epsilon: Optional[float] = None) -> Optional[str]:
+    """Plain-language learning trend, emitted every 10 finished episodes.
+
+    # DEEP-FIX: the user repeatedly reported "AI không tiến triển" but had no
+    # way to SEE whether it was learning.  Turn the episode-survival history
+    # into a visible trend (rising = learning, flat = still exploring or stuck,
+    # falling = regression) so progress is observable instead of guessed.
+    Returns None until 10 episodes have accumulated.
+    """
+    n = len(history)
+    if n < 10 or n % 10 != 0:
+        return None
+    recent = sum(history[-10:]) / 10.0
+    if n >= 20:
+        prev = sum(history[-20:-10]) / 10.0
+        delta = recent - prev
+        if delta > 0.5:
+            arrow = "↑ TIẾN BỘ"
+        elif delta < -0.5:
+            arrow = "↓ thụt lùi (kiểm tra calibration / vùng chọn)"
+        else:
+            arrow = "→ chững (có thể vẫn đang khám phá — epsilon còn cao)"
+        trend = f" (10 episode trước: {prev:.1f}s) {arrow}"
+    else:
+        trend = ""
+    eps = "" if epsilon is None else f", epsilon={epsilon:.2f}"
+    return (f"📈 TIẾN TRÌNH HỌC: {n} episode | survival TB 10 episode gần nhất "
+            f"= {recent:.1f}s{trend}{eps}")

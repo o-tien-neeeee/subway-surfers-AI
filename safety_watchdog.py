@@ -39,6 +39,7 @@ class SafetyWatchdog(threading.Thread):
         interval_s: float = 0.25,
         stall_timeout_s: float = 2.0,
         on_status: Optional[Callable[[str, str], None]] = None,
+        stall_recovery_s: float = 1.5,
     ) -> None:
         super().__init__(daemon=True, name="safety-watchdog")
         self.events = events
@@ -48,21 +49,37 @@ class SafetyWatchdog(threading.Thread):
         self.ring = ring
         self.interval_s = interval_s
         self.stall_timeout_s = stall_timeout_s
+        # DEEP-FIX: frames must advance for this long before a stall-induced
+        # pause is lifted, so a flapping capture source cannot oscillate
+        # between paused and running.
+        self.stall_recovery_s = max(0.0, float(stall_recovery_s))
         self.on_status = on_status
-        self._stop = threading.Event()
+        # DEEP-FIX: this was `self._stop = threading.Event()`.  CPython's
+        # threading.Thread defines an *internal method* named `_stop`, and
+        # assigning an attribute with that name shadows it.  When join()
+        # finished, Thread._wait_for_tstate_lock() called `self._stop()`
+        # and raised `TypeError: 'Event' object is not callable`, killing
+        # the actor-worker process with a traceback on every shutdown.
+        # The exception escaped the main flow entirely -- it happened in
+        # the child process's _bootstrap, after our own logging had
+        # already reported a clean exit -- which is why a green test
+        # suite and a clean-looking log coexisted with a crash.
+        self._stop_event = threading.Event()
         self._last_frame_id = -1
         self._last_progress_ts = time.monotonic()
         self._focus_loss_reported = False
+        self._stall_paused = False
+        self._frames_resumed_since: Optional[float] = None
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
         LOGGER.info("watchdog running (interval=%.2fs)", self.interval_s)
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():  # DEEP-FIX: renamed, see __init__
             try:
                 self._check_once()
             except Exception as exc:
                 LOGGER.error("watchdog check failed:\n%s", format_exception(exc))
-            self._stop.wait(self.interval_s)
+            self._stop_event.wait(self.interval_s)
         LOGGER.info("watchdog stopped")
 
     def _check_once(self) -> None:
@@ -88,11 +105,18 @@ class SafetyWatchdog(threading.Thread):
             if fid != self._last_frame_id:
                 self._last_frame_id = fid
                 self._last_progress_ts = time.monotonic()
+                self._maybe_resume_after_stall()
             elif time.monotonic() - self._last_progress_ts > self.stall_timeout_s:
                 self._intervene(
                     "capture_stall",
                     f"No new frames for {self.stall_timeout_s:.0f}s — pausing",
                 )
+                # DEEP-FIX: remember that WE set this pause.  The old code
+                # latched events["pause"] forever: a single 2 s Chrome hiccup
+                # stopped the run permanently and only a human clicking
+                # Pause/Resume in the GUI could bring it back.
+                self._stall_paused = True
+                self._frames_resumed_since = None
                 self._last_progress_ts = time.monotonic()
                 return
         # 6. Browser focus (best effort; None = cannot verify).
@@ -108,6 +132,31 @@ class SafetyWatchdog(threading.Thread):
         stuck = self.input.stuck_keys()
         if stuck:
             self._intervene("stuck_keys", f"keys held too long: {stuck}")
+
+    def _maybe_resume_after_stall(self) -> None:
+        """Lift a stall-induced pause once frames have been flowing again.
+
+        Only ever clears a pause that this watchdog set (``_stall_paused``);
+        a pause requested by the user through the GUI is never touched.
+        """
+        if not self._stall_paused:
+            self._frames_resumed_since = None
+            return
+        now = time.monotonic()
+        if self._frames_resumed_since is None:
+            self._frames_resumed_since = now
+            return
+        if now - self._frames_resumed_since < self.stall_recovery_s:
+            return
+        self._stall_paused = False
+        self._frames_resumed_since = None
+        self.events["pause"].clear()
+        LOGGER.info("capture recovered — clearing the stall pause")
+        put_bounded(self.metrics_q, {
+            "type": "watchdog", "tag": "capture_resumed",
+            "msg": "capture is producing frames again — resuming",
+            "released": 0, "shutdown": False,
+        })
 
     def _intervene(self, tag: str, message: str, shutdown: bool = False) -> None:
         released = self.input.release_all(tag)
@@ -127,7 +176,7 @@ class SafetyWatchdog(threading.Thread):
                 LOGGER.error("on_status callback failed: %s", exc)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
 
 class EmergencyHotkey:

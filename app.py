@@ -23,6 +23,8 @@ CLI examples:
 from __future__ import annotations
 
 import argparse
+
+from version import banner
 import multiprocessing as mp
 import sys
 import time
@@ -38,7 +40,14 @@ from ipc import (
     bounded_queue,
     make_events,
 )
-from logging_utils import drain, format_exception, get_logger, setup_logging
+from logging_utils import (
+    close_queue_safely,
+    drain,
+    format_exception,
+    get_logger,
+    quarantine_queue,
+    setup_logging,
+)
 from models import PROFILES, weight_size_for_profile
 
 LOGGER = get_logger("app")
@@ -92,8 +101,16 @@ class BotApplication:
         return SharedFrameRing(self.cfg.capture.ring_slots, h, w, 3)
 
     # ------------------------------------------------------------------ #
-    def start(self, with_learner: bool = True, with_capture: bool = True) -> None:
-        """Spawn capture, actor and (optionally) learner processes."""
+    def start(self, with_learner: bool = True, with_capture: bool = True,
+              with_actor: bool = True) -> None:
+        """Spawn capture, actor and (optionally) learner processes.
+
+        # DEEP-FIX: demo recording used to call start(with_learner=False) but the
+        # actor was started unconditionally, so the actor kept pressing keys and
+        # the game character moved BY ITSELF while the user was trying to record
+        # their own play.  with_actor=False starts capture only (the recorder
+        # just reads the ring), so recording no longer drives the game.
+        """
         if self._started:
             return
         self._started = True
@@ -105,14 +122,15 @@ class BotApplication:
                       self.action_q, str(self.cfg.paths.logs_dir)),
             )
             self.capture_proc.start()
-        self.actor_proc = CTX.Process(
-            target=self._actor_entry, name="actor-worker",
-            args=(self.cfg, self.ring, self.events, self.transition_q,
-                  self.metrics_q, self.shared_weights, self.counters,
-                  self.input_backend, self.action_q, self.cfg.seed,
-                  str(self.cfg.paths.logs_dir)),
-        )
-        self.actor_proc.start()
+        if with_actor:
+            self.actor_proc = CTX.Process(
+                target=self._actor_entry, name="actor-worker",
+                args=(self.cfg, self.ring, self.events, self.transition_q,
+                      self.metrics_q, self.shared_weights, self.counters,
+                      self.input_backend, self.action_q, self.cfg.seed,
+                      str(self.cfg.paths.logs_dir), self.cmd_q),
+            )
+            self.actor_proc.start()
         if with_learner:
             self.learner_proc = CTX.Process(
                 target=self._learner_entry, name="learner-worker",
@@ -124,7 +142,8 @@ class BotApplication:
             )
             self.learner_proc.start()
         LOGGER.info("workers started (capture=%s actor=%s learner=%s)",
-                    self.capture_proc is not None, True, self.learner_proc is not None)
+                    self.capture_proc is not None, self.actor_proc is not None,
+                    self.learner_proc is not None)
 
     # static entry wrappers keep spawn-pickling trivial ------------------ #
     @staticmethod
@@ -135,7 +154,8 @@ class BotApplication:
 
     @staticmethod
     def _actor_entry(cfg, ring, events, transition_q, metrics_q, shared_weights,
-                     counters, input_backend, action_q, seed, log_dir) -> None:
+                     counters, input_backend, action_q, seed, log_dir,
+                     cmd_q=None) -> None:
         from environment import BotActor
         from safety_watchdog import SafetyWatchdog
 
@@ -144,7 +164,8 @@ class BotApplication:
 
         set_cpu_threads(1)
         actor = BotActor(cfg, ring, events, transition_q, metrics_q,
-                         shared_weights, counters, input_backend, action_q, seed)
+                         shared_weights, counters, input_backend, action_q, seed,
+                         cmd_q=cmd_q)
         # Independent safety layer inside the actor process: emergency stop,
         # focus loss, capture stalls and stuck keys — all with authority over
         # the learner's pause event.
@@ -194,7 +215,9 @@ class BotApplication:
         }
 
     def drain_metrics(self, limit: int = 256) -> list[dict]:
-        return drain(self.metrics_q, limit)
+        # DEEP-FIX: timeout-guarded.  This runs on the Tk polling path, so a
+        # queue poisoned by a killed worker used to freeze the whole GUI.
+        return drain(self.metrics_q, limit, timeout_s=1.0)
 
     # ------------------------------------------------------------------ #
     def shutdown(self, timeout_s: float = 12.0) -> None:
@@ -220,14 +243,38 @@ class BotApplication:
                 LOGGER.error("%s did not exit in time; terminating", name)
                 proc.terminate()
                 proc.join(timeout=2.0)
+                # DEEP-FIX: a terminated worker may have left a half-written
+                # message in a queue it could write to.  Quarantine exactly
+                # those queues before the final drain, or the drain blocks
+                # forever inside Connection._recv().  Quarantining all four
+                # unconditionally would also throw away healthy channels
+                # (e.g. killing the capture worker does not corrupt the
+                # transition queue, which only the actor writes).
+                for q in self._queues_written_by(name):
+                    quarantine_queue(q, f"{name} worker was terminated")
         # final drain so buffered metrics/logs are not lost
         self._drain_all_queues()
+        for q in (self.metrics_q, self.transition_q, self.cmd_q, self.action_q):
+            close_queue_safely(q)
         self._started = False
         LOGGER.info("shutdown complete")
 
+    def _queues_written_by(self, worker: str) -> list:
+        """Queues a given worker can put() into (see start() wiring)."""
+        writers = {
+            "capture": [self.metrics_q],
+            "actor": [self.metrics_q, self.transition_q, self.action_q,
+                      self.cmd_q],
+            "learner": [self.metrics_q],
+        }
+        return writers.get(worker, [self.metrics_q, self.transition_q,
+                                    self.action_q, self.cmd_q])
+
     def _drain_all_queues(self) -> None:
+        # DEEP-FIX: timeout-guarded, and any queue that cannot be read is
+        # quarantined so the next pass skips it instead of blocking again.
         for q in (self.metrics_q, self.transition_q, self.cmd_q, self.action_q):
-            drain(q, limit=256)
+            drain(q, limit=256, timeout_s=1.0)
 
     # ------------------------------------------------------------------ #
     # Headless run (CI smoke test / profiling)
@@ -366,6 +413,7 @@ def cmd_pretrain_headless(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    print(banner(), flush=True)  # DEEP-FIX: show build at startup
     parser = argparse.ArgumentParser(
         prog="app.py", description="Subway Surfers research bot (screen-capture only)"
     )

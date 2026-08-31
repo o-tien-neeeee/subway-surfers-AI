@@ -105,7 +105,17 @@ class InputController:
     ) -> None:
         self.cfg = cfg
         self.now = now
-        self.backend_name = backend
+        # DEEP-FIX: this used to be `self.backend_name = backend`, i.e. the
+        # *request*, not the answer.  With backend="auto" and pynput working,
+        # it stayed the literal "auto" forever -- a value that is not one of
+        # the three backends.  Nothing in the app read the field except two
+        # `== "dry_run"` comparisons, which happened to give the right answer
+        # anyway, so the half-maintained diagnostic never showed a symptom
+        # until a test finally read it.  _make_backend() now assigns the
+        # resolved name on every path; this seed exists only so the attribute
+        # is bound before that call runs.
+        self.backend_name = "unresolved"
+        self.requested_backend = backend
         self._lock = threading.Lock()
         self._pressed: dict[str, tuple[float, object]] = {}  # key -> (since, keyobj)
         self._release_at: list[tuple[float, str]] = []
@@ -124,14 +134,39 @@ class InputController:
         self._guardian.start()
 
     # ------------------------------------------------------------------ #
+    #: Values accepted for the `backend` argument.  Anything else is a config
+    #: typo and must fail loudly rather than silently picking a different
+    #: backend.
+    KNOWN_BACKENDS = ("auto", "dry_run", "pynput")
+
     def _make_backend(self, backend: str, keymap: dict[int, str]):
+        """Build the backend and record which one actually went live.
+
+        DEEP-FIX: every return path now sets ``self.backend_name`` to the
+        concrete backend, so the field is always one of ``KNOWN_BACKENDS``.
+        Previously only the degradation branch wrote it.
+        """
+        # DEEP-FIX: validate the request.  The author assumed `backend` was one
+        # of the three known values, but an unknown string (a typo such as
+        # "pynpt", or "pyautogui" from an old config) fell through to the `auto`
+        # branch and silently started pressing real keys under a name the user
+        # never asked for.
+        if backend not in self.KNOWN_BACKENDS:
+            raise ValueError(
+                f"unknown input backend {backend!r}; "
+                f"expected one of {', '.join(self.KNOWN_BACKENDS)}"
+            )
         if backend == "dry_run":
+            self.backend_name = "dry_run"
             return _DryRunBackend(keymap)
         if backend == "pynput":
+            # Explicit choice: do not degrade.  If it cannot start, that is a
+            # real error the caller asked for, and _PynputBackend raises.
+            self.backend_name = "pynput"
             return _PynputBackend(keymap)
         # auto: try real input, degrade to dry-run with a logged warning.
         try:
-            return _PynputBackend(keymap)
+            live = _PynputBackend(keymap)
         except Exception as exc:
             LOGGER.warning(
                 "pynput backend unavailable (%s: %s); falling back to dry_run — "
@@ -139,6 +174,21 @@ class InputController:
             )
             self.backend_name = "dry_run"
             return _DryRunBackend(keymap)
+        # DEEP-FIX: the success path is the one that was missing.  Without it
+        # backend_name stayed "auto".
+        self.backend_name = "pynput"
+        LOGGER.info("input backend resolved: pynput (real keys will be pressed)")
+        return live
+
+    @property
+    def is_dry_run(self) -> bool:
+        """True when no real key will ever be pressed.
+
+        DEEP-FIX: the two `self.backend_name == "dry_run"` call sites in
+        click()/browser_focused() now go through this, so the sentinel string
+        lives in exactly one place.
+        """
+        return self.backend_name == "dry_run"
 
     # ------------------------------------------------------------------ #
     # Gameplay keys
@@ -258,7 +308,7 @@ class InputController:
     # ------------------------------------------------------------------ #
     def click(self, x: int, y: int, confirm_focus: bool = True) -> bool:
         """Left-click at absolute screen coords (respawn button)."""
-        if self.backend_name == "dry_run":
+        if self.is_dry_run:  # DEEP-FIX: was a magic string compare
             LOGGER.info("dry-run click at (%d, %d)", x, y)
             return True
         try:
@@ -277,7 +327,7 @@ class InputController:
 
     def browser_focused(self) -> Optional[bool]:
         """True/False when detectable; None when the platform can't tell."""
-        if self.backend_name == "dry_run":
+        if self.is_dry_run:  # DEEP-FIX: was a magic string compare
             return None
         try:
             import pyautogui  # lazy; needs a display on Linux

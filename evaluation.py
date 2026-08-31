@@ -14,7 +14,11 @@ Rules enforced here:
 
 from __future__ import annotations
 
+import dataclasses
 import json
+
+from version import APP_VERSION
+import logging
 import math
 import random
 import time
@@ -196,12 +200,25 @@ class EvaluationReport:
                 for k in ("survival_s", "total_reward", "score", "fps",
                           "action_latency_p95_ms")
             },
-            "failure_modes": self.failure_modes(),
+            # DEEP-FIX: the headline number is the evaluation set only; the
+            # mixed-population count is kept alongside it so no information
+            # is lost from older reports.
+            "failure_modes": self.failure_modes(kinds=("eval",)),
+            "failure_modes_all": self.failure_modes(),
         }
 
-    def failure_modes(self) -> dict[str, int]:
+    def failure_modes(self, kinds: Optional[tuple[str, ...]] = None) -> dict[str, int]:
+        """Count failure signatures.
+
+        # DEEP-FIX: this iterated EVERY record, mixing training episodes,
+        # evaluation episodes and the human baseline into one count, so the
+        # number labelled "early_death_lt_5s" in the report was not a
+        # statement about the policy under evaluation at all.
+        """
         modes: dict[str, int] = {}
-        for r in self.records:
+        records = (self.records if kinds is None
+                   else [r for r in self.records if r.kind in kinds])
+        for r in records:
             if r.survival_s < 5.0:
                 modes["early_death_lt_5s"] = modes.get("early_death_lt_5s", 0) + 1
             if r.action_latency_p95_ms > 100.0:
@@ -337,6 +354,7 @@ class EvaluationReport:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "app_version": APP_VERSION,   # DEEP-FIX: reports are self-describing
             "summary": self.summary(),
             "verdict": self.verdict(),
             "records": [asdict(r) for r in self.records],
@@ -348,10 +366,35 @@ class EvaluationReport:
 
     @classmethod
     def load(cls, path: str | Path) -> "EvaluationReport":
+        """Load a saved report, tolerating schema drift between versions.
+
+        # DEEP-FIX: ``EpisodeRecord(**r)`` raised TypeError on any unknown or
+        # missing key, and ``merge_baseline`` only caught (OSError,
+        # ValueError) -- so ``app.py --compare-baseline`` against a report
+        # written by an older build crashed the whole evaluation run instead
+        # of skipping one record.
+        """
         rep = cls()
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        known = {f.name for f in dataclasses.fields(EpisodeRecord)}
+        skipped = 0
         for r in data.get("records", []):
-            rep.add(EpisodeRecord(**r))
+            if not isinstance(r, dict):
+                skipped += 1
+                continue
+            clean = {k: v for k, v in r.items() if k in known}
+            missing = {f.name: f.default for f in dataclasses.fields(EpisodeRecord)
+                       if f.default is not dataclasses.MISSING
+                       and f.name not in clean}
+            try:
+                rep.add(EpisodeRecord(**{**missing, **clean}))
+            except TypeError as exc:
+                skipped += 1
+                logging.getLogger("ssbot.evaluation").warning(
+                    "skipping an unreadable episode record (%s)", exc)
+        if skipped:
+            logging.getLogger("ssbot.evaluation").warning(
+                "%s: skipped %d unreadable record(s)", path, skipped)
         return rep
 
     def merge_baseline(self, path: str | Path,
