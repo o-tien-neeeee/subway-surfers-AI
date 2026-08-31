@@ -21,11 +21,12 @@ schema, not the build, and must not be conflated with this one.
 """
 
 #: Bump on every behavioural change.  Format: MAJOR.MINOR.PATCH
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.0"
 
 #: Human-readable notes for the current build, newest first.  Kept short on
 #: purpose — the full reasoning lives in DEEP_FIX_REPORT.md.
 CHANGELOG = [
+    "1.11.0 — quay demo KHÔNG còn tự di chuyển: recording chỉ chạy capture (with_actor=False), actor bấm phím không bị khởi động; dừng demo thì tắt app để Start train lại được.",
     "1.10.1 — log rõ từng trạng thái của quay demo (bắt đầu/tiến trình/dừng, hook bàn phím) và tiền-huấn luyện BC (bắt đầu/kiểm tra demo/mỗi epoch/hoàn tất hoặc bỏ qua) ra khung log GUI.",
     "1.10.0 — quay demo: F9 dừng THẬT (global hotkey), lớp phủ trực quan ● REC + hành động + vùng 84×84, sửa action ma (held-key set + chặn modifier + tự xoá phím kẹt); chẩn đoán bot chết-ngay liên tiếp.",
     "1.9.1 — tab Hướng dẫn bổ sung mục QUAY DEMO và TIỀN-HUẤN LUYỆN BC (giải thích + cách dùng).",

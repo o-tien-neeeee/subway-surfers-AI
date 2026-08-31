@@ -1544,3 +1544,34 @@ class TestExplicitStateLogging:
         assert src.count('BC: đang kiểm tra demo') == 1
         assert 'episode hợp lệ' in src
         assert 'BC: hoàn tất' in src
+
+
+# --------------------------------------------------------------------- #
+# 24. Demo recording must NOT drive the game (capture-only)
+# --------------------------------------------------------------------- #
+class TestDemoDoesNotSelfPlay:
+    """The user saw the character move BY ITSELF during demo recording: the
+    actor (which presses keys) was started even though only capture is needed.
+    Recording must be capture-only, and the lifecycle must let training start
+    afterwards."""
+
+    def test_app_start_can_skip_actor(self) -> None:
+        import inspect
+        from app import BotApplication
+        sig = inspect.signature(BotApplication.start)
+        assert "with_actor" in sig.parameters
+        assert sig.parameters["with_actor"].default is True
+
+    def test_demo_recording_starts_capture_only(self) -> None:
+        src = (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+        assert "with_learner=False, with_actor=False" in src, (
+            "demo recording must not start the key-pressing actor")
+
+    def test_demo_stop_releases_app_for_training(self) -> None:
+        src = (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+        assert "_demo_started_app" in src
+        assert "self.app.shutdown()" in src
+        # the actor-died warning must be scoped to runs that have an actor
+        assert 'getattr(self.app, "actor_proc", None) is not None' in src

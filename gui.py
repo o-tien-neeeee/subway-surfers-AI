@@ -345,6 +345,8 @@ class ControlGUI:
         self._demo_hotkey: Optional[Any] = None
         self._demo_stop_req = threading.Event()
         self._demo_t0 = 0.0
+        self._demo_started_app = False
+        self._demo_last_log_t = 0.0
         self._build()
         self.root.after(self.POLL_MS, self._tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1077,11 +1079,14 @@ class ControlGUI:
         from demonstration_recorder import DemoRecorder
         from ipc import SharedFrameRing
 
+        self._demo_started_app = self.app is None
         if self.app is None:
             from app import BotApplication
 
             self.app = BotApplication(self.cfg)
-            self.app.start(with_learner=False)
+            # DEEP-FIX: capture only — NO actor.  The actor presses keys, so
+            # starting it made the character move by itself during recording.
+            self.app.start(with_learner=False, with_actor=False)
         # recorder reads the shared ring (latest frame wins)
         ring: Optional[SharedFrameRing] = self.app.ring if self.app else None
 
@@ -1129,6 +1134,15 @@ class ControlGUI:
         self.btn_demo.configure(text="● Quay demo (F9 dừng)")
         self._set_state(BotState.READY)
         self.log("=== DỪNG QUAY DEMO ===")
+        # DEEP-FIX: demo recording started a capture-only app; shut it down so
+        # start_training() (which refuses when self.app is set) can run again.
+        if getattr(self, "_demo_started_app", False) and self.app is not None:
+            try:
+                self.app.shutdown()
+            except Exception as exc:
+                self.log(f"dừng capture demo lỗi: {type(exc).__name__}: {exc}")
+            self.app = None
+            self._demo_started_app = False
         if path:
             self.status_var.set(f"Demo saved: {path}")
             self.log(f"đã lưu: {path}")
@@ -1305,7 +1319,7 @@ class ControlGUI:
             self.app.pause()
             self._set_state(BotState.PAUSED)
             self.status_var.set("Learner sập — tạm dừng chơi. Xem log.")
-        if not alive["actor"]:
+        if not alive["actor"] and getattr(self.app, "actor_proc", None) is not None:
             # DEEP-FIX: this branch had no state guard, so after an actor
             # crash it fired on every 150 ms tick forever (~7 identical log
             # lines per second, and the status strip was rewritten just as

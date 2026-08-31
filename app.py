@@ -101,8 +101,16 @@ class BotApplication:
         return SharedFrameRing(self.cfg.capture.ring_slots, h, w, 3)
 
     # ------------------------------------------------------------------ #
-    def start(self, with_learner: bool = True, with_capture: bool = True) -> None:
-        """Spawn capture, actor and (optionally) learner processes."""
+    def start(self, with_learner: bool = True, with_capture: bool = True,
+              with_actor: bool = True) -> None:
+        """Spawn capture, actor and (optionally) learner processes.
+
+        # DEEP-FIX: demo recording used to call start(with_learner=False) but the
+        # actor was started unconditionally, so the actor kept pressing keys and
+        # the game character moved BY ITSELF while the user was trying to record
+        # their own play.  with_actor=False starts capture only (the recorder
+        # just reads the ring), so recording no longer drives the game.
+        """
         if self._started:
             return
         self._started = True
@@ -114,14 +122,15 @@ class BotApplication:
                       self.action_q, str(self.cfg.paths.logs_dir)),
             )
             self.capture_proc.start()
-        self.actor_proc = CTX.Process(
-            target=self._actor_entry, name="actor-worker",
-            args=(self.cfg, self.ring, self.events, self.transition_q,
-                  self.metrics_q, self.shared_weights, self.counters,
-                  self.input_backend, self.action_q, self.cfg.seed,
-                  str(self.cfg.paths.logs_dir), self.cmd_q),
-        )
-        self.actor_proc.start()
+        if with_actor:
+            self.actor_proc = CTX.Process(
+                target=self._actor_entry, name="actor-worker",
+                args=(self.cfg, self.ring, self.events, self.transition_q,
+                      self.metrics_q, self.shared_weights, self.counters,
+                      self.input_backend, self.action_q, self.cfg.seed,
+                      str(self.cfg.paths.logs_dir), self.cmd_q),
+            )
+            self.actor_proc.start()
         if with_learner:
             self.learner_proc = CTX.Process(
                 target=self._learner_entry, name="learner-worker",
@@ -133,7 +142,8 @@ class BotApplication:
             )
             self.learner_proc.start()
         LOGGER.info("workers started (capture=%s actor=%s learner=%s)",
-                    self.capture_proc is not None, True, self.learner_proc is not None)
+                    self.capture_proc is not None, self.actor_proc is not None,
+                    self.learner_proc is not None)
 
     # static entry wrappers keep spawn-pickling trivial ------------------ #
     @staticmethod
