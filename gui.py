@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from config import BotConfig
 from logging_utils import get_logger, setup_logging
+from metrics import summarize_learning_progress
 from states import BotState, InvalidTransitionError, StateMachine
 
 LOGGER = get_logger("gui")
@@ -347,6 +348,7 @@ class ControlGUI:
         self._demo_t0 = 0.0
         self._demo_started_app = False
         self._demo_last_log_t = 0.0
+        self._ep_survival_history: list[float] = []
         self._build()
         self.root.after(self.POLL_MS, self._tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1273,9 +1275,19 @@ class ControlGUI:
                 self.status_var.set(f"Watchdog: {msg.get('msg')}")
             elif kind == "episode_end":
                 d = msg.get("data", {})
+                surv = float(d.get("survival_s", 0))
                 self.log(f"episode {d.get('episode_id')} ended ({msg.get('reason')}: "
-                         f"{d.get('survival_s', 0):.1f}s, reward {d.get('total_reward', 0):.1f})")
+                         f"{surv:.1f}s, reward {d.get('total_reward', 0):.1f})")
                 self.metric_vars["episode_id"].set(str(d.get("episode_id", "—")))
+                # DEEP-FIX: make learning progress observable (every 10 eps).
+                self._ep_survival_history.append(surv)
+                try:
+                    eps = float(self.metric_vars["epsilon"].get())
+                except (ValueError, tk.TclError):
+                    eps = None
+                line = summarize_learning_progress(self._ep_survival_history, eps)
+                if line:
+                    self.log(line)
         from metrics import system_usage
 
         u = system_usage()

@@ -1655,3 +1655,39 @@ class TestDemoAutoSplitOnDeath:
         # last kept frame must be at least ~3.5s before the final alive frame
         assert last_ts <= (n_alive - 1) / 30.0 - 3.5 + 1e-6
         rec.stop(done=False)
+
+
+# --------------------------------------------------------------------- #
+# 26. Learning progress must be observable
+# --------------------------------------------------------------------- #
+class TestLearningProgressVisible:
+    """'AI không tiến triển' was partly a visibility problem: there was no way
+    to see whether survival was actually rising.  summarize_learning_progress
+    turns the episode history into a plain-language trend."""
+
+    def test_silent_until_ten_episodes(self) -> None:
+        from metrics import summarize_learning_progress as f
+        assert f([1.0] * 9) is None
+        assert f([]) is None
+
+    def test_first_summary_at_ten(self) -> None:
+        from metrics import summarize_learning_progress as f
+        line = f([2.0] * 10)
+        assert line and "TIẾN TRÌNH HỌC" in line and "2.0s" in line
+
+    def test_trend_direction(self) -> None:
+        from metrics import summarize_learning_progress as f
+        assert "TIẾN BỘ" in f([1.0] * 10 + [6.0] * 10)
+        assert "thụt lùi" in f([6.0] * 10 + [1.0] * 10)
+        assert "chững" in f([3.0] * 20)
+
+    def test_epsilon_included_when_known(self) -> None:
+        from metrics import summarize_learning_progress as f
+        assert "epsilon=0.42" in f([1.0] * 10, epsilon=0.42)
+
+    def test_gui_wires_the_trend(self) -> None:
+        src = (Path(__file__).resolve().parent.parent / "gui.py") \
+            .read_text(encoding="utf-8")
+        assert "from metrics import summarize_learning_progress" in src
+        assert "_ep_survival_history.append(surv)" in src
+        assert "summarize_learning_progress(self._ep_survival_history" in src

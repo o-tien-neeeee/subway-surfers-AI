@@ -21,11 +21,12 @@ schema, not the build, and must not be conflated with this one.
 """
 
 #: Bump on every behavioural change.  Format: MAJOR.MINOR.PATCH
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.13.0"
 
 #: Human-readable notes for the current build, newest first.  Kept short on
 #: purpose — the full reasoning lives in DEEP_FIX_REPORT.md.
 CHANGELOG = [
+    "1.13.0 — audit toàn bộ máy học (Double DQN/PER/n-step/reward/observation): thuật toán vững; thêm log TIẾN TRÌNH HỌC mỗi 10 episode (survival TB ↑/→/↓ + epsilon) để thấy AI có đang học thật không.",
     "1.12.1 — khi chết, CẮT BỎ ~3.5s cuối episode (lúc loạng choạng/di chuyển lỗi) để AI không bắt chước; khung chết không bao giờ được ghi (sửa mốc cắt).",
     "1.12.0 — quay demo TỰ ĐỘNG tách episode khi chết (mỗi mạng = 1 file, done=True đúng khung chết), bỏ qua màn thua/hồi sinh để episode mới bắt đầu khi sống; cần neo chết đã hiệu chuẩn.",
     "1.11.0 — quay demo KHÔNG còn tự di chuyển: recording chỉ chạy capture (with_actor=False), actor bấm phím không bị khởi động; dừng demo thì tắt app để Start train lại được.",
