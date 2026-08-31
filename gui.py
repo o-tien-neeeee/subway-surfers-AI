@@ -993,15 +993,27 @@ class ControlGUI:
             self.status_var.set(f"Failed to start: {exc}")
             self.log(f"start failed: {exc}")
             return
+        # DEEP-FIX (BC-first): pause the actor BEFORE it spawns so it does not
+        # play — and waste episodes dying randomly — while behaviour cloning
+        # runs.  The learner uses a separate pause_learning event, so it is
+        # unaffected and runs BC now; _on_pretrain_done resumes the actor only
+        # once BC has fully finished.  (pause() works before start() because
+        # self.events is built in BotApplication.__init__.)
+        self.app.pause()
         self.app.start(with_learner=True)
         from safety_watchdog import EmergencyHotkey
 
         self.hotkey = EmergencyHotkey(self.cfg.emergency_hotkey, self.app.events)
-        self._set_state(BotState.RUNNING)
-        self.btn_pause.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.NORMAL)
-        self.status_var.set("Đã bắt đầu train. F8 = dừng khẩn cấp.")
-        self.log("training started")
+        # Gate training on BC: run BC first, then release the actor.
+        self._start_after_bc = True
+        self._set_state(BotState.PRETRAINING)
+        self.app.command("pretrain", demos_dir=str(self.cfg.paths.demos_dir),
+                         force=False)
+        self.status_var.set("Đang chạy BC trước khi train… (actor tạm dừng). F8 = dừng.")
+        self.log("=== BC HOÀN TẤT RỒI MỚI TRAIN ===")
+        self.log("actor tạm dừng trong lúc BC; xong BC sẽ tự chơi bằng policy đã học "
+                 "(không phí episode chơi ngẫu nhiên).")
 
     def pause_training(self) -> None:
         if self.app is None:
@@ -1175,7 +1187,11 @@ class ControlGUI:
             return
         self._pre_pretrain_state = self.sm.state
         self._set_state(BotState.PRETRAINING)
-        self.app.command("pretrain", demos_dir=str(self.cfg.paths.demos_dir))
+        # force=True: the manual button must re-run BC even if a BC policy
+        # already exists (the automatic BC-first gate uses force=False so it
+        # does not overwrite RL progress).
+        self.app.command("pretrain", demos_dir=str(self.cfg.paths.demos_dir),
+                         force=True)
         # DEEP-FIX: log rõ để người dùng biết BC đang chạy (trước đây im lặng).
         self.log("=== BẮT ĐẦU TIỀN-HUẤN LUYỆN (BC) ===")
         self.log(f"thư mục demos: {self.cfg.paths.demos_dir}")
@@ -1317,6 +1333,10 @@ class ControlGUI:
                      f"{self.cfg.rl.epsilon_after_bc:.2f}) thay vì chơi ngẫu "
                      f"nhiên — bot sẽ sống lâu hơn và học tiếp từ đó.")
             self.status_var.set("Tiền-huấn luyện xong. Sẵn sàng train.")
+        elif status == "already_done":
+            self.log("=== BC ĐÃ CÓ SẴN (bỏ qua, không ghi đè tiến trình RL) ===")
+            self.log("checkpoint đã có policy BC — actor sẽ dùng ngay policy đó.")
+            self.status_var.set("BC đã có sẵn. Sẵn sàng train.")
         else:
             self.log("=== TIỀN-HUẤN LUYỆN BỎ QUA ===")
             self.log(f"lý do: {res.get('reason', 'không rõ')} — cần >= "
@@ -1325,12 +1345,38 @@ class ControlGUI:
             self.log("hãy quay demo (chơi thật) rồi bấm Tiền-huấn luyện lại; "
                      "train RL vẫn chạy bình thường không cần BC.")
             self.status_var.set("BC bỏ qua (thiếu demo hợp lệ). Xem log.")
+        # DEEP-FIX (BC-first): if this BC was the pre-train gate, BC has now
+        # fully finished — release the actor (paused during BC so it did not
+        # waste episodes playing randomly) and switch to RUNNING.
+        if getattr(self, "_start_after_bc", False):
+            self._start_after_bc = False
+            self._launch_actor_after_bc()
+            return
         # restore the control state so the UI is not stuck in PRETRAINING
         target = getattr(self, "_pre_pretrain_state", BotState.READY)
         try:
             self._set_state(target)
         except InvalidTransitionError:
             self._set_state(BotState.READY)
+
+    def _launch_actor_after_bc(self) -> None:
+        """BC finished: resume the actor (paused during BC) and go RUNNING.
+
+        This is the second half of the BC-first flow started in
+        ``start_training`` — the actor only begins playing once behaviour
+        cloning is complete, so it drives with the learned policy instead of
+        burning episodes at epsilon~1.
+        """
+        if self.app is None:
+            self._set_state(BotState.READY)
+            return
+        self.app.resume()  # clears events["pause"]; the actor starts playing
+        self._set_state(BotState.RUNNING)
+        self.btn_pause.configure(state=tk.NORMAL)
+        self.btn_stop.configure(state=tk.NORMAL)
+        self.status_var.set("BC xong — actor BẮT ĐẦU CHƠI bằng policy đã học. F8 = dừng.")
+        self.log("✅ BC hoàn tất → actor bắt đầu chơi (epsilon ≤ "
+                 f"{self.cfg.rl.epsilon_after_bc:.2f} nếu có BC).")
 
     def _show_error(self, msg: dict) -> None:
         self.status_var.set(f"ERROR in {msg.get('src')}: {msg.get('error')}")

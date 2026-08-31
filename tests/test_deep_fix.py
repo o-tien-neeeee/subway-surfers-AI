@@ -1800,3 +1800,41 @@ class TestBcPolicySurvivesRestart:
         l, c = self._fresh(str(tmp_path / "empty"))
         assert l.bc_done is False
         assert float(c.bc_pretrained.value) == 0.0
+
+
+class TestBcFirstGating:
+    """Round 18: BC must fully finish before training, and re-running BC must
+    not silently overwrite RL progress."""
+
+    def _learner(self, tmp_path):
+        from queue import Queue
+        from config import BotConfig
+        from ipc import SharedCounters, SharedWeights
+        from learner_worker import Learner
+        from models import weight_size_for_profile
+        cfg = BotConfig()
+        cfg.paths.checkpoints_dir = str(tmp_path / "ckpt")
+        weights = SharedWeights(weight_size_for_profile(
+            "quality_cpu", cfg.perception.frame_stack))
+        counters = SharedCounters()
+        return Learner(cfg, weights, counters, Queue(), str(tmp_path / "ckpt"))
+
+    def test_pretrain_skips_when_bc_done_and_not_forced(self, tmp_path) -> None:
+        learner = self._learner(tmp_path)
+        learner.bc_done = True  # a BC policy already exists
+        res = learner.pretrain(str(tmp_path), force=False)
+        assert res["status"] == "already_done"
+
+    def test_pretrain_force_reruns_even_when_bc_done(self, tmp_path) -> None:
+        learner = self._learner(tmp_path)
+        learner.bc_done = True
+        # force=True must NOT short-circuit; with no demos it falls through to
+        # the normal "skipped" path (proving the guard was bypassed).
+        res = learner.pretrain(str(tmp_path), force=True)
+        assert res["status"] != "already_done"
+
+    def test_epsilon_decay_fast_enough_to_bootstrap_without_bc(self) -> None:
+        from config import RLConfig
+        # was 150_000 (~83 min) -> a no-BC run never left epsilon~0.99 in a
+        # session; 50_000 lets it start exploiting within ~10 min.
+        assert RLConfig().epsilon_decay_frames <= 50_000

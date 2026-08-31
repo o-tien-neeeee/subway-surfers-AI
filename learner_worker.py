@@ -333,8 +333,22 @@ class Learner:
     # ------------------------------------------------------------------ #
     # Behaviour cloning (Phase 1)
     # ------------------------------------------------------------------ #
-    def pretrain(self, demos_dir: str, report=print) -> dict[str, Any]:
+    def pretrain(self, demos_dir: str, report=print,
+                 force: bool = False) -> dict[str, Any]:
         from dataset import DemonstrationDataset, validate_directory
+
+        # DEEP-FIX (BC-first): if behaviour cloning already produced a policy
+        # (this session or restored from a checkpoint), do NOT silently re-run
+        # it — that would overwrite RL progress with a fresh BC policy.  The
+        # GUI's "BC before train" flow calls with force=False; the manual
+        # "Tiền-huấn luyện" button passes force=True.
+        if self.bc_done and not force:
+            msg = ("BC đã chạy trước đó (checkpoint có sẵn) — bỏ qua để không "
+                   "ghi đè tiến trình RL. Bấm nút Tiền-huấn luyện để ép chạy lại.")
+            report(msg)
+            put_bounded(self.metrics_q, {"type": "log", "level": "info",
+                                         "src": "learner", "msg": msg})
+            return {"status": "already_done"}
 
         put_bounded(self.metrics_q, {"type": "log", "level": "info",
                                      "src": "learner",
@@ -471,7 +485,18 @@ def learner_main(
                     learner.set_profile(msg.get("profile", learner.profile))
                     counters.set_profile(learner.profile)
                 elif cmd == "pretrain":
-                    res = learner.pretrain(msg.get("demos_dir", "demos"))
+                    # DEEP-FIX (BC-first): always emit pretrain_done, even on a
+                    # BC error — otherwise the GUI would wait forever and leave
+                    # the actor paused (it is held until BC finishes).
+                    try:
+                        res = learner.pretrain(
+                            msg.get("demos_dir", "demos"),
+                            force=bool(msg.get("force", False)))
+                    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                        res = {"status": "error", "reason": format_exception(exc)}
+                        put_bounded(metrics_q, {
+                            "type": "log", "level": "error", "src": "learner",
+                            "msg": f"BC lỗi: {res['reason']}"})
                     put_bounded(metrics_q, {"type": "pretrain_done", "result": res})
                 elif cmd == "save_buffer":
                     learner.ckpt.buffer_save(learner.buffer)

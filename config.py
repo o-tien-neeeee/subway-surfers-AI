@@ -255,9 +255,16 @@ class RLConfig:
     #: Epsilon decays LINEARLY over `epsilon_decay_frames` ENV frames
     #: (frames observed by the actor), from start to end.  Explicitly NOT
     #: learner updates and NOT action steps.
+    #: DEEP-FIX: was 150_000 (~83 min), so a from-scratch run with no BC stayed
+    #: at epsilon~0.99 for the whole session — 99% random, ignoring whatever the
+    #: Q-net had learned, dying every ~1s and never bootstrapping.  50_000 lets
+    #: the no-BC path start exploiting its improving policy within ~10 min so it
+    #: can actually learn something from random play.  (With BC, exploration is
+    #: capped at epsilon_after_bc regardless, so this only affects the no-BC path
+    #: and the late decay below that cap.)
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay_frames: int = 150_000
+    epsilon_decay_frames: int = 50_000
     #: After behaviour cloning produces a policy, cap exploration at this so
     #: the actor exploits the BC policy instead of playing randomly (the actor
     #: reads SharedCounters.bc_pretrained).  Only used once BC has run.
