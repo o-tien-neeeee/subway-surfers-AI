@@ -72,6 +72,10 @@ class Learner:
         self._publish_every_updates = 20
         self._last_buffer_save_update = 0
         self.bc_history: list[dict[str, Any]] = []
+        # DEEP-FIX: did behaviour cloning ever produce a policy?  Persisted in
+        # every checkpoint so a restart keeps exploiting the BC policy instead
+        # of silently dropping back to epsilon~1 random play.
+        self.bc_done = False
         # -- online best-model tracking (requirement §12) ---------------- #
         # The actor reports each finished episode through SharedCounters;
         # the learner gates best_model.pth on the ROLLING MEAN of the
@@ -117,6 +121,13 @@ class Learner:
                 if bm is not None and np.isfinite(float(bm)):
                     self.ckpt.best_metric = float(bm)
                     self.best_rolling = float(bm)
+                # DEEP-FIX: a BC-pretrained checkpoint must keep driving the
+                # actor after a restart.  Without this, bc_pretrained reset
+                # to 0 on every launch and the actor explored at epsilon~1
+                # again, ignoring the BC policy it had just loaded.
+                if extra.get("bc") is not None or extra.get("bc_done"):
+                    self.bc_done = True
+                    self.counters.bc_pretrained.value = 1.0
                 # DEEP-FIX: actually restore the replay-sampling Generator, so
                 # a resumed run continues the same sampling stream instead of
                 # restarting it from cfg.seed.
@@ -189,6 +200,7 @@ class Learner:
                 "best_metric_name": self.cfg.rl.best_metric,
                 "best_metric_window": list(self._episode_window),
                 "episode_id": done_id,
+                "bc_done": self.bc_done,
             }
             path = self.ckpt.save_model(self.agent.state_payload(), extra,
                                         which="best", metric=rolling,
@@ -310,6 +322,7 @@ class Learner:
             # "reproducible resume" the checkpoint advertises was recording
             # the state of a generator nobody uses.
             "rng": capture_rng_states(seed=self.cfg.seed, generator=self.rng),
+            "bc_done": self.bc_done,
         }
         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
         if self.update_step - self._last_buffer_save_update >= \
@@ -390,10 +403,11 @@ class Learner:
         self.agent.sync_target()
         # DEEP-FIX: tell the actor a good policy now exists so it stops playing
         # randomly (epsilon~1) and exploits the BC policy instead.
+        self.bc_done = True
         self.counters.bc_pretrained.value = 1.0
         self._publish(force=True)
         extra = {"bc": history[-1], "update_step": self.update_step,
-                 "dataset": str(demos_dir)}
+                 "dataset": str(demos_dir), "bc_done": True}
         self.ckpt.save_model(self.agent.state_payload(), extra, which="best",
                              metric=history[-1]["val_acc"], higher_is_better=True)
         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
@@ -403,6 +417,7 @@ class Learner:
     def shutdown_save(self) -> None:
         extra = {"update_step": self.update_step,
                  "buffer_size": self.buffer.size, "shutdown": True,
+                 "bc_done": self.bc_done,
                  "best_metric": self.ckpt.best_metric,
                  "best_metric_name": self.cfg.rl.best_metric,
                  "rng": capture_rng_states(seed=self.cfg.seed, generator=self.rng)}

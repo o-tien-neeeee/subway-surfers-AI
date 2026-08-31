@@ -1,6 +1,6 @@
 # Subway Surfers Research Bot (screen-capture RL agent)
 
-> **Current version / Phiên bản hiện tại: `1.13.2`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
+> **Current version / Phiên bản hiện tại: `1.13.3`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
 
 A personal, **black-box** UI-automation research bot that plays
 [Poki Subway Surfers](https://poki.com/en/g/subway-surfers) using only screen

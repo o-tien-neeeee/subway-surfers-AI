@@ -1758,3 +1758,45 @@ class TestBcAwareEpsilon:
         src = (pathlib.Path(__file__).resolve().parent.parent /
                "learner_worker.py").read_text(encoding="utf-8")
         assert "self.counters.bc_pretrained.value = 1.0" in src
+
+
+class TestBcPolicySurvivesRestart:
+    """Round 17: a BC-pretrained checkpoint must keep driving the actor.
+
+    Without persistence, ``bc_pretrained`` reset to 0 on every launch, so a
+    restart silently dropped back to epsilon~1 random play and ignored the BC
+    policy it had just loaded — the original bug, reintroduced on reboot.
+    """
+
+    def _fresh(self, ckpt_dir):
+        from queue import Queue
+        from config import BotConfig
+        from ipc import SharedCounters, SharedWeights
+        from learner_worker import Learner
+        from models import weight_size_for_profile
+        cfg = BotConfig()
+        cfg.paths.checkpoints_dir = ckpt_dir
+        weights = SharedWeights(weight_size_for_profile(
+            "quality_cpu", cfg.perception.frame_stack))
+        counters = SharedCounters()
+        return Learner(cfg, weights, counters, Queue(), ckpt_dir), counters
+
+    def test_bc_done_survives_restart(self, tmp_path) -> None:
+        ckpt_dir = str(tmp_path / "checkpoints")
+        # first launch: no BC yet -> actor explores normally
+        l1, c1 = self._fresh(ckpt_dir)
+        assert l1.bc_done is False
+        assert float(c1.bc_pretrained.value) == 0.0
+        # simulate a finished BC, then a shutdown save that persists bc_done
+        l1.bc_done = True
+        l1.counters.bc_pretrained.value = 1.0
+        l1.shutdown_save()
+        # restart: a brand-new learner loads the checkpoint and must restore it
+        l2, c2 = self._fresh(ckpt_dir)
+        assert l2.bc_done is True
+        assert float(c2.bc_pretrained.value) == 1.0
+
+    def test_no_checkpoint_means_no_bc_flag(self, tmp_path) -> None:
+        l, c = self._fresh(str(tmp_path / "empty"))
+        assert l.bc_done is False
+        assert float(c.bc_pretrained.value) == 0.0
