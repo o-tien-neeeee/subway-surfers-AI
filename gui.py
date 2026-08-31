@@ -1313,6 +1313,9 @@ class ControlGUI:
                      f"train_acc={float(last.get('train_acc', 0)):.3f}")
             self.log("đã lưu checkpoint best + latest — bot đã biết bắt chước, "
                      "sẵn sàng train RL tiếp.")
+            self.log(f"🎯 từ giờ actor sẽ DÙNG policy BC (epsilon ≤ "
+                     f"{self.cfg.rl.epsilon_after_bc:.2f}) thay vì chơi ngẫu "
+                     f"nhiên — bot sẽ sống lâu hơn và học tiếp từ đó.")
             self.status_var.set("Tiền-huấn luyện xong. Sẵn sàng train.")
         else:
             self.log("=== TIỀN-HUẤN LUYỆN BỎ QUA ===")

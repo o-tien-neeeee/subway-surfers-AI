@@ -292,6 +292,11 @@ class SharedCounters:
         self.td_loss = CTX.Value(ct.c_double, 0.0)
         self.q_mean = CTX.Value(ct.c_double, 0.0)
         self.buffer_size = CTX.Value(ct.c_uint64, 0)
+        # DEEP-FIX: learner sets this after a successful behaviour-cloning run
+        # so the actor stops exploring at epsilon~1.0 and actually uses the
+        # BC policy.  A real run showed 267 episodes stuck at ~1s survival
+        # because epsilon stayed ~0.99 and ignored a 90.8%-accurate BC policy.
+        self.bc_pretrained = CTX.Value(ct.c_double, 0.0)
         self.danger_flag = CTX.Value(ct.c_int, 0)
         self.death_flag = CTX.Value(ct.c_int, 0)
         self.profile = CTX.Array(ct.c_char, 32)  # active profile name
@@ -362,6 +367,7 @@ class SharedCounters:
             "td_loss": float(self.td_loss.value),
             "q_mean": float(self.q_mean.value),
             "buffer_size": int(self.buffer_size.value),
+            "bc_pretrained": float(self.bc_pretrained.value),
             "danger": int(self.danger_flag.value),
             "dead": int(self.death_flag.value),
             "profile": self.get_profile(),

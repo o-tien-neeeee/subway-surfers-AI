@@ -135,6 +135,23 @@ def epsilon_for_frame(frame: int, cfg: RLConfig) -> float:
     return cfg.epsilon_start + frac * (cfg.epsilon_end - cfg.epsilon_start)
 
 
+def effective_epsilon(frame: int, cfg: RLConfig, bc_pretrained: float) -> float:
+    """Exploration rate the actor should use this frame.
+
+    After behaviour cloning produces a policy the actor must actually USE it:
+    exploring at epsilon~1.0 ignores a good BC policy and the bot dies randomly
+    every ~1s (a real 267-episode run never passed ~1.1s survival with epsilon
+    0.99->0.77).  Once ``bc_pretrained`` is set we cap exploration at
+    ``cfg.epsilon_after_bc`` so the BC/learned policy drives the bot, while
+    still decaying below that cap as the normal schedule progresses.  Before BC
+    the normal schedule is used unchanged.
+    """
+    eps = epsilon_for_frame(frame, cfg)
+    if bc_pretrained > 0:
+        eps = min(eps, cfg.epsilon_after_bc)
+    return eps
+
+
 class DoubleDQNAgent:
     """Training-side agent: owns online/target nets, optimizer, losses."""
 

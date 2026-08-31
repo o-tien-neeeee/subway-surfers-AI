@@ -32,7 +32,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from action_scheduler import ActionScheduler, PlannedAction
-from agent import InferencePolicy, epsilon_for_frame
+from agent import InferencePolicy, effective_epsilon
 from config import ACTIONS, BotConfig, NOOP
 from death_detector import ColorAnchorDeathDetector, DeathResult, DeathState, RespawnController
 from horizon_detector import HorizonDetector, HorizonResult
@@ -571,7 +571,11 @@ class BotActor:
     def _decide(self, danger: bool) -> None:
         t0 = time.perf_counter()
         self.policy.refresh_weights(self.shared_weights)
-        eps = epsilon_for_frame(int(self.counters.env_frame_id.value), self.cfg.rl)
+        # DEEP-FIX: effective_epsilon() caps exploration once behaviour cloning
+        # has produced a policy, so the actor actually USES the BC policy instead
+        # of playing randomly at epsilon~1.0 and dying every ~1s.
+        eps = effective_epsilon(int(self.counters.env_frame_id.value),
+                                self.cfg.rl, self.counters.bc_pretrained.value)
         self.counters.epsilon.value = eps
         action = self.policy.act(self.stack.get(), eps)
         self.infer_ms.observe_ms((time.perf_counter() - t0) * 1000.0)

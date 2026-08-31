@@ -21,7 +21,7 @@ schema, not the build, and must not be conflated with this one.
 """
 
 #: Bump on every behavioural change.  Format: MAJOR.MINOR.PATCH
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.13.2"
 
 #: Human-readable notes for the current build, newest first.  Kept short on
 #: purpose — the full reasoning lives in DEEP_FIX_REPORT.md.

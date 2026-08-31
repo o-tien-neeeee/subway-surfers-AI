@@ -258,6 +258,10 @@ class RLConfig:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay_frames: int = 150_000
+    #: After behaviour cloning produces a policy, cap exploration at this so
+    #: the actor exploits the BC policy instead of playing randomly (the actor
+    #: reads SharedCounters.bc_pretrained).  Only used once BC has run.
+    epsilon_after_bc: float = 0.15
     checkpoint_every_updates: int = 500
     torch_threads: int = 1
     #: Which actor-reported episode metric gates best_model.pth during ONLINE

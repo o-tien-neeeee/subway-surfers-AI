@@ -1711,3 +1711,50 @@ class TestReadmeShowsCurrentVersion:
         assert m.group(1) == APP_VERSION, (
             f"README shows {m.group(1)} but APP_VERSION is {APP_VERSION} — "
             "bump the README banner whenever the version changes")
+
+
+class TestBcAwareEpsilon:
+    """Round 17: after behaviour cloning the actor must actually USE the policy.
+
+    A real 267-episode run stayed stuck at ~1.1s survival because epsilon held
+    at ~0.99 and the bot ignored a 90.8%-accurate BC policy, dying randomly
+    every ~1s.  ``effective_epsilon()`` caps exploration once BC has run.
+    """
+
+    def test_rlconfig_has_epsilon_after_bc(self):
+        from config import RLConfig
+        assert RLConfig().epsilon_after_bc == pytest.approx(0.15)
+
+    def test_shared_counters_has_bc_pretrained_default_zero(self):
+        assert float(SharedCounters().bc_pretrained.value) == 0.0
+
+    def test_before_bc_uses_normal_schedule(self):
+        from config import RLConfig
+        from agent import effective_epsilon, epsilon_for_frame
+        rl = RLConfig()
+        for frame in (0, 100, 50_000, 200_000):
+            assert effective_epsilon(frame, rl, 0.0) == pytest.approx(
+                epsilon_for_frame(frame, rl))
+
+    def test_after_bc_caps_exploration_early(self):
+        from config import RLConfig
+        from agent import effective_epsilon
+        rl = RLConfig()
+        # at frame 0 the raw schedule is epsilon_start (1.0); BC caps it
+        assert effective_epsilon(0, rl, 1.0) == pytest.approx(rl.epsilon_after_bc)
+        assert effective_epsilon(10_000, rl, 1.0) <= rl.epsilon_after_bc + 1e-9
+
+    def test_after_bc_still_decays_below_cap(self):
+        from config import RLConfig
+        from agent import effective_epsilon, epsilon_for_frame
+        rl = RLConfig()
+        late = rl.epsilon_decay_frames  # schedule reaches epsilon_end here
+        assert effective_epsilon(late, rl, 1.0) == pytest.approx(
+            epsilon_for_frame(late, rl))
+        assert effective_epsilon(late, rl, 1.0) < rl.epsilon_after_bc
+
+    def test_learner_sets_flag_after_bc(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parent.parent /
+               "learner_worker.py").read_text(encoding="utf-8")
+        assert "self.counters.bc_pretrained.value = 1.0" in src

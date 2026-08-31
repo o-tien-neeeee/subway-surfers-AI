@@ -388,6 +388,9 @@ class Learner:
                                             f"val_acc={history[-1]['val_acc']:.3f}, đang lưu checkpoint…"})
         self.bc_history = history
         self.agent.sync_target()
+        # DEEP-FIX: tell the actor a good policy now exists so it stops playing
+        # randomly (epsilon~1) and exploits the BC policy instead.
+        self.counters.bc_pretrained.value = 1.0
         self._publish(force=True)
         extra = {"bc": history[-1], "update_step": self.update_step,
                  "dataset": str(demos_dir)}
