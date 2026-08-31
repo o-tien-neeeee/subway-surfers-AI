@@ -1601,6 +1601,7 @@ class TestDemoAutoSplitOnDeath:
         import numpy as np
         from ipc import Frame
         rec = _split_rec(tmp_path)
+        rec.death_trim_s = 0.0  # isolate split logic from the tail-trim
         rec.start()
         alive = np.full((800, 480, 3), (100, 100, 100), dtype=np.uint8)
         dead = np.full((800, 480, 3), (200, 50, 50), dtype=np.uint8)
@@ -1627,4 +1628,30 @@ class TestDemoAutoSplitOnDeath:
         for i in range(10):
             rec.tick(Frame(frame_id=i + 1, ts=i / 30.0, image=dead))
         assert rec.episode_paths == [], "no anchor -> no auto-split"
+        rec.stop(done=False)
+
+    def test_death_split_trims_glitchy_tail(self, tmp_path) -> None:
+        import numpy as np
+        from pathlib import Path as _P
+        from ipc import Frame
+        rec = _split_rec(tmp_path)
+        rec.death_trim_s = 3.5
+        rec.start()
+        alive = np.full((800, 480, 3), (100, 100, 100), dtype=np.uint8)
+        dead = np.full((800, 480, 3), (200, 50, 50), dtype=np.uint8)
+        # 6 seconds of alive play at 30 fps
+        n_alive = 180
+        for i in range(n_alive):
+            rec.tick(Frame(frame_id=i + 1, ts=i / 30.0, image=alive))
+        assert rec.frame_count() == n_alive
+        cf = rec.cfg.death.confirm_frames
+        for i in range(cf):
+            rec.tick(Frame(frame_id=500 + i, ts=10.0 + i / 30.0, image=dead))
+        assert len(rec.episode_paths) == 1
+        data = np.load(_P(rec.episode_paths[0]), allow_pickle=False)
+        kept = len(data["frames"])
+        assert kept < n_alive, "the glitchy tail must be cut"
+        last_ts = float(data["timestamps"][-1])
+        # last kept frame must be at least ~3.5s before the final alive frame
+        assert last_ts <= (n_alive - 1) / 30.0 - 3.5 + 1e-6
         rec.stop(done=False)

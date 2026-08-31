@@ -163,6 +163,11 @@ class DemoRecorder:
         # automatically; skip the death/respawn screen so the next episode
         # starts alive.
         self.auto_split_on_death = True
+        # DEEP-FIX: the ~seconds just before the death screen are the crash /
+        # stumble animation — glitchy movement the user does not want the bot to
+        # imitate.  Trim this much off the tail of an episode when it ends by
+        # death (manual F9 stops are left untouched).
+        self.death_trim_s = 3.5
         self.on_episode_saved: Optional[Callable[[str], None]] = None
         self._dead_streak = 0
         self._alive_streak = 0
@@ -382,6 +387,26 @@ class DemoRecorder:
             LOGGER.debug("death-anchor check failed: %s", exc)
             return None
 
+    def _trim_tail(self, seconds: float) -> int:
+        """Drop the last ``seconds`` of the open episode; returns frames cut."""
+        if seconds <= 0:
+            return 0
+        with self._lock:
+            if not self._ts:
+                return 0
+            cutoff = self._ts[-1] - seconds
+            keep = sum(1 for t in self._ts if t <= cutoff)
+            n_drop = len(self._ts) - keep
+            if n_drop <= 0:
+                return 0
+            self._frames = self._frames[:keep]
+            self._actions = self._actions[:keep]
+            self._ts = self._ts[:keep]
+            self._conf = self._conf[:keep]
+            self._death = self._death[:keep]
+            self._score = self._score[:keep]
+            return n_drop
+
     def split_episode(self) -> Optional[str]:
         """Save the current episode and immediately begin a new one (recording
         stays on).  Hands-free multi-episode collection: one life = one file."""
@@ -414,13 +439,24 @@ class DemoRecorder:
                     self._dead_streak += 1
                     if self._dead_streak >= cf:
                         self._dead_streak = 0
+                        # DEEP-FIX: cut the glitchy death/stumble tail so BC
+                        # never imitates it.
+                        dropped = self._trim_tail(self.death_trim_s)
+                        if dropped:
+                            LOGGER.info(
+                                "demo: cắt bỏ %.1fs cuối (%d khung) di chuyển lỗi "
+                                "trước khi chết", self.death_trim_s, dropped)
                         saved = self.split_episode()
                         if saved and self.on_episode_saved is not None:
                             try:
                                 self.on_episode_saved(saved)
                             except Exception as exc:
                                 LOGGER.warning("on_episode_saved failed: %s", exc)
-                        return False
+                    # DEEP-FIX: never record a dead frame.  Recording the
+                    # death/stumble frames made _ts[-1] the death animation, so
+                    # the tail-trim measured from the wrong moment and cut
+                    # nothing.  Skip every dead frame instead.
+                    return False
                 else:
                     self._dead_streak = 0
         z = self.pre.process(frame.image, frame.frame_id, frame.ts)

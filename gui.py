@@ -1126,6 +1126,8 @@ class ControlGUI:
         if self.cfg.death.anchor_set():
             self.log("tự động tách episode khi CHẾT (mỗi mạng = 1 file) — cứ chơi "
                      "tiếp sau khi hồi sinh, không cần bấm F9.")
+            self.log("mỗi episode tự CẮT BỎ ~3.5s cuối (lúc loạng choạng/di chuyển "
+                     "lỗi trước khi chết) để AI không bắt chước.")
         else:
             self.log("chưa hiệu chuẩn neo chết (bước 3) → KHÔNG tự tách episode; "
                      "bấm F9 thủ công để cắt mỗi episode.")
