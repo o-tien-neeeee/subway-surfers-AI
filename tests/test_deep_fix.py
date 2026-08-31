@@ -1575,3 +1575,56 @@ class TestDemoDoesNotSelfPlay:
         assert "self.app.shutdown()" in src
         # the actor-died warning must be scoped to runs that have an actor
         assert 'getattr(self.app, "actor_proc", None) is not None' in src
+
+
+# --------------------------------------------------------------------- #
+# 25. Each life = one episode: auto-split on death
+# --------------------------------------------------------------------- #
+def _split_rec(tmp_path, with_anchor=True):
+    from config import BotConfig
+    from demonstration_recorder import DemoRecorder
+    cfg = BotConfig()
+    cfg.region.left, cfg.region.top = 0, 0
+    cfg.region.width, cfg.region.height = 480, 800
+    cfg.region.screen_width, cfg.region.screen_height = 1920, 1080
+    cfg.region.dpi_scale = 1.0
+    if with_anchor:
+        cfg.death.anchor_fx, cfg.death.anchor_fy = 0.5, 0.5
+        cfg.death.anchor_baseline_rgb = (100, 100, 100)
+        cfg.death.threshold = 25.0
+        cfg.death.confirm_frames = 3
+    return DemoRecorder(cfg, tmp_path / "demos", lambda: None)
+
+
+class TestDemoAutoSplitOnDeath:
+    def test_death_splits_episode_and_keeps_recording(self, tmp_path) -> None:
+        import numpy as np
+        from ipc import Frame
+        rec = _split_rec(tmp_path)
+        rec.start()
+        alive = np.full((800, 480, 3), (100, 100, 100), dtype=np.uint8)
+        dead = np.full((800, 480, 3), (200, 50, 50), dtype=np.uint8)
+        for i in range(5):
+            rec.tick(Frame(frame_id=i + 1, ts=i / 30.0, image=alive))
+        assert rec.frame_count() > 0 and rec.episode_paths == []
+        cf = rec.cfg.death.confirm_frames
+        for i in range(cf):
+            rec.tick(Frame(frame_id=100 + i, ts=1.0 + i / 30.0, image=dead))
+        assert len(rec.episode_paths) == 1, "death must save one episode"
+        assert rec.recording, "recording must continue after a split"
+        assert rec._wait_alive is True and rec.frame_count() == 0
+        for i in range(cf + 2):
+            rec.tick(Frame(frame_id=200 + i, ts=2.0 + i / 30.0, image=alive))
+        assert rec._wait_alive is False and rec.frame_count() > 0
+        rec.stop(done=False)
+
+    def test_no_split_without_calibrated_anchor(self, tmp_path) -> None:
+        import numpy as np
+        from ipc import Frame
+        rec = _split_rec(tmp_path, with_anchor=False)
+        rec.start()
+        dead = np.full((800, 480, 3), (200, 50, 50), dtype=np.uint8)
+        for i in range(10):
+            rec.tick(Frame(frame_id=i + 1, ts=i / 30.0, image=dead))
+        assert rec.episode_paths == [], "no anchor -> no auto-split"
+        rec.stop(done=False)

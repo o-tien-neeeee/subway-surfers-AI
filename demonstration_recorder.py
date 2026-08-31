@@ -155,6 +155,18 @@ class DemoRecorder:
         self._tap = KeyboardTap(self._handle_press, self._handle_release)
         self._stop_requested = threading.Event()
         self.episode_paths: list[str] = []
+        # DEEP-FIX: each life should be its own episode (ended by done=True at
+        # the death frame) — that is exactly the structure BC's episode split
+        # and validator expect.  pump() used to call tick() without a death
+        # state, so death was never seen and the user had to press F9 by hand
+        # for every life.  Detect death from the calibrated anchor and split
+        # automatically; skip the death/respawn screen so the next episode
+        # starts alive.
+        self.auto_split_on_death = True
+        self.on_episode_saved: Optional[Callable[[str], None]] = None
+        self._dead_streak = 0
+        self._alive_streak = 0
+        self._wait_alive = False
 
     #: keys that are shortcuts, never game actions (alt-tab, ctrl-arrow …)
     MODIFIER_KEYS = frozenset({
@@ -354,11 +366,63 @@ class DemoRecorder:
         return str(path)
 
     # ------------------------------------------------------------------ #
+    def _anchor_is_dead(self, image) -> Optional[bool]:
+        """True/False from the calibrated death anchor; None if not calibrated."""
+        d = self.cfg.death
+        if not d.anchor_set():
+            return None
+        try:
+            from perception import anchor_patch, patch_rgb_distance
+            h, w = image.shape[:2]
+            patch = anchor_patch(image, int(d.anchor_fx * w), int(d.anchor_fy * h))
+            if patch is None:
+                return None
+            return bool(patch_rgb_distance(patch, d.anchor_baseline_rgb) > d.threshold)
+        except Exception as exc:
+            LOGGER.debug("death-anchor check failed: %s", exc)
+            return None
+
+    def split_episode(self) -> Optional[str]:
+        """Save the current episode and immediately begin a new one (recording
+        stays on).  Hands-free multi-episode collection: one life = one file."""
+        path = self.stop(done=True)
+        self.start()
+        self._wait_alive = True
+        self._alive_streak = 0
+        return path
+
     def tick(self, frame, death_state: str = "ALIVE", confidence: float = 0.0,
              score: float = 0.0) -> bool:
         """Consume one frame while recording; True when a row was appended."""
         if not self._recording or frame is None:
             return False
+        # DEEP-FIX: death-based auto-split (see __init__ note).
+        if self.auto_split_on_death:
+            dead = self._anchor_is_dead(frame.image)
+            if dead is not None:
+                cf = max(1, int(self.cfg.death.confirm_frames))
+                if self._wait_alive:
+                    if dead:
+                        self._alive_streak = 0
+                        return False  # still on the death/respawn screen
+                    self._alive_streak += 1
+                    if self._alive_streak < cf:
+                        return False  # wait for a stable "alive" read
+                    self._wait_alive = False
+                    self._alive_streak = 0
+                elif dead:
+                    self._dead_streak += 1
+                    if self._dead_streak >= cf:
+                        self._dead_streak = 0
+                        saved = self.split_episode()
+                        if saved and self.on_episode_saved is not None:
+                            try:
+                                self.on_episode_saved(saved)
+                            except Exception as exc:
+                                LOGGER.warning("on_episode_saved failed: %s", exc)
+                        return False
+                else:
+                    self._dead_streak = 0
         z = self.pre.process(frame.image, frame.frame_id, frame.ts)
         if not z.valid or z.ground_gray is None:
             return False

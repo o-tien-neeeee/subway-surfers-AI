@@ -1106,6 +1106,7 @@ class ControlGUI:
 
         self._demo_recorder = DemoRecorder(self.cfg, self.cfg.paths.demos_dir,
                                            _RingReader(ring))
+        self._demo_recorder.on_episode_saved = self._on_demo_episode_saved
         self._demo_recorder.start()
         self._demo_t0 = time.monotonic()
         self._demo_last_log_t = 0.0
@@ -1122,7 +1123,19 @@ class ControlGUI:
         else:
             self.log("⚠ bàn phím: KHÔNG KHẢ DỤNG — demo sẽ TOÀN NOOP, không dùng "
                      "cho tiền-huấn luyện được! Cần chạy trên máy có bàn phím thật.")
+        if self.cfg.death.anchor_set():
+            self.log("tự động tách episode khi CHẾT (mỗi mạng = 1 file) — cứ chơi "
+                     "tiếp sau khi hồi sinh, không cần bấm F9.")
+        else:
+            self.log("chưa hiệu chuẩn neo chết (bước 3) → KHÔNG tự tách episode; "
+                     "bấm F9 thủ công để cắt mỗi episode.")
         self.log("F9 hoặc nút ■ để dừng & lưu. Đang ghi…")
+
+    def _on_demo_episode_saved(self, path: str) -> None:
+        """Logged when a life ends and the recorder auto-starts a new episode."""
+        n = len(self._demo_recorder.episode_paths) if self._demo_recorder else 0
+        self.log(f"☠ chết → đã lưu episode: {path}")
+        self.log(f"tổng {n} episode. Đang ghi episode MỚI — chơi tiếp đi.")
 
     def _stop_demo_recording(self) -> None:
         self._disarm_demo_hotkey()
