@@ -1691,3 +1691,23 @@ class TestLearningProgressVisible:
         assert "from metrics import summarize_learning_progress" in src
         assert "_ep_survival_history.append(surv)" in src
         assert "summarize_learning_progress(self._ep_survival_history" in src
+
+
+# --------------------------------------------------------------------- #
+# 27. README must always show the current version
+# --------------------------------------------------------------------- #
+class TestReadmeShowsCurrentVersion:
+    """The user asked that every session surface the current version in
+    README.md.  A test enforces the banner can never drift from APP_VERSION."""
+
+    def test_readme_banner_matches_app_version(self) -> None:
+        import re
+        from version import APP_VERSION
+        readme = (Path(__file__).resolve().parent.parent / "README.md") \
+            .read_text(encoding="utf-8")
+        m = re.search(r"Current version / Phiên bản hiện tại: `(\d+\.\d+\.\d+)`",
+                      readme)
+        assert m, "README must carry a 'Current version' banner"
+        assert m.group(1) == APP_VERSION, (
+            f"README shows {m.group(1)} but APP_VERSION is {APP_VERSION} — "
+            "bump the README banner whenever the version changes")
