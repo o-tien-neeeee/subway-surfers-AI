@@ -19,11 +19,80 @@ Chrome.
 
 ---
 
-## 0. What's new in this upgrade (v1.1)
+## 0. What's new in this upgrade (v1.2 — deep-research learning fixes)
 
-Continuing from the first complete build, this round closes the remaining
-specification gaps and hardens four subsystems — all verified by new tests
-(340 → 403):
+This round re-architects the **learning problem itself**, guided by the
+findings in `DEEP_RESEARCH_vi.md` (the symptom it answers: *6 000 episodes
+trained with only ~1 s average improvement*). The diagnosis was **not** model
+size or CPU — the MDP itself hid the information and cancelled the gradient.
+All changes are covered by tests (403 → **424**, all green headless):
+
+1. **The policy now sees the WHOLE frame.** Perception fed the CNN only the
+   lower 75 % crop; obstacles spawn at the horizon (top 25 %) and were
+   invisible until <1.5 s before impact. `ZonePreprocessor` now emits
+   `policy_gray` — the **entire** game region resized to `policy_size` (84) —
+   as the network/BC observation; the horizon band survives only as the
+   crude frame-diff alarm. (`perception.py`, new `policy_size`/`obs_size`.)
+2. **Atari-style frame-skip MDP.** One agent decision per `rl.frame_skip`
+   (default 3) captured frames; the action is held and rewards summed over
+   the skip; the observation stack, n-step returns and transitions are all
+   indexed by **agent steps**. `γ=0.99` per step now gives an effective
+   horizon of ~100 steps (~30 s) instead of ~3.3 s when γ was applied per
+   raw 30 FPS frame. (`environment.py`, `config.py`.)
+3. **A dense, positive reward — the style that actually learned this game.**
+   The old `+0.1` hazard bonus paid out for *any* keypress on a frame-diff
+   alarm (it trained "keep jumping/rolling"), and the `+0.02/frame` survival
+   vs `-10` death scale needed a >16 s episode just to break even, so every
+   short episode looked like the same large negative number. The reward is
+   now the **proven "counter" reward used by the no-code RL bots that have
+   demonstrably learned Subway Surfers** (e.g. the *lunai* DQN tool,
+   [github.com/khxji/lunai](https://github.com/khxji/lunai), ~20 h / 3 000
+   auto-reset runs to a score >3 600): a steady **positive per-decision-step
+   reward** (`alive_per_frame`, episode return ∝ survival time) with
+   **death penalty = 0** by default (death just ends the episode / bootstraps
+   to 0, so runs rank naturally by how long they survived instead of all
+   reading as −10). The legacy `-10` penalty, the danger/action terms and the
+   hazard bonus remain available as config flags for ablations.
+   `ObstacleTracker` (`obstacle_perception.py`), a tiny numpy lane/depth
+   occupancy grid, additionally emits a **+`clear_bonus`** when an obstacle
+   passes the player harmlessly (successful-dodge credit), and can drive the
+   scheduler's danger flag. An OCR **score/balance reward** (the lunai
+   `reward_location` path) and an OCR-free **counter reward** are both
+   supported — the counter is preferred on the weak CPU (no OCR cost).
+4. **Exploration no longer locks the blind policy.** ε decays over
+   **agent decision steps** (`epsilon_decay_steps`, default 300 000) instead
+   of finishing in ~150 k env frames (~episode 600–800), before anything
+   could be learned. (`agent.epsilon_for_step`.)
+5. **Learning from humans, done correctly.**
+   * Demo **label backdating** (`bc.label_backdate_ms`, ~220 ms): the human
+     commits before impact, so the tap label is shifted back to the frames
+     where the obstacle is still far away — the frames that actually need the
+     decision (previously they were labelled NOOP). Full-frame demos.
+   * **Mirror augmentation** for BC (left/right flip + LEFT↔RIGHT label swap),
+     which publicly-documented Subway Surfers bots report materially improves
+     robustness. (`dataset.DemonstrationDataset(mirror=True)`.)
+   * **DQfD** — demonstrations are converted to a **permanent expert replay**
+     (`add_expert_nstep`, never evicted, its own frame store), every learner
+     batch mixes `expert_batch_fraction` (25 %) expert rows, and a
+     **large-margin loss** forces Q(expert action) ≥ Q(other) + `dqfd_margin`
+     so online RL cannot unlearn the human.
+   * **HG-DAgger** — while the bot plays, any human gameplay key seizes
+     control and auto-records a correction demo for the states the policy
+     actually visits and fails in (the covariate-shift fix); it auto-saves
+     after `bc.dagger_tail_ms`. (`demonstration_recorder.py`.)
+6. **Fairer synthetic game** for headless research: obstacle cadence relaxed
+   (0.35–0.6 s → ~0.7–1.6 s), jump/roll grace window 0.35 → 0.5 s, and the
+   generator keeps at least one lane open (never blocks all three at once).
+
+The survey behind these fixes (and the BC-first vs RL-from-scratch evidence
+from existing Subway Surfers projects) is in `DEEP_RESEARCH_vi.md`.
+
+---
+
+## 0b. What's new in the previous upgrade (v1.1)
+
+Continuing from the first complete build, that round closes the remaining
+specification gaps and hardens four subsystems — all verified by tests:
 
 1. **Online best-model gating (§12).** `best_model.pth` used to be written
    only by behaviour cloning. Now the actor reports every finished episode

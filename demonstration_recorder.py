@@ -96,8 +96,11 @@ class DemoRecorder:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.read_frame = read_frame  # returns Frame or None (latest-wins)
+        # Record the FULL-FRAME policy view (obstacles spawn at the horizon;
+        # the old lower-crop hid them from BC).
         self.pre = ZonePreprocessor(cfg.perception, cfg.perception.horizon_frac,
-                                    require_anchor=False)
+                                    require_anchor=False,
+                                    policy_size=cfg.perception.obs_size)
         self._frames: list[np.ndarray] = []
         self._actions: list[int] = []
         self._ts: list[float] = []
@@ -107,11 +110,51 @@ class DemoRecorder:
         self._recording = False
         self._lock = threading.Lock()
         self._current_action = NOOP
+        # ACTION EVENTS: a keydown taps an action; the label is BACKDATED so
+        # the policy learns to commit while the obstacle is still far away
+        # (human reactions land ~200 ms before impact). ``_label_until_idx``
+        # marks frames that should inherit the tap label (event + hold window).
+        self._events: list[tuple[float, int]] = []   # (monotonic ts, action)
+        self._label_until_idx: int = -1
+        self._label_action: int = NOOP
+        # DAgger correction recording state
+        self._dagger_armed: bool = False
+        self._dagger_last_ev: float = -1e9
+        self.dagger_active: bool = False
         self._tap = KeyboardTap(self._handle_press, self._handle_release)
         self._stop_requested = threading.Event()
         self.episode_paths: list[str] = []
 
     # ------------------------------------------------------------------ #
+    # DAgger / HG-DAgger: human-gated intervention while the BOT plays.
+    # When the human seizes control (any gameplay key), start recording a
+    # correction episode and keep recording for ``dagger_tail_ms`` after the
+    # last keypress so the recovery trajectory is captured. These are the
+    # states the policy actually visits and fails in — the covariate-shift
+    # fix for behavioural cloning.
+    # ------------------------------------------------------------------ #
+    def notify_human_intervention(self) -> None:
+        if not self.cfg.bc.dagger:
+            return
+        with self._lock:
+            self._dagger_armed = True
+            self._dagger_last_ev = time.monotonic()
+            if not self._recording:
+                self.start()
+
+    def _dagger_tick(self) -> bool:
+        """Return True while a DAgger correction episode should be recorded."""
+        if not self.cfg.bc.dagger:
+            return False
+        with self._lock:
+            if not self._dagger_armed:
+                return False
+            tail = self.cfg.bc.dagger_tail_ms / 1000.0
+            if time.monotonic() - self._dagger_last_ev > tail:
+                self._dagger_armed = False
+                return False
+            return True
+
     def _handle_press(self, key_name: str) -> None:
         action = DEFAULT_KEY_TO_ACTION.get(key_name)
         # honour the configured keymap too (custom bindings)
@@ -121,6 +164,16 @@ class DemoRecorder:
         if action is not None:
             with self._lock:
                 self._current_action = action
+                # record the decision EVENT at the keypress timestamp
+                self._events.append((time.monotonic(), int(action)))
+                # any human keypress during bot play (re)starts the DAgger tail
+                if self.cfg.bc.dagger:
+                    self._dagger_armed = True
+                    self._dagger_last_ev = time.monotonic()
+                    if not self._recording:
+                        self._recording = True
+                        self._tap.start()
+                        LOGGER.info("DAgger intervention — correction recording started")
 
     def _handle_release(self, key_name: str) -> None:
         action = DEFAULT_KEY_TO_ACTION.get(key_name)
@@ -147,6 +200,9 @@ class DemoRecorder:
         self._death.clear()
         self._score.clear()
         self._current_action = NOOP
+        self._events.clear()
+        self._label_until_idx = -1
+        self._label_action = NOOP
         self._recording = True
         self._stop_requested.clear()
         self._tap.start()
@@ -208,15 +264,57 @@ class DemoRecorder:
     # ------------------------------------------------------------------ #
     def tick(self, frame, death_state: str = "ALIVE", confidence: float = 0.0,
              score: float = 0.0) -> None:
-        """Consume one frame while recording (called from the capture pump)."""
+        """Consume one frame while recording (called from the capture pump).
+
+        Label semantics (deep-research fix §1.2 #7): Subway Surfers latches a
+        tap at keydown; the human commits ~``label_backdate_ms`` BEFORE impact.
+        We therefore label frames from (keypress − backdate) through
+        (keypress + hold) with the tapped action, so the frame that NEEDS the
+        decision (obstacle still far) carries the label instead of NOOP.
+        """
         if not self._recording or frame is None:
             return
-        z = self.pre.process(frame.image, frame.frame_id, frame.ts)
-        if not z.valid or z.ground_gray is None:
+        # DAgger mode: only keep the recorder open while interventions are
+        # recent; when the tail elapses, auto-finalise the correction demo.
+        dagger_mode = getattr(self, "dagger_active", False)
+        if dagger_mode and not self._dagger_tick():
+            path = self.stop(done=False)
+            if path:
+                LOGGER.info("DAgger correction demo saved: %s", path)
             return
+        z = self.pre.process(frame.image, frame.frame_id, frame.ts)
+        if not z.valid or z.policy_gray is None:
+            return
+        idx = len(self._frames)
         with self._lock:
-            action = self._current_action
-        self._frames.append(z.ground_gray)
+            held_action = self._current_action
+            # consume tap events: open a backdated labelling window.
+            while self._events:
+                ev_ts, ev_action = self._events[0]
+                age = time.monotonic() - ev_ts
+                backdate = self.cfg.bc.label_backdate_ms / 1000.0
+                hold = self.cfg.bc.label_hold_ms / 1000.0
+                # frames older than the tap get the label for the window
+                # [tap-backdate, tap+hold]; expressed as indices:
+                back_frames = int(round(backdate * self.cfg.capture.target_fps))
+                hold_frames = max(1, int(round(hold * self.cfg.capture.target_fps)))
+                start = max(0, idx - back_frames)
+                end = idx + hold_frames
+                # apply backdated label to already-stored frames
+                for j in range(start, min(idx, len(self._actions))):
+                    self._actions[j] = int(ev_action)
+                # upcoming frames inherit until end
+                self._label_until_idx = max(self._label_until_idx, end)
+                self._label_action = int(ev_action)
+                # remove the event only once it is older than backdate
+                self._events.pop(0)
+                _ = age  # (age kept for clarity; window uses frame counts)
+            # decide THIS frame's label
+            if idx <= self._label_until_idx:
+                action = self._label_action
+            else:
+                action = held_action
+        self._frames.append(z.policy_gray)
         self._actions.append(int(action))
         self._ts.append(float(frame.ts))
         self._death.append(str(death_state))

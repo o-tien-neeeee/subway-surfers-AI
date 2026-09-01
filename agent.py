@@ -62,10 +62,29 @@ class InferencePolicy:
 
 
 def epsilon_for_frame(frame: int, cfg: RLConfig) -> float:
-    """Linear decay in ENV frames: the only definition of 'step' for eps."""
+    """Linear decay in ENV frames (legacy; retained for older callers)."""
+    decay = getattr(cfg, "epsilon_decay_frames", 0) or 0
+    if decay <= 0:
+        decay = max(1, getattr(cfg, "epsilon_decay_steps", 300_000))
     if frame <= 0:
         return cfg.epsilon_start
-    frac = min(1.0, frame / max(1, cfg.epsilon_decay_frames))
+    frac = min(1.0, frame / max(1, decay))
+    return cfg.epsilon_start + frac * (cfg.epsilon_end - cfg.epsilon_start)
+
+
+def epsilon_for_step(step: int, cfg: RLConfig) -> float:
+    """Linear decay over AGENT DECISION STEPS (the frame-skip clock).
+
+    Deep-research fix (§1.2 #5): epsilon used to finish decaying in ~150k raw
+    env frames (~episode 600-800) — before anything could be learned, the
+    greedy-blind policy was locked at 5% exploration. Agent steps are the
+    coherent MDP clock (one per frame-skip decision), and the schedule spans
+    far more of them, so exploration survives long enough for learning.
+    """
+    decay = max(1, int(getattr(cfg, "epsilon_decay_steps", 300_000)))
+    if step <= 0:
+        return cfg.epsilon_start
+    frac = min(1.0, step / decay)
     return cfg.epsilon_start + frac * (cfg.epsilon_end - cfg.epsilon_start)
 
 
@@ -105,7 +124,17 @@ class DoubleDQNAgent:
 
     # ------------------------------------------------------------------ #
     def train_step(self, batch: dict[str, Any]) -> dict[str, float]:
-        """One Double-DQN update from a PER batch; returns metrics."""
+        """One Double-DQN update from a PER batch; returns metrics.
+
+        DQfD (deep Q-learning from demonstrations): when the batch carries an
+        ``expert`` boolean mask, a large-margin supervised loss is added on
+        those transitions — it forces the demonstrated action's Q to beat
+        every other action by at least ``dqfd_margin``:
+
+            L_margin = mean_i max_a [ Q(s_i, a) + margin * [a != a_E] - Q(s_i, a_E) ]+
+
+        so the policy cannot unlearn the human during RL fine-tuning.
+        """
         obs = torch.from_numpy(batch["obs"]).float().div_(255.0)
         next_obs = torch.from_numpy(batch["next_obs"]).float().div_(255.0)
         actions = torch.from_numpy(batch["actions"])
@@ -128,6 +157,26 @@ class DoubleDQNAgent:
         loss_per = nn.functional.smooth_l1_loss(q_sa, target, reduction="none")
         loss = (weights * loss_per).mean()
 
+        # --- DQfD large-margin loss on demonstrated transitions ---------- #
+        margin_loss_val = 0.0
+        expert_mask = batch.get("expert")
+        if expert_mask is not None:
+            em = torch.as_tensor(np.asarray(expert_mask), dtype=torch.bool)
+            if bool(em.any()):
+                margin = float(getattr(self.cfg, "dqfd_margin", 0.8))
+                q_exp = q_all[em]                              # [E,5]
+                a_exp = actions[em]                            # [E]
+                one_hot = torch.nn.functional.one_hot(
+                    a_exp, num_classes=q_exp.shape[1]
+                ).float()
+                margin_term = q_exp + margin * (1.0 - one_hot)  # +0 on expert action
+                margin_target = (q_exp.gather(1, a_exp.unsqueeze(1)).squeeze(1)
+                                 )
+                l_margin = (margin_term.max(dim=1).values - margin_target).clamp_min(0.0)
+                margin_loss_val = float(l_margin.mean().item())
+                loss = loss + float(getattr(self.cfg, "dqfd_margin_weight", 0.3)) \
+                    * l_margin.mean()
+
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(
@@ -145,6 +194,7 @@ class DoubleDQNAgent:
             "loss": float(loss.item()),
             "td_error_abs": td_error_abs,                          # per-sample for PER
             "td_error_abs_mean": float(td_error_abs.mean()),
+            "margin_loss": margin_loss_val,
             "q_mean": float(q_all.mean().item()),
             "q_max": float(q_all.max().item()),
             "q_min": float(q_all.min().item()),

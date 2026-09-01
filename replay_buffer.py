@@ -155,15 +155,17 @@ class FrameStore:
 
 @dataclass
 class Transition:
-    obs_ids: tuple[int, ...]      # 4 frame-store slots (oldest -> newest)
-    next_ids: tuple[int, ...]     # 4 slots for s_{t+span}
-    obs_env_ids: tuple[int, ...]  # env ids for the 4 obs frames
+    obs_ids: tuple[int, ...]      # k frame-store slots (oldest -> newest)
+    next_ids: tuple[int, ...]     # k slots for s_{t+span}
+    obs_env_ids: tuple[int, ...]  # env ids for the k obs frames
     next_env_ids: tuple[int, ...]
     action: int
     reward: float
     done: bool
     span: int
     gamma_pow: float
+    is_expert: bool = False       # DQfD: never-evict human demonstration
+    expert_frame: bool = False    # pixels live in expert_frames, not frames
 
     def validate(self) -> None:
         if not (0 <= int(self.action) <= 4):
@@ -173,16 +175,16 @@ class Transition:
         if not isinstance(self.done, bool):
             raise TypeError("done must be bool")
         for ids in (self.obs_ids, self.next_ids):
-            if len(ids) != 4:
-                raise ValueError("stacks must reference exactly 4 frames")
+            if len(ids) < 1:
+                raise ValueError("stacks must reference at least 1 frame")
 
 
 @dataclass
 class NStepTransition:
     """Emitted by NStepBuilder; carried over the transition queue."""
 
-    obs: np.ndarray           # [4,H,W] uint8
-    next_obs: np.ndarray      # [4,H,W] uint8
+    obs: np.ndarray           # [k,H,W] uint8
+    next_obs: np.ndarray      # [k,H,W] uint8
     action: int
     reward: float             # discounted n-step return
     done: bool
@@ -190,6 +192,7 @@ class NStepTransition:
     gamma_pow: float
     obs_env_ids: tuple[int, ...]
     next_env_ids: tuple[int, ...]
+    expert: bool = False      # DQfD: human-demonstrated transition
 
 
 class NStepBuilder:
@@ -334,7 +337,8 @@ class NStepBuilder:
 class PrioritizedReplayBuffer:
     """PER buffer over n-step transitions with lazy uint8 frame storage."""
 
-    def __init__(self, cfg: PERConfig, frame_size: int = 84, gamma: float = 0.99) -> None:
+    def __init__(self, cfg: PERConfig, frame_size: int = 84, gamma: float = 0.99,
+                 expert_priority_bonus: float = 1.0) -> None:
         self.cfg = cfg
         self.gamma = gamma
         self.capacity = cfg.capacity
@@ -348,16 +352,25 @@ class PrioritizedReplayBuffer:
         self.max_priority = 1.0
         self._eps = cfg.priority_eps
         self.evicted_refs = 0
+        self._expert_priority_bonus = float(expert_priority_bonus)
+        # Small SEPARATE expert store (DQfD): demonstrations live OUTSIDE the
+        # FIFO ring so they are never evicted and are always sampleable. A
+        # dedicated FrameStore guarantees the referenced pixels persist even
+        # when the main ring wraps around.
+        self.expert: list[Transition] = []
+        self._expert_cap = 60_000
+        self.expert_frames = FrameStore(self._expert_cap, frame_size)
 
     # ------------------------------------------------------------------ #
     # Insertion
     # ------------------------------------------------------------------ #
     def add_nstep(self, tr: NStepTransition) -> None:
+        k = tr.obs.shape[0]
         obs_ids = tuple(
-            self.frames.add_if_new(tr.obs[i], tr.obs_env_ids[i]) for i in range(4)
+            self.frames.add_if_new(tr.obs[i], tr.obs_env_ids[i]) for i in range(k)
         )
         next_ids = tuple(
-            self.frames.add_if_new(tr.next_obs[i], tr.next_env_ids[i]) for i in range(4)
+            self.frames.add_if_new(tr.next_obs[i], tr.next_env_ids[i]) for i in range(k)
         )
         t = Transition(
             obs_ids=obs_ids,
@@ -369,6 +382,7 @@ class PrioritizedReplayBuffer:
             done=bool(tr.done),
             span=int(tr.span),
             gamma_pow=float(tr.gamma_pow),
+            is_expert=bool(getattr(tr, "expert", False)),
         )
         t.validate()
         idx = self.pos
@@ -376,11 +390,27 @@ class PrioritizedReplayBuffer:
         # priorities[] and the sum tree ALWAYS store alpha-powered values so
         # save/load and sampling agree on one convention.
         self.priorities[idx] = self.max_priority ** self.cfg.alpha
+        if t.is_expert:
+            # Demonstrations get a permanent priority bonus (DQfD epsilon_d)
+            # so they are sampled throughout online learning, never drowned by
+            # the policy's own random early trajectories.
+            self.priorities[idx] = max(
+                self.priorities[idx],
+                (float(getattr(self, "_expert_priority_bonus", 1.0))) ** self.cfg.alpha,
+            )
         self.tree.update(idx, self.priorities[idx])
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
         if self.size == self.capacity:
             self.filled_once = True
+
+    def expert_indices(self) -> np.ndarray:
+        """Indices of transitions flagged as human demonstrations."""
+        return np.array(
+            [i for i in range(self.size)
+             if self.transitions[i] is not None and self.transitions[i].is_expert],
+            dtype=np.int64,
+        )
 
     # ------------------------------------------------------------------ #
     # Sampling with eviction validation
@@ -427,13 +457,25 @@ class PrioritizedReplayBuffer:
 
         trs = [self.transitions[int(i)] for i in leaf_idx]
         trs = [t if t is not None else self.transitions[0] for t in trs]
-        obs = np.stack([np.stack([self.frames.frames[s] for s in t.obs_ids], axis=0)
-                        for t in trs])
-        next_obs = np.stack([np.stack([self.frames.frames[s] for s in t.next_ids], axis=0)
-                             for t in trs])
-        probs = self.priorities[leaf_idx] / max(total, 1e-12)
+        return self._build_batch(trs, leaf_idx, total, beta)
+
+    def _build_batch(self, trs: list[Transition], leaf_idx: np.ndarray,
+                     total: float, beta: float) -> dict[str, Any]:
+        def frames_of(t: Transition, ids: tuple[int, ...]) -> list[np.ndarray]:
+            store = self.expert_frames if t.expert_frame else self.frames
+            return [store.frames[s] for s in ids]
+
+        obs = np.stack([np.stack(frames_of(t, t.obs_ids), axis=0) for t in trs])
+        next_obs = np.stack([np.stack(frames_of(t, t.next_ids), axis=0) for t in trs])
+        probs = self.priorities[np.clip(leaf_idx, 0, self.capacity - 1)] / max(total, 1e-12)
         min_p = self.tree.min_leaf() / max(total, 1e-12)
         weights = np.power(np.maximum(probs, 1e-12) / max(min_p, 1e-12), -beta)
+        # Expert rows have no PER probability -> give them the mean weight so
+        # they neither vanish nor dominate the IS normalisation.
+        expert_row = np.array([bool(t.is_expert) for t in trs])
+        if expert_row.any():
+            w_online = weights[~expert_row]
+            weights[expert_row] = 1.0 if w_online.size == 0 else float(np.mean(w_online))
         weights = weights / max(float(weights.max()), 1e-12)
         return {
             "indices": leaf_idx.astype(np.int64),
@@ -445,7 +487,72 @@ class PrioritizedReplayBuffer:
             "dones": np.array([t.done for t in trs], dtype=np.float32),
             "gamma_pows": np.array([t.gamma_pow for t in trs], dtype=np.float32),
             "spans": np.array([t.span for t in trs], dtype=np.int64),
+            "expert": expert_row,
         }
+
+    def sample_mixed(self, batch_size: int, beta: float, expert_fraction: float = 0.0,
+                     rng: np.random.Generator | None = None) -> dict[str, Any]:
+        """PER batch optionally mixed with never-evict expert transitions.
+
+        DQfD: a fraction ``expert_fraction`` of each batch is drawn from the
+        permanent expert store so demonstrations keep guiding the policy
+        during online RL (large-margin loss is applied to these rows).
+        """
+        rng = rng or np.random.default_rng()
+        n_expert = 0
+        if expert_fraction > 0.0 and self.expert:
+            n_expert = min(len(self.expert),
+                           int(round(batch_size * expert_fraction)))
+        n_online = batch_size - n_expert
+        if n_online > 0 and self.size > 0:
+            batch = self.sample(n_online, beta, rng=rng)
+            if n_expert == 0:
+                return batch
+            online_trs = [self.transitions[int(i)] for i in batch["indices"]]
+            online_trs = [t if t is not None else self.transitions[0] for t in online_trs]
+        else:
+            batch = None
+            n_expert = min(batch_size, len(self.expert))
+            online_trs = []
+        if n_expert > 0:
+            picks = rng.choice(len(self.expert), size=n_expert, replace=True)
+            exp_trs = [self.expert[int(p)] for p in picks]
+        else:
+            exp_trs = []
+        trs = online_trs + exp_trs
+        # indices for expert rows are -1 (no PER leaf to update).
+        idx_online = batch["indices"] if batch is not None else np.zeros(0, np.int64)
+        idx = np.concatenate([idx_online, np.full(n_expert, -1, np.int64)])
+        total = self.tree.total()
+        out = self._build_batch(trs, idx, total if total > 0 else max(1, self.size), beta)
+        return out
+
+    def add_expert_nstep(self, tr: NStepTransition) -> None:
+        """Store a demonstrated transition in the permanent expert set."""
+        if len(self.expert) >= self._expert_cap:
+            return  # bound expert RAM; the newest demos already cover enough
+        k = tr.obs.shape[0]
+        obs_ids = tuple(
+            self.expert_frames.add_if_new(tr.obs[i], tr.obs_env_ids[i])
+            for i in range(k)
+        )
+        next_ids = tuple(
+            self.expert_frames.add_if_new(tr.next_obs[i], tr.next_env_ids[i])
+            for i in range(k)
+        )
+        t = Transition(
+            obs_ids=obs_ids, next_ids=next_ids,
+            obs_env_ids=tr.obs_env_ids, next_env_ids=tr.next_env_ids,
+            action=int(tr.action), reward=float(tr.reward), done=bool(tr.done),
+            span=int(tr.span), gamma_pow=float(tr.gamma_pow),
+            is_expert=True, expert_frame=True,
+        )
+        t.validate()
+        self.expert.append(t)
+
+    @property
+    def expert_size(self) -> int:
+        return len(self.expert)
 
     def update_priorities(self, indices: Iterable[int], td_errors: np.ndarray) -> None:
         td = np.abs(np.asarray(td_errors, dtype=np.float64))
@@ -454,8 +561,14 @@ class PrioritizedReplayBuffer:
         if prios.size:
             self.max_priority = max(self.max_priority, float(prios.max()))
         idx = np.asarray(indices, dtype=np.int64)
-        self.tree.update_batch(idx, prios ** self.cfg.alpha)
-        self.priorities[idx] = prios ** self.cfg.alpha
+        # Expert rows carry sentinel index -1 (no PER leaf) — skip them.
+        mask = idx >= 0
+        if not bool(mask.all()):
+            idx = idx[mask]
+            prios = prios[mask]
+        if idx.size:
+            self.tree.update_batch(idx, prios ** self.cfg.alpha)
+            self.priorities[idx] = prios ** self.cfg.alpha
 
     def beta_for_step(self, step: int) -> float:
         frac = min(1.0, step / max(1, self.cfg.beta_frames))
