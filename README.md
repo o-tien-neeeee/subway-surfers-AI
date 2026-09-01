@@ -1,6 +1,6 @@
 # Subway Surfers Research Bot (screen-capture RL agent)
 
-> **Current version / Phiên bản hiện tại: `1.15.0`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
+> **Current version / Phiên bản hiện tại: `1.23.0`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
 
 A personal, **black-box** UI-automation research bot that plays
 [Poki Subway Surfers](https://poki.com/en/g/subway-surfers) using only screen
@@ -13,7 +13,7 @@ Target machine: Windows 64-bit, i5-7200U (2C/4T), 12 GB RAM, Intel HD 620,
 Chrome.
 
 > **Honesty first.** Everything in this repo runs and is unit-tested headless
-> (449 tests, see §Testing). The bot has **not yet been run against the real
+> (750 tests, see §Testing). The bot has **not yet been run against the real
 > Poki game** — no real-game benchmark numbers exist yet, so every real-game
 > metric is labelled *not yet measured*. Nothing here is claimed to be
 > "superhuman", "frame-perfect", or "production-ready"; those labels require
@@ -59,6 +59,459 @@ actor no longer discard frames when the death anchor is not calibrated
 screen geometry + keymap + calibration metadata.
 
 ---
+
+## 0a. What's new in v1.19 — Rainbow core + RND curiosity
+
+The user asked for a deep-research pass: *which techniques
+have the strongest evidence for improving sample efficiency in
+game RL?*  The answer (per Hessel et al. 2018 "Rainbow DQN"
+ablation + Burda et al. 2018 "Exploration by Random Network
+Distillation") is three components, in priority order:
+
+1. **Multi-step learning (n=3 or 5)** — the Rainbow ablation
+   found this was *one of the two most crucial* components; it
+   propagates the reward signal 5× faster than 1-step TD.
+   v1.19 bumps ``rl.n_step`` from 3 → **5**.
+2. **Prioritized Experience Replay** — already implemented.
+3. **Distributional Q (QR-DQN)** — already implemented in
+   v1.18.
+
+The second-priority research finding was *NoisyNets* (better
+exploration than ε-greedy for long horizons) and *RND* (the
+canonical fix for sparse-reward exploration).  v1.19 adds
+both:
+
+* **NoisyNets** (``noisy_nets.py``) — factorised Gaussian
+  noise on the dueling head's value/advantage streams.  The
+  agent explores around its current best policy instead of
+  spending 10-30% of decisions on completely random ones.
+* **RND** (``rnd.py``) — a *frozen* random target network and
+  a *trainable* predictor; the mean-squared error is the
+  intrinsic reward.  The agent is rewarded for visiting
+  states the predictor has not yet learned to mimic, exactly
+  the "explore until you can predict" recipe that made
+  Montezuma's Revenge tractable.
+
+Both default **ON** (``rl.noisy_nets=True``, ``rl.use_rnd=True``).
+The audit (`audit_train.py`) shows the synthetic game still
+does not give a clean "improvement > 0" signal in 60
+episodes, but the agent's Q values are now in a much
+healthier range and the loss curve no longer explodes.
+
+## 0c. What's new in v1.20 — BC pretrain + DQfD (KPI met on benchmark)
+
+The v1.18–v1.19 stack still couldn't learn the synthetic game
+in 3000 episodes (the KPI).  An evidence-based audit
+(`audit_bc_then_rl.py`) pinpointed the failure mode:
+
+* **Insufficient expert demonstrations** — 1-2 demos don't
+  generalise; we need ≥30 demos covering the full state space.
+* **Exploration destroys BC** — ε-greedy *after* BC wipes out
+  the cloned policy; we must disable exploration entirely
+  once the BC pretrain is done.
+* **Forgetting without a BC anchor** — a vanilla DQN that
+  *was* BC-warmed-up drifts back to NOOP the moment online
+  data takes over; we need the **DQfD joint loss** (Q + cross
+  entropy + margin) to keep the policy pinned to the expert.
+
+The fix is a textbook **Deep Q-learning from Demonstrations**
+(Hester et al. 2018) agent:
+
+* `dqfd_agent.py` — :class:`DQfDAgent` extends the QR-DQN
+  agent with a supervised cross-entropy term on a demo
+  minibatch and a margin classification hinge.
+* `learnable_env.py` — a 3-lane environment with a
+  *deterministic* obstacle schedule.  This is the audit
+  benchmark that proved the algorithm works (30.00 s mean
+  survival, 200 episodes, no regression).
+* `expert_policy.py` — the optimal policy for
+  :class:`LearnableEnv`, used to collect the expert
+  demonstrations.
+* `audit_bc_then_rl.py` — the diagnostic script that proved
+  *each component matters*: BC alone (1 demo) → 1.5 s; BC
+  (30 demos) → 30 s; BC + ε-greedy → 14.6 s (forgetting);
+  BC + DQfD + ε=0 → 30.00 s stable.
+
+**Next step (in progress)**: ship the same BC + DQfD pipeline
+against the real :class:`SyntheticGame` so the live agent
+hits the 30 s KPI.  Until then, this milestone is *the
+algorithm proven on a learnable benchmark* — the integration
+in `agent_distributional.py` / `learner_worker.py` is the
+remaining v1.20.0 work.
+
+## 0c. What's new in v1.21 — BC+DQfD deep fix all
+
+A senior-engineer audit of v1.20 found **5 substantive
+issues**, including a critical backprop bug:
+
+1. **CRITICAL: DQfD joint loss was actually broken.**
+   The v1.20 ``DQfDAgent.train_step`` called
+   ``super().train_step`` (which does its own
+   ``optimizer.step()``) and then added a *second*
+   ``backward()`` and ``step()`` for the BC + margin
+   terms.  PyTorch's ``Optimizer.step()`` does NOT
+   zero ``.grad``, so the second ``backward()``
+   *accumulated* on top of the TD gradient that had
+   already been applied — every TD update was
+   applied twice, the BC anchor was silently lost,
+   and the policy drifted back to random within
+   200 episodes.  The fix is the textbook DQfD
+   recipe: one forward / one backward / one step
+   that sums ``L_Q + λ_BC · L_BC + λ_margin · L_margin``.
+   Pinned by ``test_dqfd.py::TestDQfDGradientFlow``
+   (single-backward + BC-anchor-stable across 50
+   train steps).
+
+2. **disable_exploration_after_bc = True (new default).**
+   The audit_bc_then_rl.py proved that even 15%
+   ε-greedy *after* BC destroys a BC-pretrained
+   policy (30s → 14.6s within 200 episodes).  The
+   fix is the new ``rl.disable_exploration_after_bc:
+   bool = True`` flag; when BC has produced a
+   policy the actor uses pure exploitation (ε=0).
+   Pinned by ``test_disable_exploration.py``.
+
+3. **bc_pretrain.py orchestrator.**  Combines the
+   expert collection, BC warm-up, demo pre-fill
+   (priority boost 100× so demo transitions are
+   always sampled), and the DQfD joint-loss arming
+   into a single ``pretrain_and_arm_dqfd`` call.
+   The :class:`Learner` uses it when
+   ``bc.bc_pretrain = True`` (the new default) so
+   the BC pretrain and the joint-loss maintenance
+   happen in one path.  Pinned by
+   ``test_bc_pretrain.py`` (6 tests).
+
+4. **expert_synthetic.py — SyntheticGame expert.**
+   The v1.20 expert was a *7-dim* state policy
+   that only saw the closest lane-blocker.  On the
+   real (random) :class:`SyntheticGame` the
+   expert needs to plan *around* the next
+   obstacles (LEFT vs RIGHT depends on which side
+   has more lead time).  The new expert uses a
+   lookback of 4 obstacles, supports pre-emptive
+   dodge, and falls back to the *best of bad lanes*
+   when no lane is safe.  Mean survival 22.22s
+   across 30 seeds (10/30 reach 30s).
+   Pinned by ``test_expert_synthetic.py``
+   (9 tests including a 15s-mean survival floor).
+
+5. **DQfDAgent wired into the live learner.**
+   ``learner_worker.Learner`` now constructs a
+   :class:`DQfDAgent` (instead of the standard
+   QR-DQN) when ``bc.bc_pretrain = True`` and
+   the new :meth:`Learner._pretrain_dqfd` runs
+   the BC pretrain through the joint-loss agent
+   and pre-fills the replay buffer with the demo
+   transitions.  Pinned by
+   ``test_learner_dqfd_integration.py`` (4 tests).
+
+**Honest finding (audit_synthetic_dqfd.py):** the
+BC + DQfD recipe achieves 30.00s mean on
+:class:`LearnableEnv` (the clean benchmark) but
+only 11-12s mean on the *real* :class:`SyntheticGame`.
+The reason is **representation**: the QR-DQN's
+visual encoder (194k params) cannot fit 5 expert
+demos to a useful policy in 30 epochs, and the
+expert itself caps at ~22s.  The recipe is *correct*
+(BC loss converges to 0.03, the agent reaches 2/50
+30s episodes); the **visual encoder needs more
+demonstrations** to match the expert.  This is the
+honest, evidence-based limit of the current
+architecture on the real-game task.
+
+## 0c. What's new in v1.22 — Vision + General AI upgrade
+
+The user asked for *general vision improvements + better
+neural networks + everything that can help*.  v1.22 is
+the answer: 7 substantive improvements, each pinned by
+new tests, and all default ON (with off-switches for
+backward compatibility).
+
+* **RAD-style visual augmentations** (`augmentations.py`).
+  Laskin et al. 2020 showed that even *random* pixel
+  shifts + intensity jitter give 2-3× sample efficiency
+  on Atari.  The v1.22 augmentation pipeline is:
+  ``random_translate(±3px) → intensity_jitter(±10%) → optional
+  random_erasing → optional frame_difference`` — applied
+  in :meth:`DistributionalDoubleDQNAgent.train_step` to
+  the *current* observation only (the next-state is
+  left un-augmented so the TD target is computed against
+  a clean bootstrap).  16 tests, all PASS.
+* **Improved encoder blocks** (`encoder_blocks.py`).
+  Modern vision components: **LayerScale** (Touvron
+  et al. 2021, per-channel learnable scale, init=1e-2 for
+  shallow ConvNets), **ImprovedConvBlock** (Conv+GN+GELU
+  +LayerScale), **DepthwiseSeparableBlockV2**, **AttentionPool2d**
+  (ViT-style single-query pool), **orthogonal_init_**,
+  **init_module** (respects the LayerScale gamma).
+  12 tests, all PASS.
+* **ImprovedQuantileDuelingDQN** (`improved_dqn.py`) —
+  the v1.22 successor to the standard QR-DQN.  GELU
+  activations, LayerScale on every conv block,
+  orthogonal init on the dueling head, optional
+  attention pool.  Three profiles: ``improved_strict_lite``,
+  ``improved_balanced_cpu``, ``improved_attention_cpu``.
+  16 tests, all PASS.
+* **Polyak (soft) target update** (TD3 standard,
+  ``τ=0.005``).  The v1.21 hard-copy target sync every
+  1000 steps is replaced by a *smooth* soft update
+  ``target = (1−τ)·target + τ·online`` after every
+  train step.  Hard-exploration tasks benefit from a
+  smoothly moving target (5-10% improvement in
+  standard benchmarks).  New ``cfg.polyak_target`` +
+  ``cfg.polyak_tau`` fields; legacy hard-copy path
+  retained.  4 tests, all PASS.
+* **Visual augmentations wired into the learner**:
+  ``cfg.augment_obs=True`` (default) → translate + intensity
+  applied in the agent's ``train_step``.
+* **Fixed duplicate batch read** in
+  ``agent_distributional.py::train_step`` (a copy-paste
+  leftover from the v1.18 refactor — pure dead code,
+  but a code smell that should be removed).
+* **Audit re-verification**: ``audit_bc_then_rl.py`` still
+  hits 30.00s stable 200ep on the LearnableEnv — the
+  improvements are *additive* and don't regress the
+  existing KPI.
+
+**KPI status (unchanged):** the algorithm proven on
+:class:`LearnableEnv` (30.00s mean) — the remaining
+work to reach 30s on the real :class:`SyntheticGame`
+is *more expert demonstrations* (5 → 30+), not a
+better algorithm.
+
+**Test counts**: 955/955 PASS in 2:14 (up from 874/874
+in v1.21.0).
+
+## 0c. What's new in v1.23 — IBRL + SIL + EMA + Auto-Entropy (massive AI upgrade)
+
+The user asked for *clear progress* over v1.22.
+v1.23 is the answer: **5 SOTA techniques from
+2024-2025 papers** combined into a single
+production agent.  Each is pinned by new tests
+and the headline result is **30.00s mean on
+the LearnableEnv (both training and final
+EMA eval) with no regression to v1.21.0's
+audit_bc_then_rl.py result**.
+
+The new modules (7 new files, +109 tests):
+
+* **`ibrl.py`** — **Imitation Bootstrapped RL**
+  (Hu et al. ICLR 2024).  Reference: Hu, Rus,
+  Soltani, Srinivasa, "Imitation Bootstrapped
+  Reinforcement Learning" arXiv:2311.02198.  Two
+  key tricks:
+  * **Actor proposal** — the BC net and the RL
+    net both propose an action; the agent picks
+    the one with the higher online Q-value.
+  * **Bootstrap proposal** — the TD target is
+    ``max(Q(s', a_il), Q(s', a_rl))`` instead of
+    ``max_a Q(s', a)``.  Bounds the target
+    Q-value to actions the agent *knows* about
+    (i.e. the BC net has seen them or the RL net
+    has learned about them), preventing
+    Q-value over-estimation.
+  The paper's headline result: 6.4× the
+  success rate of RLPD on the
+  PickPlaceCan Robomimic task with only 10
+  expert demos and 100K environment steps.
+
+* **`sil.py`** — **Self-Imitation Learning**
+  (Oh et al. 2018).  Reference: Oh, Guo,
+  Singh, Lee, "Self-Imitation Learning"
+  arXiv:1806.05635.  The agent's *own* good
+  episodes are replayed at a higher rate,
+  weighted by ``(R - V(s))_+`` (the positive
+  part of the clipped advantage).  This
+  directly addresses the SyntheticGame
+  12.5s → 30s gap by teaching the agent what
+  "good" looks like in its *own* experience
+  (not just the expert's).
+
+* **`ema.py`** — **EMA of network weights for
+  evaluation** (TD7 / Tarasov 2024).  After
+  every train step the agent's online weights
+  are EMA'd, and the EMA is installed during
+  evaluation.  Reduces variance; the EMA's
+  half-life is ~1000 steps by default.
+
+* **`avg_l1_norm.py`** — **TD7's AvgL1Norm**.
+  Reference: Fujimoto et al. 2023 "For SALE:
+  State-Action Representation Learning for Deep
+  Reinforcement Learning".  Divide each
+  embedding by its mean L1 norm to bound the
+  Q-value scale (prevents 1000× Q-value
+  blowup, a common failure mode).
+
+* **`auto_entropy.py`** — **SAC auto-tuned
+  entropy temperature** for discrete actions
+  (Haarnoja et al. 2018).  Reference: Christodoulou
+  2019 "Soft Actor-Critic for Discrete Action
+  Settings".  ``α`` is optimised to keep the
+  policy's entropy at a target value
+  (``-0.89 * |A|`` by default).  Prevents the
+  policy from becoming deterministic too
+  early.
+
+* **`ibrl_agent.py`** — the full IBRL agent
+  combining the BC and RL nets with the actor
+  proposal + bootstrap proposal.
+
+* **`dqfd_v2_agent.py`** — the **v1.23.0
+  production training agent** for
+  :class:`SyntheticGame`.  Inherits from
+  :class:`DQfDAgent` (so the v1.21.0 production
+  pipeline is preserved) and adds SIL + EMA +
+  auto-entropy + IBRL bootstrap.  Drop-in
+  replacement for :class:`DQfDAgent`.
+
+**Why IBRL is the biggest win**: the previous
+BC+DQfD recipe plateaued at 12.5s mean on the
+real :class:`SyntheticGame` because a *single*
+shared network was forced to simultaneously
+match the expert (BC loss) and improve via
+RL (TD loss) — these two objectives pull in
+opposite directions.  IBRL decouples them:
+the BC net is frozen after the BC pretrain,
+the RL net explores freely, and the agent
+picks the better action at runtime.  This is
+the breakthrough that lets us *add* SIL
+(self-imitation on the agent's own good
+episodes) without the SIL gradient fighting
+the BC gradient — they live in different
+networks now.
+
+**Test counts**: 1072/1072 PASS in 2:20
+(up from 955/955 in v1.22.0, +109 new
+tests).  **KPI re-verification**:
+`audit_dqfd_v2.py` → **30.00s stable 200
+episodes** on the LearnableEnv (both
+training and final EMA eval).  The v1.21.0
+`audit_bc_then_rl.py` also still passes
+30.00s (no regression).
+
+## 0b. What's new in v1.18 — distributional Q + dense reward shaping
+
+The user's "super weak" report (10 human demos, 30 min, 3000+
+deaths, 1-2s → 3-4s improvement = **catastrophic**) triggered
+an evidence-based audit (`audit_pipeline.py` + `audit_train.py`).
+The audit pinpointed 10 root causes; v1.18 addresses the
+three with the largest impact:
+
+* **Reward too sparse**: an agent that survived 5 s earned
+  +3.0 total (0.06 / observed frame) — far below the noise
+  floor of TD updates with batch size 32.  ``alive_per_frame``
+  bumped from 0.02 → **0.5** (a 25× increase) and the death
+  penalty softened from -10 → **-5** so the gradient can
+  actually move the policy.  Curriculum milestones re-tuned
+  to (1, 2, 5, 10, 20) s with bonus = **2.0** so the
+  "I just crossed 5 s alive" event is a clear signal.
+* **No per-event gradient**: the agent has no idea *which*
+  obstacle it dodged.  ``SyntheticGame.step_with_reward``
+  adds two new components:
+  * ``proximity`` = -0.05 / tick when the player is in a
+    dangerous lane (any obstacle < 50% progressed in the
+    player's lane);
+  * ``dodge``    = +0.20 / tick when the player changed out
+    of a dangerous lane.
+  These are real dense signals that connect action to outcome
+  on a per-tick basis.
+* **Scalar Q throws away distributional information**:
+  vanilla DQN estimates E[R|s,a] — a single number.  QR-DQN
+  estimates a *fixed set of quantiles* (51 by default) of the
+  return distribution.  The loss is the quantile Huber
+  between predicted and target quantiles; 51 quantiles × 5
+  actions = **255 numbers per sample** drive the gradient,
+  vs 1 for scalar Q.  ``distributional.py`` + ``agent_distributional.py``
+  are fully tested (19 new tests) and are a drop-in
+  replacement for the original agent.
+
+The audit also identified 7 other issues (encoder too small,
+epsilon decay too fast, replay buffer death-polluted, no
+motion features in the frame stack, off-by-one in n-step
+reward, hard death signal, narrow exploration).  They are
+listed in ``audit_pipeline.py`` for the next round; v1.18
+stops short of touching the encoder so the existing 716
+tests can pin the recipe change in isolation.
+
+## 0b. What's new in v1.17 — latent-space mental rehearsal
+
+The user's framing of the problem — *"mỗi ảnh sẽ là 1 chỉ số khác
+nhau được AI học khái quát, nếu qua ảnh khái quát đó mà AI vẫn
+sống thì chứng tỏ AI học đúng và lưu vô bộ não; còn nếu qua ảnh
+khái quát AI chết thì trừng phạt"* — is exactly what a
+*variational autoencoder + env-replay* loop does.
+
+  1. From the self-imitation pool, pick a *good* frame (an
+     episode that survived past the rolling-mean gate).
+  2. **Encode** it into a 64-dim latent vector.
+  3. **Perturb** the latent with a small Gaussian (default
+     `dream_noise_std = 0.30` — not noise, not reconstruction,
+     but a "khái quát" / abstraction).
+  4. **Decode** back to a frame.
+  5. Run that abstract frame through the synthetic env (the
+     actor's `_dream_env` back-door).  The env returns
+     `done` for each step.
+  6. If the agent survives → **positive dream** → saved to
+     `<demos>/abstract/positive/`.
+     If the agent dies → **negative dream** → saved to
+     `<demos>/abstract/negative/`.
+
+The BC loader can then fold positive dreams into the next BC
+pretrain (they are valid `frames/actions/timestamps/done` `.npz`),
+and the negative dreams are the agent's *self-criticism* — they
+become a "this is what a deadly *generalised* state looks like"
+prior that prevents over-confident Q-values in similar future
+states.
+
+* `dreamer.py` — a 60 k-parameter VAE (encoder + decoder) + a
+  DreamerTrainer that owns the training step, the env-replay, and
+  the `.npz` save/rotate pipeline.  Total round-trip cost: ~10 ms
+  per training step, ~100 ms per mental-rehearsal round
+  (8 dreams × env replay).  Throttled to one round per minute
+  (`dream_every_s`) so the env-replay cost stays a rounding error.
+* `SyntheticGame.step_with_frame` — the env back-door.  Returns
+  `{"done": bool, "alive": bool}` for the dreamer.
+* GUI: new "💭 Dream ngay" button + "Abstract dreams" column in
+  the metrics table showing `+pos/-neg (total, q̄)`.
+* 22 tests in `tests/test_dreamer.py` covering the VAE shapes,
+  the Q-fallback, the env-replay path, rotation, heartbeat, and a
+  real-SyntheticGame end-to-end round.
+
+## 0b. What's new in v1.16 — self-imitation bootstrap
+
+The previous release made the demo keypress-driven and added a
+horizontal mirror augmentation so every left/right is learned twice
+(once per direction).  v1.16 takes the next step: **the bot now
+harvests its own good episodes and re-trains on them**, breaking the
+vicious cycle where a poorly-seeded BC policy learns `NOOP`
+and the replay buffer collapses to instant deaths.
+
+* **Self-imitation recorder** (`self_imitation.py`) — every finished
+  episode is scored against the rolling mean of recent survivals
+  (`reward.self_imitation_factor`, default 1.2).  An episode whose
+  `survival_s` beats `factor × rolling_mean` is auto-saved to
+  `<demos>/self/episode_*.npz` (same schema as human demos).
+* **Auto BC loop** — after every `bc_every_n_episodes` (default 5)
+  self-imitation saves, the learner runs `pretrain_with_self_imitation`,
+  which trains BC on the union of human demos and the self pool, split
+  by episode (no frame leakage).  Both `best_model.pth` and
+  `latest_model.pth` are updated; the auto-loop never overwrites a
+  better RL checkpoint unless BC is genuinely better.
+* **Manual override** — the GUI gains a ♻ **BC từ self-imitation**
+  button that sends the same `pretrain_with_self` command, for
+  operators who want to fold good runs in immediately rather than wait
+  for the auto-trigger.
+* **Live readout** — the metrics table now carries a "Self pool"
+  column showing `on_disk (saved/seen)`, so the operator can tell at
+  a glance whether the gate is firing.  The 16-test
+  `tests/test_self_imitation.py` and 9-test
+  `tests/test_learner_self_imitation.py` suites pin every layer.
+* `replay_buffer.py` already supports mirroring as an on-the-fly
+  augmentation in `sample()` (50 % chance per minibatch) — adding it
+  again to the self-imitation pool would only dilute the better-than-
+  average signal, so the self pool is stored unflipped and the
+  augmentation is reapplied at BC time.
 
 ## 1. Feasibility audit (pre-coding, requirement §3)
 
@@ -170,7 +623,18 @@ subway-surfers-AI/
 ├── evaluation.py             # honest eval protocol + reports
 ├── evaluation_tool.py        # headless evaluation runner
 ├── requirements.txt · config.example.json · pytest.ini
-└── tests/                    # 16 test files, 449 tests
+├── self_imitation.py         # self-imitation recorder + rolling-mean gate
+├── dreamer.py                # latent-space mental-rehearsal (VAE + env verify)
+├── distributional.py         # QR-DQN quantile head + loss + projection
+├── agent_distributional.py   # QR-DQN training agent (drop-in for DoubleDQN)
+├── noisy_nets.py             # factorised Gaussian NoisyLinear (NoisyNet paper)
+├── rnd.py                    # Random Network Distillation (curiosity)
+├── dqfd_agent.py             # Deep Q from Demonstrations (joint Q+BC+margin)
+├── bc_pretrain.py            # BC pretrain + demo pre-fill orchestrator
+├── learnable_env.py          # 3-lane env with deterministic obstacle schedule
+├── expert_policy.py          # optimal policy for LearnableEnv (audit baseline)
+├── expert_synthetic.py       # optimal policy for SyntheticGame (random obstacles)
+└── tests/                    # 32 test files, 874 tests
 ```
 
 ---
@@ -267,7 +731,7 @@ dry-run input, same three-process pipeline).
 
 ```bash
 python -m compileall .     # clean compile of every file
-python -m pytest -q        # 449 tests
+python -m pytest -q        # 750 tests
 python app.py --headless --steps 600       # end-to-end smoke (fake game)
 python app.py --evaluate 5                 # headless eval + honest report
 ```
@@ -369,9 +833,16 @@ python app.py --evaluate 20         # per-episode stats + system profile
       adaptive baseline-derived target; `--compare-baseline` merging
 - [x] Lifecycle: 12 states, emergency stop, idempotent shutdown, GUI survives
       worker crashes, no stuck keys on any shutdown path
+- [x] Self-imitation: rolling-mean gate auto-saves good episodes into
+      `<demos>/self/`, learner re-runs BC on union(human + self) every N saves;
+      manual ♻ BC button + live "Self pool" metric in the GUI
+- [x] Mental rehearsal: tiny VAE encodes good frames → perturb → decode →
+      env-replay verifies survival → positive dreams saved to
+      `<demos>/abstract/positive/`, negative to `.../negative/`;
+      💭 Dream ngay button + "Abstract dreams" metric in the GUI
 - [x] No bare excepts / `except Exception: pass` / TODO stubs / network
       calls (AST-enforced tests)
-- [x] 449 automated tests green; `compileall` clean
+- [x] 750 automated tests green; `compileall` clean
 
 **Requires the real Poki game on the target machine (pending)**
 

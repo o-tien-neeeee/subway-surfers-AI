@@ -892,6 +892,16 @@ class ControlGUI:
         self.btn_pretrain = ttk.Button(ctrl, text="Tiền-huấn luyện (BC)", command=self.run_pretrain,
                                        state=tk.DISABLED)
         self.btn_pretrain.pack(side=tk.LEFT, padx=3)
+        self.btn_self_bc = ttk.Button(
+            ctrl, text="♻ BC từ self-imitation",
+            command=self.run_self_pretrain,
+            state=tk.DISABLED)
+        self.btn_self_bc.pack(side=tk.LEFT, padx=3)
+        self.btn_dream = ttk.Button(
+            ctrl, text="💭 Dream ngay",
+            command=self.run_dream,
+            state=tk.DISABLED)
+        self.btn_dream.pack(side=tk.LEFT, padx=3)
         self.btn_emergency = ttk.Button(ctrl, text="⛔ KHẨN CẤP (F8)",
                                         command=self.emergency_stop)
         self.btn_emergency.pack(side=tk.RIGHT, padx=3)
@@ -910,6 +920,8 @@ class ControlGUI:
             ("learner_updates", "Bước learner"), ("cpu", "CPU %"),
             ("ram", "RAM (GB)"), ("profile", "Profile model"),
             ("best", "Tốt nhất"),
+            ("self_imitation", "Self pool"),
+            ("dreams", "Abstract dreams"),
         ]
         for i, (key, label) in enumerate(cols):
             r, c = divmod(i, 3)
@@ -948,8 +960,8 @@ class ControlGUI:
         ):
             if self.sm.can(BotState.READY):
                 self._set_state(BotState.READY)
-            for btn in (self.btn_start, self.btn_demo, self.btn_pretrain):
-                btn.configure(state=tk.NORMAL)
+        for btn in (self.btn_start, self.btn_demo, self.btn_pretrain, self.btn_self_bc, self.btn_dream):
+            btn.configure(state=tk.NORMAL)
 
     # ------------------------------------------------------------------ #
     # Training control
@@ -1198,6 +1210,47 @@ class ControlGUI:
         self.log("learner đang kiểm tra demo rồi học bắt chước — xem log bên dưới.")
         self.status_var.set("Đang tiền-huấn luyện BC… xem log.")
 
+    def run_self_pretrain(self) -> None:
+        """Manual self-imitation retrain: BC on human demos + saved self episodes.
+
+        Distinct from the auto-trigger that fires after every N
+        self-imitation saves — this is the "I just watched a couple of
+        great runs, fold them in NOW" button.  The same command also
+        tells the learner to call
+        :meth:`learner_worker.Learner.pretrain_with_self_imitation`,
+        so the GUI message stream (``pretrain_done``) reports
+        ``n_human`` / ``n_self`` for the operator.
+        """
+        if self.app is None:
+            self.status_var.set("Bắt đầu train trước (learner giữ việc BC).")
+            return
+        self._pre_pretrain_state = self.sm.state
+        self._set_state(BotState.PRETRAINING)
+        self.app.command("pretrain_with_self",
+                         human_dir=str(self.cfg.paths.demos_dir))
+        self.log("=== BẮT ĐẦU BC TỪ SELF-IMITATION ===")
+        self.log(f"thư mục demos: {self.cfg.paths.demos_dir}")
+        self.log("learner sẽ BC trên union(human + self) — chờ log bên dưới.")
+        self.status_var.set("Đang BC từ self-imitation… xem log.")
+
+    def run_dream(self) -> None:
+        """Manual mental-rehearsal trigger.
+
+        Sends ``"dream_now"`` to the learner, which (subject to its
+        own throttle) generates a batch of abstract frames, runs each
+        through the synthetic env, and writes positive/negative
+        dreams to ``<demos>/abstract/``.  The operator can use this
+        to fold "khái quát" into the policy right after a long
+        training session, instead of waiting for the auto-throttle.
+        """
+        if self.app is None:
+            self.status_var.set("Dreamer chưa sẵn sàng (chưa start).")
+            return
+        self.app.command("dream_now")
+        self.log("💭 yêu cầu dreamer chạy ngay (throttle "
+                 f"{self.cfg.dreamer.dream_every_s:.0f}s có thể bỏ qua).")
+        self.status_var.set("Đang chạy mental-rehearsal…")
+
     # ------------------------------------------------------------------ #
     # Polling loop (the ONLY place worker data reaches Tk)
     # ------------------------------------------------------------------ #
@@ -1259,6 +1312,25 @@ class ControlGUI:
                 name = d.get("best_metric_name", "survival_s")
                 self.metric_vars["best"].set(
                     "—" if best is None or best < 0 else f"{best:.1f} ({name})")
+                # Self-imitation: the operator can see at a glance
+                # whether the gate is firing.  The two numbers we
+                # care about are "how many good episodes have we
+                # saved" and "how big is the on-disk pool".
+                seen = int(d.get("self_imitation_seen", 0))
+                saved = int(d.get("self_imitation_saved", 0))
+                on_disk = int(d.get("self_imitation_on_disk", 0))
+                self.metric_vars["self_imitation"].set(
+                    f"{on_disk} (đã lưu {saved}/{seen})")
+                # Abstract dreams: same idea, one row up.  We show
+                # positive/negative counts so the operator can tell
+                # at a glance whether the dreamer is producing
+                # "khái quát" frames the policy still survives on.
+                pos = int(d.get("on_disk_positive", 0))
+                neg = int(d.get("on_disk_negative", 0))
+                total = int(d.get("dreams_total", 0))
+                q_mean = float(d.get("dream_q_mean", 0.0))
+                self.metric_vars["dreams"].set(
+                    f"+{pos}/-{neg} (tổng {total}, q̄={q_mean:.2f})")
             elif kind == "best_model":
                 d = msg.get("data") or msg
                 self.log(f"NEW BEST MODEL ({d.get('metric')}: rolling="
@@ -1279,6 +1351,11 @@ class ControlGUI:
                     self.log(f"WARNING held keys: {d['held_keys']}")
             elif kind == "pretrain_done":
                 self._on_pretrain_done(msg.get("result", {}))
+            elif kind == "self_imitation_saved":
+                d = msg.get("data") or msg
+                self.log(f"📼 self-imitation: episode {d.get('episode_id')} "
+                         f"(sống {d.get('survival_s', 0):.1f}s) — "
+                         f"đã lưu vào self pool.")
             elif kind == "log":
                 self.log(f"[{msg.get('src')}] {msg.get('msg')}")
             elif kind == "error":
@@ -1323,7 +1400,16 @@ class ControlGUI:
         if status == "ok":
             hist = res.get("history") or []
             last = hist[-1] if hist else {}
-            self.log("=== TIỀN-HUẤN LUYỆN HOÀN TẤT ===")
+            # ``pretrain_with_self_imitation`` returns n_human / n_self
+            # in addition to history; surface them so the operator
+            # knows what the BC run actually saw.
+            n_human = res.get("n_human")
+            n_self = res.get("n_self")
+            if n_human is not None:
+                self.log("=== SELF-IMITATION BC HOÀN TẤT ===")
+                self.log(f"  human demo: {n_human}  |  self episode: {n_self}")
+            else:
+                self.log("=== TIỀN-HUẤN LUYỆN HOÀN TẤT ===")
             self.log(f"{len(hist)} epoch | val_acc cuối="
                      f"{float(last.get('val_acc', 0)):.3f} | "
                      f"train_acc={float(last.get('train_acc', 0)):.3f}")

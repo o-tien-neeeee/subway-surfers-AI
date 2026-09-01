@@ -636,16 +636,22 @@ class TestGuardedDrain:
 # --------------------------------------------------------------------- #
 class TestEpisodeBoundaries:
     def test_respawn_restores_the_death_penalty(self) -> None:
-        """The -10 penalty used to fire once per process, not per episode."""
+        """The -5 penalty used to fire once per process, not per episode.
+
+        v1.18 bumped the magnitude from -10 to -5 (see the
+        reward_signal audit in audit_pipeline.py) so the test
+        value tracks the new default; the *behaviour* is what
+        the test pins: the penalty must reset on respawn().
+        """
         from config import BotConfig
         from environment import GameEnvironment
 
         env = GameEnvironment(BotConfig())
         env.reset()
         env.reward_calc.begin_episode(0.0)
-        assert env.reward_calc.death_reward() == pytest.approx(-10.0)
+        assert env.reward_calc.death_reward() == pytest.approx(-5.0)
         env.respawn()
-        assert env.reward_calc.death_reward() == pytest.approx(-10.0), (
+        assert env.reward_calc.death_reward() == pytest.approx(-5.0), (
             "the second episode got no death penalty")
 
     def test_flush_transitions_survives_an_unseeded_stack(self) -> None:
@@ -1737,17 +1743,36 @@ class TestBcAwareEpsilon:
                 epsilon_for_frame(frame, rl))
 
     def test_after_bc_caps_exploration_early(self):
+        """DEEP-FIX v1.21.0: with ``disable_exploration_after_bc=True``
+        (the new default — see audit_bc_then_rl.py) the actor uses
+        pure exploitation (ε=0) after BC.  The legacy
+        ``epsilon_after_bc`` cap is only active when the flag is
+        explicitly disabled.
+        """
         from config import RLConfig
         from agent import effective_epsilon
         rl = RLConfig()
-        # at frame 0 the raw schedule is epsilon_start (1.0); BC caps it
-        assert effective_epsilon(0, rl, 1.0) == pytest.approx(rl.epsilon_after_bc)
-        assert effective_epsilon(10_000, rl, 1.0) <= rl.epsilon_after_bc + 1e-9
+        # v1.21.0 default: BC → ε=0 (the audit proved ε=0.15
+        # destroys the BC policy).
+        assert effective_epsilon(0, rl, 1.0) == 0.0
+        assert effective_epsilon(10_000, rl, 1.0) == 0.0
+        # Legacy path: when the flag is off, the cap
+        # still applies.
+        rl2 = RLConfig(disable_exploration_after_bc=False)
+        assert effective_epsilon(0, rl2, 1.0) == pytest.approx(
+            rl2.epsilon_after_bc)
+        assert effective_epsilon(10_000, rl2, 1.0) <= rl2.epsilon_after_bc + 1e-9
 
     def test_after_bc_still_decays_below_cap(self):
+        """With the legacy ``epsilon_after_bc`` cap, the
+        schedule still decays below the cap once the
+        linear decay reaches ``epsilon_end``.
+        """
         from config import RLConfig
         from agent import effective_epsilon, epsilon_for_frame
-        rl = RLConfig()
+        # Legacy path: ``disable_exploration_after_bc=False``
+        # preserves the old "cap + decay below" behaviour.
+        rl = RLConfig(disable_exploration_after_bc=False)
         late = rl.epsilon_decay_frames  # schedule reaches epsilon_end here
         assert effective_epsilon(late, rl, 1.0) == pytest.approx(
             epsilon_for_frame(late, rl))
@@ -1855,27 +1880,49 @@ def _mk_episode(actions):
 
 class TestWhyPressOversampling:
     """Round 19: 'why did the human press?' — dodges are rare but fatal, so BC
-    must oversample them instead of drowning them in NOOP."""
+    must oversample them instead of drowning them in NOOP.
+
+    The dataset is constructed with the keypress-window filter and
+    horizontal mirror EXPLICITLY DISABLED so the count assertions below
+    describe the legacy / augmentation-off behaviour.  With the new
+    defaults (window on, mirror on) the same episode would give a larger
+    index — see :mod:`tests.test_dataset_augment` for that contract.
+    """
 
     def test_dodge_press_counts(self) -> None:
         from dataset import DemonstrationDataset
+        from demo_augment import DemoAugmentor
         # NOOP NOOP LEFT LEFT NOOP JUMP NOOP -> LEFT pressed once, JUMP once
-        ds = DemonstrationDataset([_mk_episode([0, 0, 1, 1, 0, 3, 0])],
-                                  stack=4, dodge_oversample=1)
+        ds = DemonstrationDataset(
+            [_mk_episode([0, 0, 1, 1, 0, 3, 0])],
+            stack=4, dodge_oversample=1,
+            augment=DemoAugmentor(keypress_window=False,
+                                  mirror_horizontal=False),
+        )
         c = ds.dodge_press_counts()
         assert c[1] == 1 and c[3] == 1 and c[0] == 0
 
     def test_oversample_grows_only_dodge_frames(self) -> None:
         from dataset import DemonstrationDataset
+        from demo_augment import DemoAugmentor
         ep = _mk_episode([0, 0, 1, 1, 0, 3, 0])  # 4 NOOP + 3 dodge frames
-        assert len(DemonstrationDataset([ep], stack=4, dodge_oversample=1)) == 7
-        # 4 NOOP x1 + 3 dodge x4 = 16
-        assert len(DemonstrationDataset([ep], stack=4, dodge_oversample=4)) == 4 + 3 * 4
+        aug = DemoAugmentor(keypress_window=False, mirror_horizontal=False)
+        # 7 distinct frames, each present once.
+        assert len(DemonstrationDataset([ep], stack=4, dodge_oversample=1,
+                                         augment=aug)) == 7
+        # Oversample only fires for press frames (idx 2 LEFT + idx 5 JUMP).
+        # The held-LEFT row at idx 3 is the same press, so it is NOT
+        # oversampled (the press count for LEFT is 1, not 2).  Total:
+        # 4 NOOP x1 + 1 LEFT @ 2 x4 + 1 LEFT @ 3 x1 + 1 JUMP @ 5 x4 = 13.
+        assert len(DemonstrationDataset([ep], stack=4, dodge_oversample=4,
+                                         augment=aug)) == 4 + 1 * 4 + 1 + 1 * 4
 
     def test_oversample_off_is_legacy(self) -> None:
         from dataset import DemonstrationDataset
+        from demo_augment import DemoAugmentor
         ep = _mk_episode([0, 1, 0, 2, 0])
-        assert len(DemonstrationDataset([ep], stack=4)) == 5  # default off-by-count
+        aug = DemoAugmentor(keypress_window=False, mirror_horizontal=False)
+        assert len(DemonstrationDataset([ep], stack=4, augment=aug)) == 5
 
     def test_config_exposes_dodge_oversample(self) -> None:
         from config import BCConfig

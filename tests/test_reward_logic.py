@@ -37,20 +37,31 @@ class TestSurvivalRewards:
         assert r.alive == pytest.approx(0.02 * 6, rel=0.05)
 
     def test_death_penalty_once(self) -> None:
+        # v1.18: death_penalty softened to -5.0 (was -10.0) so
+        # the gradient signal in the synthetic env can actually
+        # compete with the survival reward.  See audit_pipeline
+        # for the evidence.
         calc = SurvivalRewardCalculator(RewardConfig())
         calc.begin_episode(0.0)
         r1 = calc.step(ts=0.1, action=0, horizon=hz(1, 0.1, 0, False), died=True)
-        assert r1.death == -10.0
+        assert r1.death == -5.0
         assert r1.total < 0
         r2 = calc.step(ts=0.2, action=0, horizon=hz(2, 0.2, 0, False), died=True)
         assert r2.death == 0.0, "death penalty must be applied exactly once"
 
     def test_total_clipped_to_bounds(self) -> None:
-        calc = SurvivalRewardCalculator(RewardConfig(alive_per_frame=0.02))
+        # v1.18: alive_per_frame default bumped to 0.5 (was 0.02)
+        # so the test exercises the new magnitude, but the bound
+        # is still the upper clip.
+        calc = SurvivalRewardCalculator(RewardConfig())
         calc.begin_episode(0.0)
         r = calc.step(ts=0.01, action=0, horizon=hz(1, 0.01, 0, False), died=True)
-        assert r.death == -10.0
-        assert r.total == pytest.approx(-10.0 + 0.006, abs=0.01)
+        assert r.death == -5.0
+        # Total should be -5 (death) + tiny alive component.  With
+        # alive_per_frame=0.5 and dt=0.01 the alive component is
+        # 0.5 * 0.01 * 30 = 0.15, so total ≈ -4.85.  Well above
+        # the lower clip so it is not clipped.
+        assert r.total == pytest.approx(-5.0 + 0.15, abs=0.05)
         assert r.clipped is False
         # absurdly large alive component must clip at max
         r2 = calc.step(ts=1000.0, action=0, horizon=hz(2, 1000.0, 0, False))
@@ -174,7 +185,11 @@ class TestPixelDiffAblation:
         """A 'hacker' flashing the screen every frame must not farm more
         reward than the clip allows; total stays within bounds."""
         cfg = RewardConfig(use_pixel_diff_reward=True, pixel_diff_clip=0.01,
-                           alive_per_frame=0.02)
+                           alive_per_frame=0.02,
+                           # disable curriculum for this test so the bound
+                           # is the same as before the curriculum change.
+                           curriculum_milestones=(),
+                           curriculum_bonus=0.0)
         calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
         rng = np.random.default_rng(0)
@@ -196,4 +211,5 @@ class TestPixelDiffAblation:
         calc.begin_episode(0.0)
         r = calc.step(ts=0.03, action=0, horizon=hz(1, 0.03, 0, False))
         d = r.to_dict()
-        assert set(d) == {"alive", "death", "hazard", "pixel_diff", "total", "clipped"}
+        assert set(d) == {"alive", "death", "hazard", "pixel_diff",
+                          "curriculum", "total", "clipped"}
