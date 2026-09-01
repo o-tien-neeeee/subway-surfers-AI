@@ -102,11 +102,76 @@ class PerceptionConfig:
     #: Mean luminance below which a frame is treated as black/invalid.
     black_mean_threshold: float = 4.0
 
+    #: DEEP-FIX (v1.24.0 — "AI mù chân trời"): the policy used to see ONLY
+    #: the bottom ``1 - horizon_frac`` of the captured region (the "ground
+    #: band"), because the same split that feeds the HorizonDetector was
+    #: reused to build the CNN observation.  In Subway Surfers the top band
+    #: is exactly where trains/barriers first appear, so an obstacle only
+    #: entered the observation 0.5-1.5 s before impact — the policy could
+    #: not dodge what it never saw.  When ``policy_full_frame`` is True the
+    #: policy observation is the WHOLE region resized to ``obs_size``², and
+    #: the horizon band survives *only* as the detector's input.  Set False
+    #: to restore the legacy cropped observation (ablation).
+    policy_full_frame: bool = True
+    #: Side of the square policy observation (uint8, grayscale).
+    obs_size: int = 84
+
     def __post_init__(self) -> None:
         if not (0.15 <= self.horizon_frac <= 0.40):
             raise ConfigError(
                 f"horizon_frac must be within [0.15, 0.40], got {self.horizon_frac}"
             )
+        if not (32 <= self.obs_size <= 256):
+            raise ConfigError(
+                f"perception.obs_size must be within [32, 256], got {self.obs_size}"
+            )
+
+    @property
+    def policy_size(self) -> int:
+        """Side of the frame the policy actually consumes.
+
+        With ``policy_full_frame`` the policy view is ``obs_size``²; the
+        legacy cropped path keeps ``ground_size``² so old checkpoints and
+        recorded demos stay loadable.
+        """
+        return self.obs_size if self.policy_full_frame else self.ground_size
+
+
+@dataclass
+class ObstacleConfig:
+    """Structured lane/depth obstacle grid (see :mod:`obstacle_perception`).
+
+    Feeds the *causal* reward terms (``reward.clear_bonus`` /
+    ``reward.danger_penalty``) and the actor's danger flag.  Pure
+    numpy/cv2 on an 84x84 frame — well under 1 ms, so it is free on a
+    weak CPU next to the CNN forward pass.
+    """
+
+    #: Master switch.  When False no clear/danger shaping is produced.
+    enabled: bool = True
+    lanes: int = 3
+    #: Depth resolution of the track in front of the player.
+    depth_rows: int = 5
+    #: Vertical extent of the tracked play area, as a fraction of the
+    #: region height: ``top_frac`` is the far band (just under the
+    #: horizon) and ``bottom_frac`` the player's own row.
+    top_frac: float = 0.30
+    bottom_frac: float = 0.97
+    #: Fraction of each lane strip ignored on both sides so painted lane
+    #: dividers are not mistaken for obstacles.
+    lane_margin_frac: float = 0.12
+    #: Sobel magnitude above which a pixel counts as an edge, and the
+    #: fraction/mean a cell needs to be called occupied.
+    edge_pixel_threshold: float = 40.0
+    min_cell_frac: float = 0.06
+    grad_threshold: float = 14.0
+    #: Consecutive occupied updates before a cell becomes a real track
+    #: (debounce — one noisy frame must not pay a dodge bonus).
+    confirm_cells: int = 2
+    #: Rows (counted from the player upwards) treated as "imminent".
+    near_rows: int = 2
+    #: Cap on clear credits paid per agent step.
+    max_clears_per_step: int = 2
 
 
 @dataclass
@@ -210,35 +275,49 @@ class SchedulerConfig:
 
 @dataclass
 class RewardConfig:
-    #: Alive reward per frame at the nominal 30 FPS.  v1.18 bumped
-    #: this from 0.02 to 0.5 (a 25× increase) because the audit
-    #: showed the gradient signal was invisible: an agent that
-    #: survived 5 s only earned +3.0 total, which is 0.06 per
-    #: observed frame — far below the noise floor of TD updates
-    #: with batch size 32.  0.5/step gives +15.0 / 5s, which is
-    #: comparable to the magnitude of the death penalty so the
-    #: survival signal can actually move the policy.
+    #: DEEP-FIX (v1.24.0): the survival term is a *positive counter*.
+    #: Every DQN bot that has demonstrably learned Subway Surfers pays a
+    #: dense, strictly-positive per-step reward and NO catastrophic death
+    #: penalty, so an episode's return is simply proportional to how long
+    #: it survived and early episodes rank themselves instead of all
+    #: reading as the same negative number.  0.5/step at the nominal 30
+    #: FPS ≈ +15/s (kept from v1.18 — already the right magnitude).
     alive_per_frame: float = 0.5
     nominal_fps: int = 30
-    #: Death penalty softened from -10 to -5.  The original -10
-    #: created a "death-polluted" replay buffer where 30 % of
-    #: samples were terminal transitions, dragging the Q-value
-    #: estimate toward "everything leads to death" and collapsing
-    #: exploration.  -5 is still a strong deterrent (cancels
-    #: about 10 s of alive reward) but lets the agent learn that
-    #: "the long path of living is worth taking".
-    death_penalty: float = -5.0
-    #: Per-hazard-resolve bonus bumped from 0.1 to 1.0.  Without
-    #: this the agent has no per-event gradient ("you survived
-    #: THIS obstacle").  1.0 = ~0.5s of alive reward, large
-    #: enough to be a clear "yes, that was the right move" signal
-    #: in the TD update.
+    #: DEEP-FIX (v1.24.0): default 0.0 (was -5.0, originally -10.0).
+    #: With a negative terminal penalty every short episode lands at
+    #: almost the same negative return, so the TD gradient cannot tell a
+    #: good dodge from a bad one — this is the #1 "6000 episodes, +1 s"
+    #: plateau cause.  Death is still a *terminal* transition, which is
+    #: all the signal bootstrapping needs (``(1-done)`` zeroes the
+    #: bootstrap).  Set -5.0/-10.0 to restore the legacy ablation.
+    death_penalty: float = 0.0
+    #: Legacy per-hazard-resolve bonus.  DEEP-FIX (v1.24.0): OFF by
+    #: default.  It fires on *any* key press held across the frames
+    #: after the horizon detector blinks, so it pays for button-mashing
+    #: and teaches the "keeps jumping / keeps rolling" policy that both
+    #: published Subway Surfers DQN write-ups report as their failure
+    #: mode.  The causal replacement is ``clear_bonus`` below, which is
+    #: paid only when an obstacle actually passes the player's lane
+    #: without a death (see :mod:`obstacle_perception`).
     hazard_bonus: float = 1.0
+    use_hazard_bonus: bool = False
+    #: Paid once per obstacle that leaves the player's lane while the
+    #: agent is still alive — a causal "that dodge worked" credit.
+    clear_bonus: float = 0.5
+    #: Opt-in shaping (default 0 = off): small penalty while an obstacle
+    #: sits in the player's lane at the nearest depth rows.
+    danger_penalty: float = 0.0
+    #: Opt-in anti-spam cost per non-NOOP decision (default 0 = off).
+    action_cost: float = 0.0
     #: Pending-hazard events resolve after this many valid frames.
     hazard_resolve_frames: int = 2
     #: Pending events older than this are expired without reward.
     hazard_expiry_s: float = 1.2
-    reward_clip_min: float = -10.0
+    #: DEEP-FIX (v1.24.0): 0.0 (was -10.0) — with the positive-counter
+    #: reward the return is naturally non-negative, so clipping at 0
+    #: keeps a stray negative component from re-creating the plateau.
+    reward_clip_min: float = 0.0
     reward_clip_max: float = 3.0
     #: Ablation switches (pixel-diff reward is OFF by default; see audit).
     use_pixel_diff_reward: bool = False
@@ -449,7 +528,28 @@ class RLConfig:
     use_rnd: bool = True
     #: Training cadence (learner updates) — independent of action cadence.
     max_updates_per_second: float = 20.0
+    #: DEEP-FIX (v1.24.0 — Atari-style frame skip / decision cadence).
+    #: One *agent step* = ``frame_skip`` captured frames during which the
+    #: chosen action is held and the per-frame rewards are accumulated
+    #: into that step's transition.  This matters for three reasons:
+    #:   1. ``gamma`` and ``n_step`` are expressed per *decision*, so the
+    #:      effective planning horizon becomes ``gamma``^(n_step*frame_skip
+    #:      /fps) instead of a 3.3 s window that cannot see the death a
+    #:      dodge 6 s later prevents.
+    #:   2. The observation stack holds ``frame_stack`` *decisions* of
+    #:      history (~0.4 s of motion) instead of 0.13 s.
+    #:   3. One labelled transition per decision instead of one per frame
+    #:      with a stale action repeated 2-4×, which is what corrupts the
+    #:      action→Q credit assignment.
+    #: Subway Surfers swipes are instantaneous taps, so holding an action
+    #: for 3 frames (100 ms) does not repeat the manoeuvre.
+    frame_skip: int = 3
     n_step: int = 5
+    #: DEEP-FIX (v1.24.0): ε decays over *agent steps* (decisions), not
+    #: captured frames.  With frame_skip=3 the old 50 000-frame schedule
+    #: is ~16 700 decisions; expressed directly in decisions the schedule
+    #: stays correct if the capture FPS or frame_skip changes.
+    epsilon_decay_steps: int = 100_000
     #: Epsilon decays LINEARLY over `epsilon_decay_frames` ENV frames
     #: (frames observed by the actor), from start to end.  Explicitly NOT
     #: learner updates and NOT action steps.
@@ -516,6 +616,33 @@ class BCConfig:
     #: Each dodge frame is repeated this many times in BC training so the rare,
     #: critical presses actually drive the gradient.  1 = off (legacy behaviour).
     dodge_oversample: int = 4
+    #: DEEP-FIX (v1.24.0 — "bot học phản ứng muộn"): a human's key press
+    #: lands 200-300 ms AFTER they perceived the obstacle, so a demo
+    #: labelled at the press frame teaches the policy to press when the
+    #: obstacle is already on top of the player — at 30 FPS that is an
+    #: unplayable reaction time.  The recorder therefore back-dates each
+    #: press label by this many milliseconds (≈7 frames at 30 FPS), so the
+    #: demonstration says "press here, while it is still 2 lanes away".
+    #: 0 = off (legacy frame-exact labelling).
+    label_backdate_ms: int = 220
+
+    #: HG-DAgger (human-gated DAgger).  Behaviour cloning alone suffers
+    #: compounding error: the policy drifts into states the demo never
+    #: covered and no supervision exists there.  DAgger fixes exactly
+    #: that by collecting labels *in the policy's own state
+    #: distribution*.  With ``dagger`` on, pressing the demo hotkey while
+    #: the BOT is playing arms an intervention: the frames around the
+    #: human's corrective key presses are written to a separate
+    #: ``dagger`` demo directory, so the next BC pass is trained on the
+    #: states where the bot actually fails.
+    dagger: bool = True
+    #: Frames kept before the first corrective press (context) and after
+    #: the last one (the recovery), i.e. the intervention window.
+    dagger_pre_frames: int = 15
+    dagger_tail_frames: int = 45
+    #: Auto-disarm the intervention this long after the last press, so a
+    #: single tap-and-let-go cannot keep recording the whole episode.
+    dagger_auto_stop_s: float = 1.5
 
 
 @dataclass
@@ -590,6 +717,7 @@ class BotConfig:
     version: str = CONFIG_VERSION
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+    obstacle: ObstacleConfig = field(default_factory=ObstacleConfig)
     horizon: HorizonConfig = field(default_factory=HorizonConfig)
     death: DeathConfig = field(default_factory=DeathConfig)
     region: RegionConfig = field(default_factory=RegionConfig)
@@ -649,6 +777,30 @@ class BotConfig:
             raise ConfigError("rl.gamma must be in (0, 1)")
         if self.rl.n_step < 1 or self.rl.n_step > 10:
             raise ConfigError("rl.n_step must be in [1, 10]")
+        if not (1 <= self.rl.frame_skip <= 10):
+            raise ConfigError("rl.frame_skip must be in [1, 10]")
+        if self.rl.epsilon_decay_steps < 1:
+            raise ConfigError("rl.epsilon_decay_steps must be >= 1")
+        if not (1 <= self.perception.obs_size <= 256):
+            raise ConfigError("perception.obs_size must be in [1, 256]")
+        if self.obstacle.enabled:
+            if not (1 <= self.obstacle.lanes <= 8):
+                raise ConfigError("obstacle.lanes must be in [1, 8]")
+            if not (1 <= self.obstacle.depth_rows <= 32):
+                raise ConfigError("obstacle.depth_rows must be in [1, 32]")
+            if not (0.0 <= self.obstacle.top_frac
+                    < self.obstacle.bottom_frac <= 1.0):
+                raise ConfigError(
+                    "obstacle.top_frac must be < obstacle.bottom_frac within [0, 1]"
+                )
+            if not (1 <= self.obstacle.near_rows <= self.obstacle.depth_rows):
+                raise ConfigError(
+                    "obstacle.near_rows must be in [1, obstacle.depth_rows]"
+                )
+        if self.bc.label_backdate_ms < 0 or self.bc.label_backdate_ms > 1000:
+            raise ConfigError("bc.label_backdate_ms must be in [0, 1000]")
+        if self.bc.dagger and self.bc.dagger_tail_frames < 1:
+            raise ConfigError("bc.dagger_tail_frames must be >= 1")
         if self.rl.best_metric not in ("survival_s", "total_reward"):
             raise ConfigError(
                 "rl.best_metric must be 'survival_s' or 'total_reward'"
@@ -668,7 +820,7 @@ class BotConfig:
         return warnings
 
     def _replay_ram_estimate_gb(self) -> float:
-        frame_bytes = self.perception.ground_size ** 2
+        frame_bytes = self.perception.policy_size ** 2
         # Frame store keeps unique frames once (lazy stacking); priorities,
         # actions and bookkeeping add a small constant per transition.
         per_transition = frame_bytes + 64
@@ -700,9 +852,9 @@ class BotConfig:
     def from_dict(cls, data: dict[str, Any]) -> "BotConfig":
         cfg = cls()
         for section in (
-            "capture", "perception", "horizon", "death", "region", "input",
-            "scheduler", "reward", "per", "rl", "bc", "demo_augment", "perf",
-            "paths",
+            "capture", "perception", "obstacle", "horizon", "death", "region",
+            "input", "scheduler", "reward", "dreamer", "rnd", "per", "rl", "bc",
+            "demo_augment", "perf", "paths",
         ):
             if section in data and isinstance(data[section], dict):
                 current = getattr(cfg, section)

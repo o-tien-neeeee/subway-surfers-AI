@@ -23,6 +23,10 @@ def _make_recorder(tmp_path, cfg: BotConfig = None) -> DemoRecorder:
     cfg.region.width, cfg.region.height = 480, 800
     cfg.region.screen_width, cfg.region.screen_height = 1920, 1080
     cfg.region.dpi_scale = 1.25
+    # These tests pin the WINDOW FILTER in isolation; label back-dating
+    # (v1.24.0) adds a second window boundary per press and is covered by
+    # its own tests in tests/test_deep_research_fixes.py.
+    cfg.bc.label_backdate_ms = 0
     return DemoRecorder(cfg, tmp_path / "demos", lambda: None)
 
 

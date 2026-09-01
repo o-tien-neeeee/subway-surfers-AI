@@ -638,15 +638,18 @@ class TestEpisodeBoundaries:
     def test_respawn_restores_the_death_penalty(self) -> None:
         """The -5 penalty used to fire once per process, not per episode.
 
-        v1.18 bumped the magnitude from -10 to -5 (see the
-        reward_signal audit in audit_pipeline.py) so the test
-        value tracks the new default; the *behaviour* is what
-        the test pins: the penalty must reset on respawn().
+        v1.24.0 made ``reward.death_penalty`` default to 0.0 (positive
+        counter reward, see config.RewardConfig), so this test now pins the
+        legacy -5 explicitly.  The *behaviour* is what it checks: whatever
+        the penalty is, it must re-arm on respawn().
         """
         from config import BotConfig
         from environment import GameEnvironment
 
-        env = GameEnvironment(BotConfig())
+        cfg = BotConfig()
+        cfg.reward.death_penalty = -5.0
+        cfg.reward.reward_clip_min = -10.0
+        env = GameEnvironment(cfg)
         env.reset()
         env.reward_calc.begin_episode(0.0)
         assert env.reward_calc.death_reward() == pytest.approx(-5.0)

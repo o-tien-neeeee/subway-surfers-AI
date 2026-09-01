@@ -1,6 +1,6 @@
 # Subway Surfers Research Bot (screen-capture RL agent)
 
-> **Current version / Phiên bản hiện tại: `1.23.0`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
+> **Current version / Phiên bản hiện tại: `1.24.0`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
 
 A personal, **black-box** UI-automation research bot that plays
 [Poki Subway Surfers](https://poki.com/en/g/subway-surfers) using only screen
@@ -13,7 +13,7 @@ Target machine: Windows 64-bit, i5-7200U (2C/4T), 12 GB RAM, Intel HD 620,
 Chrome.
 
 > **Honesty first.** Everything in this repo runs and is unit-tested headless
-> (750 tests, see §Testing). The bot has **not yet been run against the real
+> (1125 tests, see §Testing). The bot has **not yet been run against the real
 > Poki game** — no real-game benchmark numbers exist yet, so every real-game
 > metric is labelled *not yet measured*. Nothing here is claimed to be
 > "superhuman", "frame-perfect", or "production-ready"; those labels require
@@ -21,7 +21,71 @@ Chrome.
 
 ---
 
-## 0. What's new in this upgrade (v1.1)
+## 0. What's new in v1.24.0 — deep fix MDP ("train 6000 episode chỉ +1 giây")
+
+Full reasoning, evidence and the before/after table live in
+**`DEEP_RESEARCH_vi.md`**.  Summary of the seven root causes fixed, each with
+its own tests in `tests/test_deep_research_fixes.py` (40 new tests;
+suite **1077 → 1125 green**):
+
+1. **The policy was blind to the horizon.** `perception.py` reused the
+   horizon/ground split to build the CNN input, so the top 25% — exactly where
+   trains and barriers first appear — never entered the observation.
+   `perception.policy_full_frame=True` now feeds the CNN the WHOLE region
+   (`obs_size`²); the horizon band survives only as the detector's input.
+2. **Every short episode scored the same negative number.** With a −5/−10
+   death penalty the TD gradient could not separate a good dodge from a bad
+   one.  The reward is now a **positive counter** (`reward.death_penalty=0`,
+   `reward_clip_min=0`): death is a *terminal* transition, which is all the
+   signal bootstrapping needs.  This is the recipe the publicly documented
+   DQN bots that actually learned this game use (see `DEEP_RESEARCH_vi.md`
+   appendices A/B).
+3. **`hazard_bonus` paid for button-mashing.** It fired on any key press held
+   after a horizon blink — the documented "keeps jumping or rolling" failure
+   mode.  Now off by default (`reward.use_hazard_bonus=False`).
+4. **No causal success signal.** New module **`obstacle_perception.py`**: a
+   `depth_rows × lanes` occupancy grid (pure numpy/cv2, <1 ms) pays
+   `reward.clear_bonus` only when an obstacle actually passes the player's
+   lane while the player stays alive.  The state machine is per LANE (not per
+   cell) because obstacles move; a collision is never credited as a dodge.
+5. **The MDP was not frame-skip.** The actor shipped one transition per frame
+   carrying a stale `_last_action`, while decisions happened every 2–4 frames;
+   `gamma`/`n_step` were therefore expressed in frames (≈3.3 s horizon) and the
+   4-frame stack held 0.13 s of motion.  `rl.frame_skip=3` makes one agent
+   step = 3 frames with the action held, rewards summed into ONE transition,
+   and the stack/n-step/gamma all counted per DECISION.
+6. **Exploration decayed in the wrong unit.** `agent.epsilon_for_step()` decays
+   ε per decision (`rl.epsilon_decay_steps=100k`), so the schedule no longer
+   changes meaning when the capture FPS or the cadence is tuned.
+7. **Transitions were shifted one step.** `_ship_transition` used the stack at
+   ship time (already containing the frames the action produced); it now uses
+   the observation captured at decision time, so `(obs_before, action, R,
+   obs_after_n_steps)` matches the n-step target's assumption.
+
+Learning-from-human fixes:
+
+* **Label back-dating** (`bc.label_backdate_ms=220`): a human presses 200–300 ms
+  after perceiving the obstacle, so labels recorded at the press frame teach an
+  unplayable reaction time.  The recorder now rewrites the preceding NOOP rows
+  with the pressed action (never overwriting a different real dodge).
+* **Demos match the inference view**: the recorder stores the same full-frame
+  `policy_gray` the CNN consumes, and `dataset.validate_episode` checks the
+  configured `policy_size` instead of a hardcoded 84.
+* **HG-DAgger** (`bc.dagger`, GUI 🎓 button / **F10** while the bot plays):
+  press an arrow key to take over when the bot is about to fail, and the frames
+  around your correction are saved to `<demos>/dagger/` and folded into the
+  next BC pass (the loader is recursive).  This is the compounding-error fix
+  plain BC cannot provide.
+
+Housekeeping: `config.example.json` was **regenerated from the current
+defaults** — the previous copy still carried `death_penalty=-10`,
+`alive_per_frame=0.02`, `hazard_bonus=0.1`, `epsilon_decay_frames=150000`,
+i.e. exactly the plateau configuration, and copying it to `config.json`
+silently overrode every fix above.
+
+---
+
+## 0b. What's new in the earlier v1.1 upgrade
 
 Continuing from the first complete build, this round closes the remaining
 specification gaps and hardens four subsystems — all verified by new tests
@@ -731,7 +795,7 @@ dry-run input, same three-process pipeline).
 
 ```bash
 python -m compileall .     # clean compile of every file
-python -m pytest -q        # 750 tests
+python -m pytest -q        # 1125 tests
 python app.py --headless --steps 600       # end-to-end smoke (fake game)
 python app.py --evaluate 5                 # headless eval + honest report
 ```

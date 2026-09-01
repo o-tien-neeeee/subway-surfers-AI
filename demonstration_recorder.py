@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -206,6 +207,24 @@ class DemoRecorder:
         # how many presses the current episode has captured without
         # touching the internal lists.  Reset in start().
         self.press_count: int = 0
+        # DEEP-FIX (v1.24.0): label back-dating.  A human reacts 200-300 ms
+        # AFTER perceiving the obstacle, so a demo labelled at the press frame
+        # teaches the bot to press when the obstacle is already on top of it.
+        # The recorder rewrites the NOOP rows immediately preceding each press
+        # with the pressed action, i.e. "press here, while it is still far".
+        fps = max(1, int(cfg.capture.target_fps))
+        self._backdate_frames = int(
+            round(max(0, int(getattr(cfg.bc, "label_backdate_ms", 0))) * fps / 1000.0))
+        self.backdated_labels = 0
+        # HG-DAgger intervention state (see arm_dagger()).
+        self._dagger_armed = False
+        self._dagger_collecting = False
+        self._dagger_window: deque = deque()
+        self._dagger_rows: list = []
+        self._dagger_presses = 0
+        self._dagger_pre_len = 0
+        self._dagger_last_press = 0.0
+        self.dagger_episodes_saved = 0
 
     #: keys that are shortcuts, never game actions (alt-tab, ctrl-arrow …)
     MODIFIER_KEYS = frozenset({
@@ -252,16 +271,28 @@ class DemoRecorder:
                 self._held_order.remove(key_name)
             self._held_order.append(key_name)
             self._recompute_current()
-            # Record the press index AFTER _current_action is set so the
-            # window built around it covers the frame the human actually
-            # saw when deciding to press.  ``len(self._frames)`` is the
-            # index the press will be ASSIGNED to (the next tick appends
-            # the row), so subtract 0 here is wrong — the press frame is
-            # the next one to be appended, which is ``len(_frames)``.
-            # Cap the recorded index at 0 so a press received before the
-            # first frame still maps to a valid row.
-            self._press_indices.append(max(0, len(self._frames)))
-            self.press_count = len(self._press_indices)
+            # DEEP-FIX (v1.24.0): label back-dating.  The rows for the frames
+            # the human was LOOKING AT when they decided are already in
+            # ``_actions`` (labelled NOOP), so rewrite them with the action
+            # that followed.  Only NOOP rows are touched: overwriting a
+            # different dodge would corrupt a genuine two-key manoeuvre.
+            press_row = len(self._frames)  # row the next tick will append
+            if self._backdate_frames > 0:
+                start = max(0, len(self._actions) - self._backdate_frames)
+                backdated_any = False
+                for i in range(start, len(self._actions)):
+                    if self._actions[i] == NOOP:
+                        self._actions[i] = action
+                        self.backdated_labels += 1
+                        backdated_any = True
+                if backdated_any:
+                    # Register the back-dated row as an extra press boundary
+                    # so the keypress-window filter keeps BOTH the frames the
+                    # human reacted to and the frames they pressed on.
+                    self._press_indices.append(start)
+            self._press_indices.append(max(0, press_row))
+            self.press_count += 1
+            self._dagger_note_press(action)
 
     def _handle_release(self, key_name: str) -> None:
         if key_name in self.MODIFIER_KEYS:
@@ -360,6 +391,7 @@ class DemoRecorder:
             death = list(self._death)
             score = list(self._score)
             press_indices = list(self._press_indices)
+            press_events = int(self.press_count)
         lengths = {len(frames), len(actions), len(ts), len(conf),
                    len(death), len(score)}
         if len(lengths) != 1:
@@ -422,7 +454,11 @@ class DemoRecorder:
                 getattr(self.cfg, "demo_augment", None), "keypress_pre", 5)),
             "keypress_post": int(getattr(
                 getattr(self.cfg, "demo_augment", None), "keypress_post", 5)),
-            "press_count": len(press_indices),
+            # Real human presses (not window boundaries: a back-dated press
+            # contributes two boundaries but is still one press).
+            "press_count": press_events,
+            "label_backdate_ms": int(getattr(self.cfg.bc, "label_backdate_ms", 0)),
+            "backdated_labels": int(self.backdated_labels),
         }
         # DEEP-FIX: %Y%m%d_%H%M%S has one-second resolution, so two episodes
         # finished in the same second overwrote each other.  Add a monotonic
@@ -456,6 +492,143 @@ class DemoRecorder:
         tmp.replace(path)
         self.episode_paths.append(str(path))
         LOGGER.info("demo episode saved: %s (%d steps)", path, n)
+        return str(path)
+
+    # ------------------------------------------------------------------ #
+    # HG-DAgger: correction demos collected while the BOT is playing
+    # ------------------------------------------------------------------ #
+    def arm_dagger(self, armed: bool = True) -> bool:
+        """Start/stop collecting HG-DAgger corrections.
+
+        While armed, the recorder keeps a short rolling window of frames
+        and, the moment the human presses a game key (i.e. takes over
+        because the bot is about to fail), it snapshots that window and
+        keeps recording for ``cfg.bc.dagger_tail_frames`` more rows.  The
+        result is written to ``<out_dir>/dagger/`` as a normal episode
+        file, so the next BC pass is trained on *the policy's own state
+        distribution at the moments it fails* — the compounding-error fix
+        plain BC cannot provide.
+        """
+        if not bool(getattr(self.cfg.bc, "dagger", False)):
+            LOGGER.warning("dagger disabled in config (bc.dagger=False)")
+            return False
+        with self._lock:
+            self._dagger_armed = bool(armed)
+            self._dagger_collecting = False
+            self._dagger_rows.clear()
+            self._dagger_window.clear()
+        LOGGER.info("dagger intervention %s", "ARMED" if armed else "disarmed")
+        return bool(armed)
+
+    @property
+    def dagger_armed(self) -> bool:
+        with self._lock:
+            return bool(self._dagger_armed)
+
+    def _dagger_note_press(self, action: int) -> None:
+        """Called from :meth:`_handle_press` while recording."""
+        if not self._dagger_armed:
+            return
+        if not self._dagger_collecting:
+            self._dagger_collecting = True
+            self._dagger_rows = list(self._dagger_window)
+            # Rows already in the buffer are the *lead-in* context; the tail
+            # budget counts only the frames recorded after the takeover.
+            self._dagger_pre_len = len(self._dagger_rows)
+            self._dagger_presses = 0
+            LOGGER.info("dagger: intervention bắt đầu (%d khung dẫn trước)",
+                        self._dagger_pre_len)
+        self._dagger_presses += 1
+        self._dagger_last_press = time.monotonic()
+
+    def _dagger_tick(self, row: tuple) -> None:
+        """Append one recorded row to the DAgger window / intervention."""
+        if not self._dagger_armed:
+            return
+        if self._dagger_collecting:
+            self._dagger_rows.append(row)
+            tail = max(1, int(getattr(self.cfg.bc, "dagger_tail_frames", 45)))
+            idle = time.monotonic() - self._dagger_last_press
+            auto_stop = float(getattr(self.cfg.bc, "dagger_auto_stop_s", 1.5))
+            collected = len(self._dagger_rows) - self._dagger_pre_len
+            if collected >= tail and idle > auto_stop:
+                self._save_dagger_episode()
+        else:
+            pre = max(1, int(getattr(self.cfg.bc, "dagger_pre_frames", 15)))
+            self._dagger_window.append(row)
+            while len(self._dagger_window) > pre:
+                self._dagger_window.popleft()
+
+    def _save_dagger_episode(self) -> Optional[str]:
+        """Write the collected intervention out as its own episode file."""
+        rows = list(self._dagger_rows)
+        self._dagger_rows = []
+        self._dagger_collecting = False
+        self._dagger_window.clear()
+        if len(rows) < 2:
+            return None
+        frames = [r[0] for r in rows]
+        actions = [r[1] for r in rows]
+        ts = [r[2] for r in rows]
+        death = [r[3] for r in rows]
+        conf = [r[4] for r in rows]
+        score = [r[5] for r in rows]
+        out_dir = self.out_dir / "dagger"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "fps_target": self.cfg.capture.target_fps,
+            "region": {
+                "left": self.cfg.region.left, "top": self.cfg.region.top,
+                "width": self.cfg.region.width, "height": self.cfg.region.height,
+                "screen_width": self.cfg.region.screen_width,
+                "screen_height": self.cfg.region.screen_height,
+                "dpi_scale": self.cfg.region.dpi_scale,
+            },
+            "horizon_frac": self.cfg.perception.horizon_frac,
+            "profile": self.cfg.rl.profile,
+            "keymap": {str(a): k for a, k in self.cfg.input.keymap.items()},
+            "recorded_at": time.time(),
+            # Marks the file as an HG-DAgger correction so the dataset /
+            # GUI can tell it apart from a plain human demonstration.
+            "dagger": True,
+            "press_count": int(self._dagger_presses),
+            "keypress_window": False,
+        }
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        seq = 0
+        while True:
+            name = f"dagger_{stamp}" + (f"_{seq:02d}" if seq else "") + ".npz"
+            path = out_dir / name
+            if not path.exists():
+                break
+            seq += 1
+            if seq > 999:  # pragma: no cover - defensive
+                path = out_dir / f"dagger_{stamp}_{time.time_ns()}.npz"
+                break
+        done_flags = np.zeros(len(rows), dtype=bool)
+        done_flags[-1] = True
+        tmp = path.with_suffix(".npz.tmp")
+        with open(tmp, "wb") as fh:
+            np.savez_compressed(
+                fh,
+                frames=np.stack(frames).astype(np.uint8),
+                actions=np.asarray(actions, dtype=np.int64),
+                timestamps=np.asarray(ts, dtype=np.float64),
+                done=done_flags,
+                score=np.asarray(score, dtype=np.float32),
+                confidence=np.asarray(conf, dtype=np.float32),
+                death_state=np.asarray(death, dtype="U16"),
+                meta=np.str_(json.dumps(meta)),
+            )
+        tmp.replace(path)
+        self.episode_paths.append(str(path))
+        self.dagger_episodes_saved += 1
+        LOGGER.info("dagger correction saved: %s (%d steps)", path, len(rows))
+        if self.on_episode_saved is not None:
+            try:
+                self.on_episode_saved(str(path))
+            except Exception as exc:  # pragma: no cover - GUI callback
+                LOGGER.warning("on_episode_saved failed: %s", exc)
         return str(path)
 
     @staticmethod
@@ -594,9 +767,13 @@ class DemoRecorder:
                 else:
                     self._dead_streak = 0
         z = self.pre.process(frame.image, frame.frame_id, frame.ts)
-        if not z.valid or z.ground_gray is None:
+        if not z.valid or z.policy_gray is None:
             return False
-        zone = np.ascontiguousarray(z.ground_gray)
+        # DEEP-FIX (v1.24.0): the demo now stores the SAME full-frame view
+        # the policy consumes at inference time.  Recording the cropped
+        # ground band while the CNN sees the whole screen would silently
+        # train BC on a different input distribution than the bot plays with.
+        zone = np.ascontiguousarray(z.policy_gray)
         # DEEP-FIX: every column is appended under the same lock so a
         # concurrent stop() can never see a ragged episode.
         with self._lock:
@@ -623,6 +800,10 @@ class DemoRecorder:
             self._death.append(str(death_state))
             self._conf.append(float(confidence))
             self._score.append(float(score))
+            dagger_row = (zone, int(self._current_action), float(frame.ts),
+                          str(death_state), float(confidence), float(score))
+        # HG-DAgger bookkeeping is outside the lock (it never re-enters it).
+        self._dagger_tick(dagger_row)
         return True
 
     def pump(self, max_frames: int = 4) -> int:

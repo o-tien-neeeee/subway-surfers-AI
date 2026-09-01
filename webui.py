@@ -87,7 +87,7 @@ class DemoSession:
                 self.env = GameEnvironment(cfg, SyntheticGame(seed=int(seed)))
                 model = DuelingDQN.from_profile(
                     self.profile, cfg.perception.frame_stack,
-                    cfg.perception.ground_size)
+                    cfg.perception.policy_size)
                 self.policy = InferencePolicy(model, seed=int(seed))
             except Exception as exc:                       # pragma: no cover
                 self.last_error = f"{type(exc).__name__}: {exc}"

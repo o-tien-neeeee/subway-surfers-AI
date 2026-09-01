@@ -40,6 +40,10 @@ class RewardBreakdown:
     hazard: float = 0.0
     pixel_diff: float = 0.0
     curriculum: float = 0.0
+    #: v1.24.0 causal shaping (see :mod:`obstacle_perception`).
+    clear: float = 0.0
+    danger: float = 0.0
+    action_cost: float = 0.0
     total: float = 0.0
     clipped: bool = False
     reason: str = ""
@@ -51,6 +55,9 @@ class RewardBreakdown:
             "hazard": self.hazard,
             "pixel_diff": self.pixel_diff,
             "curriculum": self.curriculum,
+            "clear": self.clear,
+            "danger": self.danger,
+            "action_cost": self.action_cost,
             "total": self.total,
             "clipped": 1.0 if self.clipped else 0.0,
         }
@@ -298,13 +305,31 @@ class SurvivalRewardCalculator:
         ground_gray=None,
         prev_ground_gray=None,
         died: bool = False,
+        cleared: int = 0,
+        danger: bool = False,
+        is_decision: bool = True,
     ) -> RewardBreakdown:
         alive = self.alive_reward(ts)
         hazard = 0.0
         if horizon.detected:
             self.hazards.register(horizon)
-        hazard = self.hazards.on_frame(horizon, action)
+        # DEEP-FIX (v1.24.0): the legacy hazard bonus is opt-in now.  It
+        # pays for ANY dodge action held across the frames after a horizon
+        # blink — including presses that dodge nothing — which is exactly
+        # how a policy ends up "keeping jumping or rolling".  The causal
+        # replacement is ``clear`` below.
+        if self.cfg.use_hazard_bonus:
+            hazard = self.hazards.on_frame(horizon, action)
         self.hazards.expire_old(ts)
+        # Causal shaping from the obstacle grid.  ``cleared`` is only ever
+        # reported for obstacles that passed the player's lane while the
+        # player stayed alive, so it cannot credit a collision, and it is
+        # capped per step by ObstacleConfig.max_clears_per_step.
+        clear = float(cleared) * float(self.cfg.clear_bonus)
+        danger_term = -float(self.cfg.danger_penalty) if danger else 0.0
+        cost = 0.0
+        if is_decision and self.cfg.action_cost > 0.0 and action in DODGE_ACTIONS:
+            cost = -float(self.cfg.action_cost)
         # curriculum is paid BEFORE the death penalty so the
         # terminal-state transition still gets a normal "you just hit
         # 10s for the first time" credit even when the same frame is
@@ -313,7 +338,7 @@ class SurvivalRewardCalculator:
         curriculum = self.curriculum_reward(ts)
         pd = self.pixel_diff_reward(ground_gray, prev_ground_gray)
         death = self.death_reward() if died else 0.0
-        total = alive + hazard + pd + death + curriculum
+        total = alive + hazard + pd + death + curriculum + clear + danger_term + cost
         clipped = False
         if total < self.cfg.reward_clip_min:
             total, clipped = self.cfg.reward_clip_min, True
@@ -325,6 +350,9 @@ class SurvivalRewardCalculator:
             hazard=hazard,
             pixel_diff=pd,
             curriculum=curriculum,
+            clear=clear,
+            danger=danger_term,
+            action_cost=cost,
             total=total,
             clipped=clipped,
             reason="death" if died else "step",

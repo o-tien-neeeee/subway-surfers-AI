@@ -128,11 +128,38 @@ class InferencePolicy:
 
 
 def epsilon_for_frame(frame: int, cfg: RLConfig) -> float:
-    """Linear decay in ENV frames: the only definition of 'step' for eps."""
+    """Linear decay in ENV frames (legacy schedule, kept for ablation)."""
     if frame <= 0:
         return cfg.epsilon_start
     frac = min(1.0, frame / max(1, cfg.epsilon_decay_frames))
     return cfg.epsilon_start + frac * (cfg.epsilon_end - cfg.epsilon_start)
+
+
+def epsilon_for_step(step: int, cfg: RLConfig) -> float:
+    """Linear decay in AGENT STEPS (decisions) — the v1.24.0 schedule.
+
+    With frame skip the actor makes one decision every ``cfg.frame_skip``
+    captured frames, so counting captured frames makes the exploration
+    schedule depend on the capture FPS *and* the frame skip: the same
+    "50 000 frames" budget is ~16 700 decisions at frame_skip=3 and
+    ~8 300 at frame_skip=6.  Decay per decision instead and the schedule
+    means the same thing however the cadence is tuned.
+    """
+    if step <= 0:
+        return cfg.epsilon_start
+    frac = min(1.0, step / max(1, cfg.epsilon_decay_steps))
+    return cfg.epsilon_start + frac * (cfg.epsilon_end - cfg.epsilon_start)
+
+
+def effective_epsilon_for_step(step: int, cfg: RLConfig,
+                               bc_pretrained: float) -> float:
+    """``effective_epsilon`` for the per-decision schedule (same BC rules)."""
+    eps = epsilon_for_step(step, cfg)
+    if bc_pretrained > 0:
+        if getattr(cfg, "disable_exploration_after_bc", False):
+            return 0.0
+        eps = min(eps, cfg.epsilon_after_bc)
+    return eps
 
 
 def effective_epsilon(frame: int, cfg: RLConfig, bc_pretrained: float) -> float:

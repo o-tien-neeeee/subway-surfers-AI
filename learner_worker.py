@@ -90,7 +90,7 @@ class Learner:
             self.agent = build_dqfd_agent(
                 self.profile, cfg.rl, dqfd_cfg,
                 in_frames=cfg.perception.frame_stack,
-                size=cfg.perception.ground_size,
+                size=cfg.perception.policy_size,
                 num_quantiles=int(getattr(cfg.rl, "num_quantiles", 51)),
                 seed=cfg.seed)
         elif getattr(cfg.rl, "distributional", True):
@@ -219,13 +219,13 @@ class Learner:
     # ------------------------------------------------------------------ #
     def _load_or_fresh_buffer(self) -> PrioritizedReplayBuffer:
         fresh = lambda: PrioritizedReplayBuffer(  # noqa: E731
-            self.cfg.per, frame_size=self.cfg.perception.ground_size,
+            self.cfg.per, frame_size=self.cfg.perception.policy_size,
             gamma=self.cfg.rl.gamma,
         )
         loaded, ok = self.ckpt.buffer_load(
             lambda: PrioritizedReplayBuffer.load(
                 str(self.ckpt.buffer_path), self.cfg.per,
-                frame_size=self.cfg.perception.ground_size,
+                frame_size=self.cfg.perception.policy_size,
                 gamma=self.cfg.rl.gamma,
             )
         )
@@ -598,7 +598,9 @@ class Learner:
         put_bounded(self.metrics_q, {"type": "log", "level": "info",
                                      "src": "learner",
                                      "msg": f"BC: đang kiểm tra demo trong {demos_dir}…"})
-        episodes, reports = validate_directory(demos_dir)
+        episodes, reports = validate_directory(
+            demos_dir,
+            expected_size=self.cfg.perception.policy_size)
         valid = [e for e, r in zip(episodes, reports) if r.ok]
         put_bounded(self.metrics_q, {"type": "log", "level": "info",
                                      "src": "learner",
@@ -870,9 +872,13 @@ class Learner:
         """
         from dataset import validate_directory
         from pathlib import Path as _P
-        human_eps, human_reps = validate_directory(human_dir)
+        human_eps, human_reps = validate_directory(
+            human_dir,
+            expected_size=self.cfg.perception.policy_size)
         self_dir = str(self.self_imitation.out_dir)
-        self_eps, self_reps = validate_directory(self_dir)
+        self_eps, self_reps = validate_directory(
+            self_dir,
+            expected_size=self.cfg.perception.policy_size)
         human_valid = [e for e, r in zip(human_eps, human_reps) if r.ok]
         self_valid = [e for e, r in zip(self_eps, self_reps) if r.ok]
         if not human_valid and not self_valid:

@@ -50,7 +50,7 @@ def _fresh_learner(ckpt_dir: str, bc_pretrain: bool = True) -> tuple:
     if bc_pretrain:
         probe = DQfDAgent(cfg.rl.profile, cfg.rl, DQfDConfig(),
                             in_frames=cfg.perception.frame_stack,
-                            size=cfg.perception.ground_size,
+                            size=cfg.perception.policy_size,
                             num_quantiles=int(getattr(cfg.rl, "num_quantiles", 51)))
         n_params = probe.count_params()
     else:

@@ -3,8 +3,15 @@
 Pipeline per frame (all numpy/cv2, no torch on this path):
 
   captured RGB region
-    ├─ horizon band  -> resize 40x40, grayscale  -> HorizonDetector
-    └─ ground band   -> resize 84x84, grayscale  -> uint8 FrameStack
+    ├─ horizon band (top 25%) -> resize 40x40, grayscale -> HorizonDetector
+    └─ FULL FRAME             -> resize 84x84, grayscale -> uint8 FrameStack
+
+Since v1.24.0 the policy input is the whole region, not the cropped
+"ground band": cutting the top 25% away removed the part of the screen
+where obstacles first appear, which is the single biggest reason a
+pixel policy cannot learn to dodge on this game.  The horizon band is
+still produced, but only for the HorizonDetector's early-warning signal.
+Set ``perception.policy_full_frame=False`` to restore the legacy crop.
 
 * Observations stay uint8 until they enter the network (normalise inside the
   forward pass) — 4x less RAM than float32 and zero-copy views for stacking.
@@ -127,10 +134,23 @@ class ZoneResult:
     frame_id: int
     ts: float
     horizon_gray: Optional[np.ndarray]  # 40x40 uint8
-    ground_gray: Optional[np.ndarray]  # 84x84 uint8
+    ground_gray: Optional[np.ndarray]  # policy view: obs_size² uint8
     anchor_patch: Optional[np.ndarray]  # 5x5x3 uint8
     valid: bool
     reason: str = "ok"
+
+    @property
+    def policy_gray(self) -> Optional[np.ndarray]:
+        """Canonical name for the array the CNN consumes.
+
+        ``ground_gray`` is kept as the storage field for compatibility
+        with every existing call site, but since v1.24.0 it holds the
+        FULL frame (see :attr:`PerceptionConfig.policy_full_frame`) — not
+        the cropped ground band the name suggests.  New code should read
+        ``policy_gray``.
+        """
+        return self.ground_gray
+
 
 
 class ZonePreprocessor:
@@ -168,16 +188,28 @@ class ZonePreprocessor:
         split = self.split_line(h)
 
         horizon = image[:split, :, :]
-        ground = image[split:, :, :]
 
         horizon_gray = cv2.resize(
             rgb_to_gray(horizon),
             (self.cfg.horizon_size, self.cfg.horizon_size),
             interpolation=cv2.INTER_AREA,
         )
+        # DEEP-FIX (v1.24.0): the policy observation is the WHOLE region.
+        # It used to be `image[split:]` — the bottom 75% — because the same
+        # horizon/ground split that feeds the HorizonDetector was reused to
+        # build the CNN input.  That deleted exactly the band where trains
+        # and barriers first appear, so an obstacle entered the observation
+        # 0.5-1.5 s before impact and no policy could dodge what it never
+        # saw.  The horizon band survives, but only as the detector's input.
+        if getattr(self.cfg, "policy_full_frame", False):
+            policy_src = image
+            policy_side = self.cfg.obs_size
+        else:  # legacy ablation: cropped ground band
+            policy_src = image[split:, :, :]
+            policy_side = self.cfg.ground_size
         ground_gray = cv2.resize(
-            rgb_to_gray(ground),
-            (self.cfg.ground_size, self.cfg.ground_size),
+            rgb_to_gray(policy_src),
+            (policy_side, policy_side),
             interpolation=cv2.INTER_AREA,
         )
         patch = anchor_patch(image, *self.anchor_xy) if self.anchor_xy else None

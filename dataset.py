@@ -153,15 +153,20 @@ def load_episode(path: str | Path) -> Episode:
 
 
 def load_episodes(directory: str | Path) -> list[Episode]:
-    """Load every ``*.npz`` in a directory.
+    """Load every ``*.npz`` under a directory (recursively).
 
     # DEEP-FIX: an unreadable file no longer aborts the whole load; it is
     # reported through :func:`validate_directory` as an invalid episode so
     # the operator sees WHICH file is broken and BC continues with the rest.
+
+    # DEEP-FIX (v1.24.0): recursive, so HG-DAgger correction episodes (which
+    # the recorder writes to ``<demos>/dagger/``) join the BC dataset instead
+    # of sitting unread on disk.  Plain human demos stay at the top level, so
+    # both kinds are picked up by one call.
     """
     root = Path(directory)
     out: list[Episode] = []
-    for path in sorted(root.glob("*.npz")):
+    for path in sorted(root.rglob("*.npz")):
         try:
             out.append(load_episode(path))
         except EpisodeLoadError as exc:
@@ -181,7 +186,8 @@ def take_load_errors() -> dict[str, str]:
 
 
 def validate_episode(ep: Episode, target_fps: float = 30.0,
-                     gap_factor: float = 3.0) -> ValidationReport:
+                     gap_factor: float = 3.0,
+                     expected_size: int = 84) -> ValidationReport:
     rep = ValidationReport(path=ep.path, ok=True)
     rep.n_steps = len(ep)
     n = len(ep)
@@ -189,9 +195,14 @@ def validate_episode(ep: Episode, target_fps: float = 30.0,
         rep.ok = False
         rep.errors.append("empty episode")
         return rep
-    if ep.frames.ndim != 3 or ep.frames.shape[1:] != (84, 84):
+    # DEEP-FIX (v1.24.0): the expected side is the CONFIGURED policy size,
+    # not a hardcoded 84 — demos recorded with a different obs_size were
+    # rejected wholesale, which reads as "BC has no data".
+    want = (int(expected_size), int(expected_size))
+    if ep.frames.ndim != 3 or ep.frames.shape[1:] != want:
         rep.ok = False
-        rep.errors.append(f"frames shape {ep.frames.shape} != [N,84,84]")
+        rep.errors.append(
+            f"frames shape {ep.frames.shape} != [N,{want[0]},{want[1]}]")
     if not np.all((ep.actions >= 0) & (ep.actions <= 4)):
         bad = int(np.sum((ep.actions < 0) | (ep.actions > 4)))
         rep.ok = False
@@ -229,11 +240,13 @@ def validate_episode(ep: Episode, target_fps: float = 30.0,
     return rep
 
 
-def validate_directory(directory: str | Path, target_fps: float = 30.0
+def validate_directory(directory: str | Path, target_fps: float = 30.0,
+                       expected_size: int = 84
                        ) -> tuple[list[Episode], list[ValidationReport]]:
     _LOAD_ERRORS.clear()
     eps = load_episodes(directory)
-    reps = [validate_episode(e, target_fps) for e in eps]
+    reps = [validate_episode(e, target_fps, expected_size=expected_size)
+            for e in eps]
     # DEEP-FIX: files that could not even be parsed are surfaced as invalid
     # reports instead of vanishing (or crashing the caller).
     for path, reason in take_load_errors().items():

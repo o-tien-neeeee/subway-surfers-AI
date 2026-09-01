@@ -889,6 +889,10 @@ class ControlGUI:
         self.btn_demo = ttk.Button(ctrl, text="● Quay demo (F9 dừng)",
                                    command=self.toggle_demo_recording, state=tk.DISABLED)
         self.btn_demo.pack(side=tk.LEFT, padx=3)
+        # HG-DAgger: arm correction capture while the BOT plays (F10).
+        self.btn_dagger = ttk.Button(ctrl, text="🎓 HG-DAgger (F10)",
+                                     command=self.toggle_dagger, state=tk.DISABLED)
+        self.btn_dagger.pack(side=tk.LEFT, padx=3)
         self.btn_pretrain = ttk.Button(ctrl, text="Tiền-huấn luyện (BC)", command=self.run_pretrain,
                                        state=tk.DISABLED)
         self.btn_pretrain.pack(side=tk.LEFT, padx=3)
@@ -960,7 +964,8 @@ class ControlGUI:
         ):
             if self.sm.can(BotState.READY):
                 self._set_state(BotState.READY)
-        for btn in (self.btn_start, self.btn_demo, self.btn_pretrain, self.btn_self_bc, self.btn_dream):
+        for btn in (self.btn_start, self.btn_demo, self.btn_dagger,
+                    self.btn_pretrain, self.btn_self_bc, self.btn_dream):
             btn.configure(state=tk.NORMAL)
 
     # ------------------------------------------------------------------ #
@@ -1094,6 +1099,94 @@ class ControlGUI:
             except Exception as exc:
                 self.log(f"dừng hotkey demo thất bại: {exc}")
 
+    # ------------------------------------------------------------------ #
+    # HG-DAgger: human takes over while the BOT plays
+    # ------------------------------------------------------------------ #
+    def toggle_dagger(self) -> None:
+        """Arm/disarm HG-DAgger correction capture (F10 while the bot plays).
+
+        Plain behaviour cloning only ever sees the human's state
+        distribution, so the bot drifts into states no demo covered and
+        fails there — the compounding-error problem.  DAgger fixes it by
+        labelling *the bot's own* states: while this is armed, every time
+        you press an arrow key to save the bot, the frames around that
+        correction are saved to ``<demos>/dagger/`` and join the next BC
+        pass.  Requires the bot to be running (capture + actor).
+        """
+        rec = self._demo_recorder
+        if rec is not None and rec.dagger_armed:
+            rec.arm_dagger(False)
+            self._disarm_dagger_hotkey()
+            self.status_var.set("Đã tắt HG-DAgger.")
+            self.log("=== HG-DAgger: TẮT ===")
+            return
+        if self.app is None:
+            self.status_var.set("Bật bot trước, rồi bấm F10 để can thiệp (DAgger).")
+            return
+        if not bool(getattr(self.cfg.bc, "dagger", False)):
+            self.status_var.set("bc.dagger=False trong config — không thể bật.")
+            return
+        if rec is None:
+            from demonstration_recorder import DemoRecorder
+
+            class _RingReader:
+                def __init__(self, ring) -> None:
+                    self.ring = ring
+                    self._last = -1
+
+                def __call__(self):
+                    if self.ring is None:
+                        return None
+                    fr = self.ring.read_latest()
+                    if fr is None or fr.frame_id <= self._last:
+                        return None
+                    self._last = fr.frame_id
+                    return fr
+
+            rec = DemoRecorder(self.cfg, self.cfg.paths.demos_dir,
+                               _RingReader(self.app.ring))
+            rec.on_episode_saved = self._on_demo_episode_saved
+            rec.start()
+            self._demo_recorder = rec
+            self._demo_t0 = time.monotonic()
+            self._demo_last_log_t = 0.0
+        if not rec.arm_dagger(True):
+            self.status_var.set("Không bật được HG-DAgger (xem log).")
+            return
+        self._arm_dagger_hotkey()
+        self.status_var.set(
+            "HG-DAgger BẬT — để bot chơi; bấm phím mũi tên lúc nó sắp chết "
+            "để dạy nó (F10 để tắt).")
+        self.log("=== HG-DAgger: BẬT ===")
+        self.log("Mỗi lần bạn giành quyền điều khiển, các khung hình quanh cú "
+                 "sửa sẽ được lưu vào thư mục dagger/ và gộp vào lần BC sau.")
+
+    def _arm_dagger_hotkey(self) -> None:
+        if getattr(self, "_dagger_hotkey", None) is not None:
+            return
+        try:
+            from pynput import keyboard
+
+            def on_press(key):
+                if key == keyboard.Key.f10:
+                    self.root.after(0, self.toggle_dagger)
+
+            self._dagger_hotkey = keyboard.Listener(on_press=on_press)
+            self._dagger_hotkey.start()
+        except Exception as exc:
+            self._dagger_hotkey = None
+            self.log(f"F10 không khả dụng ({type(exc).__name__}: {exc}) — "
+                     "dùng nút HG-DAgger trên giao diện.")
+
+    def _disarm_dagger_hotkey(self) -> None:
+        h = getattr(self, "_dagger_hotkey", None)
+        self._dagger_hotkey = None
+        if h is not None:
+            try:
+                h.stop()
+            except Exception as exc:
+                self.log(f"dừng hotkey dagger thất bại: {exc}")
+
     def toggle_demo_recording(self) -> None:
         if self.sm.state is BotState.RECORDING_DEMO:
             self._stop_demo_recording()
@@ -1167,6 +1260,7 @@ class ControlGUI:
 
     def _stop_demo_recording(self) -> None:
         self._disarm_demo_hotkey()
+        self._disarm_dagger_hotkey()
         if self._demo_recorder is None:
             return
         path = self._demo_recorder.stop(done=True)

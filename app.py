@@ -338,7 +338,7 @@ class BotApplication:
 def cmd_validate_demos(demos_dir: str) -> int:
     from dataset import summarize_reports, validate_directory
 
-    eps, reps = validate_directory(demos_dir)
+    eps, reps = validate_directory(demos_dir, expected_size=84)
     print(summarize_reports(reps))
     ok = sum(1 for r in reps if r.ok)
     print(f"\n{ok}/{len(reps)} episodes valid for behaviour cloning")
