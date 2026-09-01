@@ -585,3 +585,43 @@ phép reward shaping "né thành công" chính xác.
 *Báo cáo này phân tích trên mã nguồn tại commit hiện tại (403 tests, pipeline headless)
 và các nguồn công khai. Mọi con số triển khai (acc, khoảng cách, ngưỡng) cần được kiểm
 chứng lại trên game thật/Poki theo đúng evaluation protocol của repo.*
+
+---
+
+## Phụ lục A — Đối chiếu công cụ lunai (video "code-free RL", ~20h/3000 run)
+
+Phân tích mã nguồn [khxji/lunai](https://github.com/khxji/lunai) (`Lunai.py`,
+`advanced_settings.json`):
+
+- **Thuật toán:** `stable_baselines3.DQN` — RL thuần, KHÔNG phải học từ người.
+  `total_timesteps ≈ 1.000.000`, buffer 150.000, LR 2.5e-4, batch 32.
+- **Observation:** grayscale **toàn cửa sổ game** resize **74×110, 1 kênh**
+  (không crop — thấy chân trời). ⇒ khớp fix #1 của báo cáo.
+- **Reward (điểm mấu chốt):** `get_reward()` trả **điểm số OCR** (easyocr tại
+  `reward_location`) HOẶC **bộ đếm `counter_reward += 1` mỗi bước** (chế độ
+  "Use a counter as reward" — tác giả ghi *"INCREASES AI FPS"*, tức rẻ hơn và
+  khuyến nghị cho máy yếu). **Toàn dương, KHÔNG có penalty chết**; chết chỉ là
+  `done=True` (OCR khớp `doneString` ở `done_location`).
+- **Reset:** tự click nút chơi lại (`Custom Reset Click`) ⇒ train liên tục
+  không cần người — đây là lý do chạy được 3.000 run trong ~20 giờ.
+
+**Bài học xác nhận/điều chỉnh báo cáo chính:**
+
+1. **Reward dương đều đặn, không phạt chết** là cấu hình thắng. Episode sống
+   lâu tự cho tổng reward cao hơn ⇒ gradient mật độ, không bị "mọi run ngắn đều
+   âm như nhau". Repo đã chuyển default theo đúng hướng này
+   (`alive_per_frame` dương/step, `death_penalty=0`, `reward_clip_min=0`);
+   reward chết −10 và action-cost giữ lại dưới dạng cờ tắt/mở cho ablation.
+2. **Observation full-frame grayscale nhỏ (74×110)** là đủ — không cần mạng to.
+   Repo dùng 84×84 full-frame (tương đương).
+3. **Auto-reset không gián đoạn + hàng triệu timestep** mới làm RL from-scratch
+   kịp hội tụ; 6000 episode ngắn của bạn là chưa đủ nếu MDP chưa sạch. Sau khi
+   MDP đã sạch (báo cáo này), hai lựa chọn:
+   - **Nhanh nhất, ít data nhất:** BC từ demo người → DQfD/DAgger (§4.2), tận
+     dụng được người chơi; hoặc
+   - **Không cần chơi tay:** bật auto-reset, dùng counter-reward, để agent tự
+     chạy nhiều giờ như lunai (đường DQN thuần). Repo đã có đủ phần tử cho cả
+     hai (counter reward + reset click tự động + DQN PER/n-step + auto best gate).
+4. **Counter reward thay cho OCR** trên máy yếu — repo đã hỗ trợ: reward sống
+   theo thời gian/step chính là counter; OCR điểm số chỉ dùng để đánh giá (đúng
+   định hướng "score is evaluation-only" hiện có).
