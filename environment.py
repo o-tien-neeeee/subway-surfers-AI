@@ -566,23 +566,25 @@ class BotActor:
 
         # ---- decide on the FIRST frame of each agent step ----------------
         # frame-skip structure: one decision every `frame_skip` captured
-        # frames (or immediately on danger); the chosen action is held.
+        # frames; the chosen action is held across the skip. The skip IS the
+        # decision cadence (Atari frame-skip), so we decide every agent step
+        # rather than re-using the scheduler's own 2-3-frame counter (which
+        # would otherwise skip decisions). pop_executable still enforces TTL
+        # and duplicate suppression for safe key delivery.
         first_frame_of_step = (self._step_frames == 0)
         if first_frame_of_step:
-            # Decide from the CURRENT stack (the previous step's final
-            # frames); the new frame is pushed below at step completion.
             self._step_action = NOOP
-            if self.scheduler.on_frame(danger=danger):
-                self._decide(danger)
-                planned = self.scheduler.pop_executable()
-                if planned is not None:
-                    self._execute(planned, t_frame)
-                    self._step_action = planned.action
+            self.scheduler.on_frame(danger=danger)  # keep danger stats fresh
+            self._decide(danger)
+            planned = self.scheduler.pop_executable()
+            if planned is not None:
+                self._execute(planned, t_frame)
+                self._step_action = planned.action
             self.counters.action_step.value = self.scheduler.action_step
             # epsilon is indexed by AGENT DECISION STEPS now (a stable clock
             # under variable cadence), not raw env frames.
             self.counters.epsilon.value = epsilon_for_step(
-                self.scheduler.action_step, self.cfg.rl)
+                max(1, self.scheduler.action_step), self.cfg.rl)
 
         # ---- per-frame reward for the action held this step --------------
         reward = self.reward_calc.step(
