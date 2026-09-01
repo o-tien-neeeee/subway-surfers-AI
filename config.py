@@ -210,20 +210,162 @@ class SchedulerConfig:
 
 @dataclass
 class RewardConfig:
-    #: Alive reward per frame at the nominal 30 FPS (~0.6/second).
-    alive_per_frame: float = 0.02
+    #: Alive reward per frame at the nominal 30 FPS.  v1.18 bumped
+    #: this from 0.02 to 0.5 (a 25× increase) because the audit
+    #: showed the gradient signal was invisible: an agent that
+    #: survived 5 s only earned +3.0 total, which is 0.06 per
+    #: observed frame — far below the noise floor of TD updates
+    #: with batch size 32.  0.5/step gives +15.0 / 5s, which is
+    #: comparable to the magnitude of the death penalty so the
+    #: survival signal can actually move the policy.
+    alive_per_frame: float = 0.5
     nominal_fps: int = 30
-    death_penalty: float = -10.0
-    hazard_bonus: float = 0.1
+    #: Death penalty softened from -10 to -5.  The original -10
+    #: created a "death-polluted" replay buffer where 30 % of
+    #: samples were terminal transitions, dragging the Q-value
+    #: estimate toward "everything leads to death" and collapsing
+    #: exploration.  -5 is still a strong deterrent (cancels
+    #: about 10 s of alive reward) but lets the agent learn that
+    #: "the long path of living is worth taking".
+    death_penalty: float = -5.0
+    #: Per-hazard-resolve bonus bumped from 0.1 to 1.0.  Without
+    #: this the agent has no per-event gradient ("you survived
+    #: THIS obstacle").  1.0 = ~0.5s of alive reward, large
+    #: enough to be a clear "yes, that was the right move" signal
+    #: in the TD update.
+    hazard_bonus: float = 1.0
     #: Pending-hazard events resolve after this many valid frames.
     hazard_resolve_frames: int = 2
     #: Pending events older than this are expired without reward.
     hazard_expiry_s: float = 1.2
     reward_clip_min: float = -10.0
-    reward_clip_max: float = 1.0
+    reward_clip_max: float = 3.0
     #: Ablation switches (pixel-diff reward is OFF by default; see audit).
     use_pixel_diff_reward: bool = False
     pixel_diff_clip: float = 0.01
+    #: Curriculum milestones: grant a one-shot bonus the FIRST time the
+    #: agent survives past each threshold (in seconds).  The bonus is
+    #: paid once per milestone per episode (re-arms at episode start),
+    #: so it does NOT compound — it shapes the early reward landscape
+    #: (small bonuses for reaching 2s/5s/10s/20s) and then goes quiet.
+    #: Without this, the only signal the agent gets is "alive or dead"
+    #: and there is no gradient telling it "you got 1% better".  The
+    #: default schedule (0.0/0.0/0.0/0.0) keeps the original behaviour.
+    curriculum_milestones: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 20.0)
+    curriculum_bonus: float = 2.0
+    #: Per-transition bonus for hazard resolution.  When 0, the legacy
+    #: ``hazard_bonus`` is used.  When positive, this is paid INSTEAD
+    #: of the hazard_bonus (so the two knobs do not double-credit the
+    #: same event).
+    hazard_resolve_bonus: float = 0.0
+    #: Self-imitation: every time the actor's survival_s for the
+    #: finished episode is at least this multiple of the rolling mean,
+    #: the episode is "good" enough to save as a self-imitation demo.
+    #: The self-imitation dataset is the union of the human demos
+    #: (from the demo recorder) and the good agent episodes (added by
+    #: the learner).  Set 0.0 to disable, 1.0 means "at or above the
+    #: average", 1.2 means "20% better than average", etc.
+    self_imitation_factor: float = 1.2
+    #: Maximum number of self-imitation episodes kept on disk (older
+    #: ones are rotated out).  Sized to keep the BC dataset
+    #: self-imitation-heavy without unbounded disk growth.
+    self_imitation_max: int = 50
+
+
+@dataclass
+class DreamerConfig:
+    """Mental-rehearsal (latent-space dreaming) configuration.
+
+    The dreamer is the third leg of the "AI tự học full aggressive"
+    stack:
+
+    * curriculum reward  — teaches *what* a good state is,
+    * self-imitation     — copies *when* a full episode is good,
+    * dreamer            — extracts *what generalises* across good
+      frames and verifies it by replaying through the env.
+
+    The user-facing description (from the field-tested phrasing in
+    the GUI):
+
+      "Mỗi ảnh sẽ là 1 chỉ số khác nhau được AI học khái quát.
+       Nếu qua ảnh khái quát đó mà AI vẫn sống thì chứng tỏ AI
+       học đúng và lưu vô bộ não (Q-network).  Còn nếu qua ảnh
+       khái quát AI chết thì trừng phạt (Q-value bị đẩy xuống)."
+
+    All fields are pinned in
+    :mod:`tests.test_dreamer` so the operator can audit them.
+    """
+
+    #: Master switch.  When ``False`` the dreamer is not constructed
+    #: at all, so the round's RAM cost stays zero.
+    enabled: bool = True
+    #: Latent dimension.  64 is a sweet spot on CPU.
+    latent_dim: int = 64
+    #: Gaussian stddev added to the latent vector when dreaming.
+    #: 0.0 = "photographic memory", 1.0 = "wild hallucination".
+    dream_noise_std: float = 0.30
+    #: Maximum abstract episodes kept on disk per kind.
+    max_episodes: int = 50
+    #: β weight for the KL term in the VAE loss.
+    beta_kl: float = 0.01
+    #: Number of frames per abstract episode.
+    frames_per_dream: int = 32
+    #: Train the VAE every N learner updates.
+    train_every_n_updates: int = 100
+    #: Throttle between mental-rehearsal rounds (seconds).
+    dream_every_s: float = 60.0
+    #: Number of dreams generated per round.
+    dreams_per_round: int = 8
+    #: Q-value threshold for "positive" dreams (the agent thought
+    #: the abstract frame was good).
+    positive_q_threshold: float = 0.5
+    #: Q-value threshold for "negative" dreams (the agent thought
+    #: the abstract frame was deadly).
+    negative_q_threshold: float = -0.5
+    #: Survival-rate threshold (env-replay) above which a dream is
+    #: "positive".  Independent from the Q-score because the env
+    #: can disagree with the Q-network.
+    positive_survival: float = 0.6
+    #: Survival-rate threshold (env-replay) below which a dream is
+    #: "negative".
+    negative_survival: float = 0.2
+
+
+@dataclass
+class RNDConfig:
+    """Random Network Distillation (curiosity) configuration.
+
+    The deep-research the user asked for highlighted RND as
+    one of the most impactful additions for sparse-reward
+    game RL (Burda et al. 2018 — the paper that made
+    Montezuma's Revenge tractable).  The default
+    configuration is "always on with a moderate beta" so
+    the agent gets a *novelty* bonus on top of the
+    extrinsic alive/dead signal.
+
+    All fields are pinned by :mod:`tests.test_rnd`.
+    """
+
+    #: Master switch.  When ``False`` no RND network is
+    #: constructed and the intrinsic reward is always 0.
+    enabled: bool = True
+    #: Output dim of the encoder.  128 is the paper's
+    #: default; we keep it.
+    feature_dim: int = 128
+    #: Coefficient on the intrinsic reward.  0.5 is large
+    #: enough to matter in the first 100 episodes (when the
+    #: agent has barely seen any state) and small enough
+    #: that the agent still chases the extrinsic reward
+    #: once the predictor catches up.
+    beta: float = 0.5
+    #: EMA decay for the intrinsic-reward normaliser.
+    normalizer_alpha: float = 0.99
+    #: Train the predictor every N learner updates.
+    train_every_n_updates: int = 1
+    #: Random seed for the *frozen* target.  Different from
+    #: the agent's overall seed so the predictor has
+    #: something to fit.
+    target_seed: int = 12345
 
 
 @dataclass
@@ -249,9 +391,65 @@ class RLConfig:
     target_update_every: int = 1_000
     grad_clip_norm: float = 10.0
     warmup_transitions: int = 500
+    #: Use the distributional QR-DQN agent (v1.18) instead of
+    #: the original scalar DoubleDQN.  Default ON: the deep
+    #: research in v1.19 found distributional Q to be the
+    #: third-most-important Rainbow ingredient (after multi-step
+    #: learning and PER).  The QR-DQN head produces 51 quantiles
+    #: per action — 51× denser gradient than scalar Q.
+    distributional: bool = True
+    #: Number of quantiles for the QR-DQN head.  51 is the
+    #: CPU-friendly default; raise to 200 for a richer
+    #: distribution at the cost of 4× head memory.
+    num_quantiles: int = 51
+    #: Use NoisyNets for exploration.  When ``True`` the
+    #: dueling head's value/advantage streams are :class:`NoisyLinear`
+    #: layers whose weights are perturbed by factorised
+    #: Gaussian noise.  Replaces ε-greedy with parameter-space
+    #: noise.  Default ON per the Rainbow ablation.
+    noisy_nets: bool = True
+    #: DEEP-FIX (v1.22.0): soft (Polyak) target update.
+    #: When True the target net is updated as
+    #: ``target = (1-tau) * target + tau * online`` after every
+    #: train step (the standard DDPG/TD3 recipe).  When False
+    #: (legacy), the target is hard-copied from the online net
+    #: every ``target_update_every`` steps.  Polyak averaging
+    #: tends to give a 5-10% boost on hard-exploration tasks
+    #: because the target moves smoothly, reducing the
+    #: over-estimation bias that comes from a stale target.
+    polyak_target: bool = True
+    #: The Polyak averaging coefficient.  Only used when
+    #: ``polyak_target=True``.  ``tau=0.005`` is the TD3 default.
+    polyak_tau: float = 0.005
+    #: DEEP-FIX (v1.22.0): visual data augmentation for
+    #: the train-time observation.  Laskin et al. 2020
+    #: (RAD) showed that even *random* shifts + intensity
+    #: jitter improve sample efficiency by 2-3x on Atari.
+    #: The augmentations are applied to the *current*
+    #: observation only (next_obs is left alone, so the
+    #: TD target is not corrupted by augmentation noise).
+    augment_obs: bool = True
+    #: Max random translate, in pixels.  Per-frame
+    #: intensity jitter amplitude (additive).
+    augment_translate_px: int = 3
+    augment_intensity: float = 0.10
+    #: Add the temporal-difference channel to the obs.
+    #: Increases the input from ``F`` to ``F+1`` channels,
+    #: which requires an encoder that supports the new
+    #: channel count.  When True, the learner will rebuild
+    #: the encoder with ``in_frames+1`` channels.  Default
+    #: ``False`` for compatibility with the standard
+    #: encoder.
+    augment_frame_diff: bool = False
+    #: Use RND (Random Network Distillation) for intrinsic
+    #: motivation.  When ``True`` the agent adds a *novelty
+    #: bonus* to the extrinsic reward so it explores the state
+    #: space even when alive/dead is the only extrinsic signal.
+    #: See :class:`rnd.RNDModule` for the math.
+    use_rnd: bool = True
     #: Training cadence (learner updates) — independent of action cadence.
     max_updates_per_second: float = 20.0
-    n_step: int = 3
+    n_step: int = 5
     #: Epsilon decays LINEARLY over `epsilon_decay_frames` ENV frames
     #: (frames observed by the actor), from start to end.  Explicitly NOT
     #: learner updates and NOT action steps.
@@ -269,6 +467,13 @@ class RLConfig:
     #: the actor exploits the BC policy instead of playing randomly (the actor
     #: reads SharedCounters.bc_pretrained).  Only used once BC has run.
     epsilon_after_bc: float = 0.15
+    #: DEEP-FIX (v1.21.0): audit_bc_then_rl.py proved that even 15%
+    #: ε-greedy *destroys* a BC-pretrained policy — the agent picked
+    #: the wrong lane in 14% of frames and the survival fell from 30s
+    #: to 14.6s within 200 episodes.  When this flag is ``True`` the
+    #: actor uses ε=0 after BC (pure exploitation).  Set to ``False``
+    #: to fall back to the legacy ``epsilon_after_bc`` cap.
+    disable_exploration_after_bc: bool = True
     checkpoint_every_updates: int = 500
     torch_threads: int = 1
     #: Which actor-reported episode metric gates best_model.pth during ONLINE
@@ -282,6 +487,22 @@ class RLConfig:
 
 @dataclass
 class BCConfig:
+    #: DEEP-FIX (v1.21.0): when ``True`` the learner
+    #: builds a :class:`DQfDAgent` (instead of the
+    #: standard QR-DQN) and the BC pretrain hands the
+    #: expert demos to its joint-loss path.  Without
+    #: this the BC pretrain is *just* a standard
+    #: cross-entropy warm-up; the policy drifts back to
+    #: random within 200 episodes of online RL because
+    #: the TD loss washes out the BC anchor.
+    bc_pretrain: bool = True
+    #: DQfD joint-loss hyper-parameters.  Defaults are
+    #: the Hester 2018 paper's values.  See
+    #: :class:`dqfd_agent.DQfDConfig` for details.
+    dqfd_lambda_bc: float = 0.5
+    dqfd_lambda_margin: float = 0.1
+    dqfd_margin: float = 0.8
+    dqfd_decay_episodes: int = 1000
     epochs: int = 8
     batch_size: int = 64
     learning_rate: float = 1e-3
@@ -295,6 +516,46 @@ class BCConfig:
     #: Each dodge frame is repeated this many times in BC training so the rare,
     #: critical presses actually drive the gradient.  1 = off (legacy behaviour).
     dodge_oversample: int = 4
+
+
+@dataclass
+class DemoAugmentConfig:
+    """Augmentation rulebook applied at BC training time (and reported live).
+
+    Every knob is independent so a non-symmetric game (or a user who does
+    not want the keypress-window filter) can switch any of them off.
+
+    * ``keypress_window``: instead of keeping every captured frame, keep a
+      ±N-frame window around each human key press.  Stretches where the
+      human is just running untouched (NOOP) are dropped — they are the
+      majority of a continuous recording and drown the rare dodges in
+      useless NOOP samples.  This is what makes "the bot learns the
+      frame where I pressed" actually trainable.
+
+    * ``keypress_pre`` / ``keypress_post``: how many frames to keep
+      before and after each press.  At 30 FPS the defaults (5 each) keep
+      a 333 ms window — the obstacle that triggered the press is usually
+      2-4 frames in front of the player, and the recovery / next dodge
+      is 3-5 frames past the press.  Bigger windows = more context but
+      more NOOP samples; smaller = the network may miss the trigger.
+
+    * ``mirror_horizontal``: append a horizontally flipped copy of every
+      kept frame with the mirrored action (LEFT <-> RIGHT; JUMP/SLIDE/
+      NOOP stay the same).  Subway Surfers' lanes are mirror-symmetric,
+      so this is a free x2 augmentation that teaches "an obstacle on the
+      left is the same problem as one on the right".  Disable for any
+      non-symmetric game.
+
+    * ``stack_mirror``: when True, the whole frame stack is flipped (the
+      4 newest frames in the original become the 4 flipped frames in
+      the same order).  When False, only the newest frame flips — the
+      policy can confuse the two, so the default is the safer choice.
+    """
+    keypress_window: bool = True
+    keypress_pre: int = 5
+    keypress_post: int = 5
+    mirror_horizontal: bool = True
+    stack_mirror: bool = True
 
 
 @dataclass
@@ -335,9 +596,12 @@ class BotConfig:
     input: InputConfig = field(default_factory=InputConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    dreamer: DreamerConfig = field(default_factory=DreamerConfig)
+    rnd: RNDConfig = field(default_factory=RNDConfig)
     per: PERConfig = field(default_factory=PERConfig)
     rl: RLConfig = field(default_factory=RLConfig)
     bc: BCConfig = field(default_factory=BCConfig)
+    demo_augment: DemoAugmentConfig = field(default_factory=DemoAugmentConfig)
     perf: PerfConfig = field(default_factory=PerfConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
     seed: int = 7
@@ -437,7 +701,8 @@ class BotConfig:
         cfg = cls()
         for section in (
             "capture", "perception", "horizon", "death", "region", "input",
-            "scheduler", "reward", "per", "rl", "bc", "perf", "paths",
+            "scheduler", "reward", "per", "rl", "bc", "demo_augment", "perf",
+            "paths",
         ):
             if section in data and isinstance(data[section], dict):
                 current = getattr(cfg, section)

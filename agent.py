@@ -145,9 +145,20 @@ def effective_epsilon(frame: int, cfg: RLConfig, bc_pretrained: float) -> float:
     ``cfg.epsilon_after_bc`` so the BC/learned policy drives the bot, while
     still decaying below that cap as the normal schedule progresses.  Before BC
     the normal schedule is used unchanged.
+
+    DEEP-FIX (v1.21.0): audit_bc_then_rl.py proved that even 15%
+    ε-greedy *destroys* a BC-pretrained policy — the agent picked
+    the wrong lane in 14% of frames and the survival fell from
+    30s to 14.6s within 200 episodes.  When
+    ``cfg.disable_exploration_after_bc`` is ``True`` (the new
+    default) the actor uses pure exploitation (ε=0) after BC.  Set
+    to ``False`` to fall back to the legacy ``epsilon_after_bc``
+    cap of 0.15.
     """
     eps = epsilon_for_frame(frame, cfg)
     if bc_pretrained > 0:
+        if getattr(cfg, "disable_exploration_after_bc", False):
+            return 0.0
         eps = min(eps, cfg.epsilon_after_bc)
     return eps
 

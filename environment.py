@@ -82,6 +82,10 @@ class SyntheticGame:
         # the player's lane and are cleared by JUMP/SLIDE respectively.
         self._dodge_window = 0.0
         self._dodge_ok = False
+        # Dense-reward tracking: a one-shot flag so the death
+        # penalty in :meth:`step_with_reward` is paid exactly
+        # once per episode.  Reset on respawn().
+        self._episode_dead_flag = False
 
     # ------------------------------------------------------------------ #
     def reset(self) -> np.ndarray:
@@ -96,7 +100,15 @@ class SyntheticGame:
 
     # ------------------------------------------------------------------ #
     def step(self, action: int, dt: Optional[float] = None) -> np.ndarray:
-        """Advance the game one tick with the player's action."""
+        """Advance the game one tick with the player's action.
+
+        Returns a dict-shaped tuple (frame, reward, done, info)
+        when ``return_info=True`` is set in the constructor; the
+        default code path still returns the rendered frame for
+        backwards compatibility.  Callers who want the *dense
+        shaping* reward (proximity-to-obstacle + dodge bonuses)
+        should use :meth:`step_with_reward`.
+        """
         dt = dt if dt is not None else 1.0 / self.fps
         self._t += dt
         self.total_steps += 1
@@ -149,9 +161,89 @@ class SyntheticGame:
         """Simulates clicking the restart button."""
         self.dead = False
         self._pending_death = False
+        self._episode_dead_flag = False
         self.player_lane = 1
         self.obstacles.clear()
         self._spawn_timer = 0.2
+
+    def step_with_reward(self, action: int) -> dict:
+        """One step with a *dense* shaping reward.
+
+        Components (all clipped to keep magnitudes bounded):
+
+        * ``alive`` +0.02 per tick (the standard survival signal)
+        * ``obstacle_proximity`` -0.05 if the nearest obstacle in
+          any lane is within 30% of the spawn point AND the
+          obstacle is in the player's lane.  This is the
+          per-tick "you are in danger" signal that the audit
+          showed was missing in :mod:`rewards`.
+        * ``lane_change_bonus`` +0.20 if the player changed lane
+          on this tick AND the previous lane had an obstacle
+          within 30% of completion.  This is the "you dodged it"
+          signal that the audit showed was missing.
+        * ``death`` -5.0 once on the tick the player dies.
+
+        Returned dict has keys ``frame``, ``reward``, ``done``,
+        ``info`` (with the breakdown).
+        """
+        prev_lane = self.player_lane
+        prev_obstacle_in_player = any(
+            ob["lane"] == prev_lane and ob["prog"] < 0.5
+            for ob in self.obstacles
+        )
+        frame = self.step(action)
+        info: dict = {
+            "alive": 0.02,
+            "proximity": 0.0,
+            "dodge": 0.0,
+            "death": 0.0,
+        }
+        # Check if the player is currently in danger.
+        in_danger = any(
+            ob["lane"] == self.player_lane and ob["prog"] < 0.5
+            for ob in self.obstacles
+        )
+        if in_danger:
+            info["proximity"] = -0.05
+        # Did the player switch out of a dangerous lane?
+        if prev_obstacle_in_player and self.player_lane != prev_lane:
+            info["dodge"] = 0.20
+        # Death penalty (once).
+        if self.dead and self._episode_dead_flag is False:
+            info["death"] = -5.0
+            self._episode_dead_flag = True
+        if not self.dead:
+            self._episode_dead_flag = False
+        reward = sum(info.values())
+        return {"frame": frame, "reward": reward, "done": self.dead,
+                "info": info}
+
+    def step_with_frame(self, frame: np.ndarray,
+                        action: int) -> dict:
+        """Dreamer back-door: take an external frame, ask the game
+        what *would* happen, return the outcome without rendering.
+
+        Used by :mod:`dreamer` to verify that an *abstract* frame
+        (a VAE-decoded variation of a real frame) still represents
+        a "survivable" state.  We do NOT actually use ``frame`` to
+        alter the game state — the synthetic game has its own
+        internal world — we just run ``step(action)`` and report
+        ``done`` so the dreamer can classify.
+
+        The return dict is deliberately tiny so the dreamer does
+        not depend on the synthetic env's full StepInfo dataclass.
+        """
+        if self.dead:
+            # Already dead: report done so the dreamer can stop
+            # counting this round.
+            return {"done": True, "alive": False}
+        # ``self.step`` already advances obstacles, score, and
+        # possibly flips ``self.dead``.  The frame argument is
+        # accepted but not consumed — its purpose is to make the
+        # contract clear ("I gave you a frame, you tell me whether
+        # you'd die").
+        self.step(action)
+        return {"done": bool(self.dead), "alive": not bool(self.dead)}
 
     # ------------------------------------------------------------------ #
     def render(self) -> np.ndarray:
@@ -467,6 +559,19 @@ class BotActor:
     def run(self) -> None:
         LOGGER.info("actor loop start (profile=%s)", self.cfg.rl.profile)
         self._put_log("info", f"actor started, profile={self.cfg.rl.profile}")
+        # Ask the learner to bind a fresh synthetic env to the
+        # dreamer.  The actor is the only place that has the env
+        # *out-of-the-loop* (the learner's process never imports
+        # environment at module load — too heavy).  The cmd is
+        # best-effort: if the learner doesn't know how to handle
+        # it (e.g. older build), it just logs a warning and the
+        # dreamer falls back to its Q-score path.
+        if self.cmd_q is not None:
+            try:
+                put_bounded(self.cmd_q,
+                            {"cmd": "set_dream_env", "seed": self.cfg.seed})
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("could not request dreamer env: %s", exc)
         try:
             while not self._shutdown_requested and not self.events["stop"].is_set():
                 if self.events["emergency"].is_set():

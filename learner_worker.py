@@ -61,7 +61,68 @@ class Learner:
         self.metrics_q = metrics_q
         self.ckpt = CheckpointManager(checkpoints_dir, cfg.rl.profile)
         self.profile = cfg.rl.profile
-        self.agent = DoubleDQNAgent(self.profile, cfg.rl, seed=cfg.seed)
+        # v1.21.0: choose between the standard QR-DQN
+        # and the BC-pretrained DQfD agent.  When the
+        # user has the ``bc.bc_pretrain`` flag enabled
+        # (the new default — see audit_bc_then_rl.py)
+        # the learner constructs a :class:`DQfDAgent`
+        # so the :meth:`pretrain` flow can hand the
+        # expert demos straight to the joint-loss
+        # agent.  The DQfD agent is a *drop-in* for
+        # the QR-DQN agent: same forward, same TD
+        # loss, same target net, same RND hook — the
+        # only difference is the BC + margin loss
+        # terms that fire whenever a demo buffer has
+        # been loaded.
+        use_dqfd = bool(getattr(cfg.bc, "bc_pretrain", False))
+        if use_dqfd:
+            from bc_pretrain import build_dqfd_agent
+            from dqfd_agent import DQfDConfig
+            dqfd_cfg = DQfDConfig(
+                lambda_bc=float(getattr(cfg.bc, "dqfd_lambda_bc", 0.5)),
+                lambda_margin=float(getattr(cfg.bc, "dqfd_lambda_margin", 0.1)),
+                margin=float(getattr(cfg.bc, "dqfd_margin", 0.8)),
+                supervised_decay_episodes=int(getattr(
+                    cfg.bc, "dqfd_decay_episodes", 1000)),
+                no_exploration=bool(getattr(
+                    cfg.rl, "disable_exploration_after_bc", True)),
+            )
+            self.agent = build_dqfd_agent(
+                self.profile, cfg.rl, dqfd_cfg,
+                in_frames=cfg.perception.frame_stack,
+                size=cfg.perception.ground_size,
+                num_quantiles=int(getattr(cfg.rl, "num_quantiles", 51)),
+                seed=cfg.seed)
+        elif getattr(cfg.rl, "distributional", True):
+            from agent_distributional import DistributionalDoubleDQNAgent
+            self.agent = DistributionalDoubleDQNAgent(
+                self.profile, cfg.rl, num_quantiles=int(
+                    getattr(cfg.rl, "num_quantiles", 51)),
+                seed=cfg.seed)
+        else:
+            self.agent = DoubleDQNAgent(self.profile, cfg.rl, seed=cfg.seed)
+        # Attach the RND (curiosity) module if the config
+        # asked for it.  The RND module is constructed in the
+        # same process so the intrinsic-reward tensor never
+        # has to cross the IPC boundary.
+        self.rnd = None
+        if getattr(cfg.rl, "use_rnd", True):
+            from rnd import RNDConfig, RNDModule
+            r_cfg_raw = getattr(cfg, "rnd", None)
+            r_cfg = RNDConfig(
+                enabled=getattr(r_cfg_raw, "enabled", True),
+                feature_dim=int(getattr(r_cfg_raw, "feature_dim", 128)),
+                beta=float(getattr(r_cfg_raw, "beta", 0.5)),
+                normalizer_alpha=float(getattr(r_cfg_raw, "normalizer_alpha", 0.99)),
+                train_every_n_updates=int(getattr(r_cfg_raw, "train_every_n_updates", 1)),
+                target_seed=int(getattr(r_cfg_raw, "target_seed", 12345)),
+            ) if r_cfg_raw is not None else RNDConfig()
+            self.rnd = RNDModule(r_cfg, in_frames=cfg.perception.frame_stack)
+            # Bind the module to the agent (the agent uses it
+            # inside train_step to inject the intrinsic bonus
+            # into the reward tensor).
+            if hasattr(self.agent, "attach_rnd"):
+                self.agent.attach_rnd(self.rnd)
         self.buffer = self._load_or_fresh_buffer()
         self.rng = np.random.default_rng(cfg.seed)
         self.update_step = 0
@@ -86,6 +147,73 @@ class Learner:
         self._last_seen_episode_done_id = 0
         self.best_metric_name = cfg.rl.best_metric
         self.best_rolling: Optional[float] = None
+        # -- self-imitation (DQfD-style) --------------------------------- #
+        # Good episodes are written to <demos_dir>/self/*.npz with the
+        # same format as human demos, so the same training pipeline
+        # (keypress window + mirror + BC) consumes both pools.  The
+        # gate uses the same rolling survival mean the best-model
+        # gate already maintains — they cannot disagree on "is this
+        # a good run?".
+        from self_imitation import SelfImitationConfig, SelfImitationRecorder
+        si_cfg = SelfImitationConfig(
+            enabled=bool(getattr(cfg.reward, "self_imitation_factor", 1.2) > 0),
+            factor=float(getattr(cfg.reward, "self_imitation_factor", 1.2)),
+            max_episodes=int(getattr(cfg.reward, "self_imitation_max", 50)),
+        )
+        # Resolve the demo directory the same way the GUI does — the
+        # ``PathsConfig`` keeps the default ``"demos"`` so the
+        # recorder and the GUI end up writing to the same place.
+        from pathlib import Path as _P
+        demos_dir = _P(str(getattr(cfg.paths, "demos_dir", "demos")))
+        self.self_imitation = SelfImitationRecorder(si_cfg, demos_dir)
+        self._episodes_since_last_self_bc = 0
+        # Bounded ring of the most recent transitions; used only when
+        # the self-imitation gate opens and we need to dump the
+        # current episode to disk.  Capped at 30_000 frames so a long
+        # episode does not blow up the learner's working set.  The
+        # store is appended in :meth:`add_transitions` and cleared on
+        # episode end (whether the episode was saved or not).
+        from collections import deque as _dq
+        self._recent_transitions: _dq = _dq(maxlen=30_000)
+        # ----- Latent-space dreamer (mental rehearsal) -----
+        # The third leg of "AI tự học full aggressive": a tiny
+        # variational autoencoder that distils the self-imitation
+        # pool into a latent space, then *perturbs* a latent to
+        # produce an "abstract" frame, then replays the abstract
+        # frame through the synthetic env to check whether the
+        # policy still survives — that is the "khái quát" the
+        # user asked for.  When env-replay is unavailable (no
+        # ``_dream_env`` attribute, e.g. in unit tests), the
+        # dreamer falls back to the Q-value of the live policy.
+        from dreamer import DreamerConfig, DreamerTrainer
+        from pathlib import Path as _PathDreamer
+        d_cfg_raw = getattr(cfg, "dreamer", None)
+        if d_cfg_raw is None:
+            d_cfg = DreamerConfig(enabled=False)
+        else:
+            d_cfg = DreamerConfig(
+                enabled=bool(getattr(d_cfg_raw, "enabled", True)),
+                latent_dim=int(getattr(d_cfg_raw, "latent_dim", 64)),
+                dream_noise_std=float(getattr(d_cfg_raw, "dream_noise_std", 0.30)),
+                max_episodes=int(getattr(d_cfg_raw, "max_episodes", 50)),
+                beta_kl=float(getattr(d_cfg_raw, "beta_kl", 0.01)),
+                frames_per_dream=int(getattr(d_cfg_raw, "frames_per_dream", 32)),
+                train_every_n_updates=int(getattr(d_cfg_raw, "train_every_n_updates", 100)),
+                dream_every_s=float(getattr(d_cfg_raw, "dream_every_s", 60.0)),
+                dreams_per_round=int(getattr(d_cfg_raw, "dreams_per_round", 8)),
+                positive_q_threshold=float(getattr(d_cfg_raw, "positive_q_threshold", 0.5)),
+                negative_q_threshold=float(getattr(d_cfg_raw, "negative_q_threshold", -0.5)),
+            )
+        abstract_dir = _PathDreamer(demos_dir) / "abstract"
+        self.dreamer = DreamerTrainer(d_cfg, abstract_dir)
+        # Wire the self-imitation pool in so the dreamer can pick
+        # seed frames.  Done after construction so an empty pool
+        # does not block the trainer from being unit-tested.
+        self.dreamer.attach_learner(self, self.self_imitation)
+        # The env back-door is set by the actor/headless harness at
+        # startup; the dreamer checks ``learner._dream_env`` lazily
+        # so a missing attribute just means "use the Q fallback".
+        self._dream_env: object | None = None
         self._load_checkpoint()
 
     # ------------------------------------------------------------------ #
@@ -214,7 +342,67 @@ class Learner:
                     "metric": self.cfg.rl.best_metric,
                     "rolling": rolling, "window": list(self._episode_window),
                 })
+        # ---- self-imitation: maybe save the just-finished episode ---- #
+        # Run after the best-model gate so the self-imitation decision
+        # sees the freshly-updated rolling mean.  Failures here never
+        # raise — the actor's next episode is more important than
+        # archiving the previous one.
+        try:
+            self._maybe_self_imitate(done_id, value)
+        except Exception as exc:
+            LOGGER.warning("self-imitation hook failed: %s", exc)
         return rolling
+
+    # ------------------------------------------------------------------ #
+    def _maybe_self_imitate(self, episode_id: int, survival_s: float) -> None:
+        """Decide whether to archive the just-finished episode.
+
+        The "decision" is the recorder's job; this function is the
+        wiring that drains the recent-transition ring, calls
+        :meth:`SelfImitationRecorder.save_episode`, and schedules a
+        self-BC if the gate is configured to retrain periodically.
+        """
+        decision = self.self_imitation.note_episode(episode_id, survival_s)
+        if not decision.get("saved"):
+            # Always clear the ring on episode end so the next
+            # episode does not accumulate against the previous one.
+            self._recent_transitions.clear()
+            return
+        recent = self._consume_recent_episode()
+        if recent is None:
+            # Learner started after the actor's recent frames had
+            # already rotated; without the data the gate can only
+            # honestly say "no" — clear the ring and move on.
+            self._recent_transitions.clear()
+            return
+        path = self.self_imitation.save_episode(
+            episode_id, survival_s,
+            recent["frames"], recent["actions"],
+            recent["timestamps"], recent["done"],
+            meta={"source": "self_imitation", "config": self.cfg.rl.profile})
+        # Drop the recent transitions regardless of save success.
+        self._recent_transitions.clear()
+        if path is None:
+            return
+        LOGGER.info("self-imitation: archived episode %d (survival=%.2fs, "
+                    "threshold=%.2fs) -> %s",
+                    episode_id, survival_s,
+                    decision.get("threshold", 0.0), path)
+        put_bounded(self.metrics_q, {
+            "type": "log", "level": "info", "src": "learner",
+            "msg": f"📼 self-imitation: lưu episode {episode_id} "
+                   f"(sống {survival_s:.1f}s) — sẽ được BC lại tự động"})
+        put_bounded(self.metrics_q, {
+            "type": "self_imitation_saved", "src": "learner",
+            "path": str(path), "episode_id": episode_id,
+            "survival_s": survival_s})
+        # Schedule a re-BC run that includes the new episode.
+        self._episodes_since_last_self_bc += 1
+        if int(self.self_imitation.cfg.bc_every_n_episodes) > 0 and \
+                self._episodes_since_last_self_bc >= \
+                int(self.self_imitation.cfg.bc_every_n_episodes):
+            self._episodes_since_last_self_bc = 0
+            self._self_bc_pending = True
 
     # ------------------------------------------------------------------ #
     def set_profile(self, profile: str) -> None:
@@ -226,7 +414,21 @@ class Learner:
         dropped = self.buffer.size
         self.ckpt = CheckpointManager(str(self.ckpt.dir.parent), profile)
         self.profile = profile
-        self.agent = DoubleDQNAgent(profile, self.cfg.rl, seed=self.cfg.seed)
+        # Same distributional-or-scalar choice as the
+        # constructor (see __init__).
+        if getattr(self.cfg.rl, "distributional", True):
+            from agent_distributional import DistributionalDoubleDQNAgent
+            self.agent = DistributionalDoubleDQNAgent(
+                profile, self.cfg.rl,
+                num_quantiles=int(getattr(self.cfg.rl, "num_quantiles", 51)),
+                seed=self.cfg.seed)
+        else:
+            self.agent = DoubleDQNAgent(profile, self.cfg.rl, seed=self.cfg.seed)
+        # Re-bind the RND module if we have one (the
+        # networks inside RND are not profile-dependent so
+        # we can keep the same instance).
+        if self.rnd is not None and hasattr(self.agent, "attach_rnd"):
+            self.agent.attach_rnd(self.rnd)
         # DEEP-FIX: the replay buffer is profile-independent (frames, actions,
         # rewards, priorities), but it used to be replaced here, silently
         # discarding every transition collected since the last periodic
@@ -247,8 +449,51 @@ class Learner:
         for it in items:
             if isinstance(it, NStepTransition):
                 self.buffer.add_nstep(it)
+                # Mirror the latest N transitions into the recent
+                # ring so the self-imitation gate can dump the
+                # current episode if the just-finished one is good.
+                # A full NStepTransition carries the obs stack and
+                # the action — that is everything the .npz file needs.
+                self._recent_transitions.append(it)
                 n += 1
         return n
+
+    def _consume_recent_episode(self) -> Optional[dict[str, Any]]:
+        """Drain the recent-transition ring into an episode-shaped dict.
+
+        Returns ``None`` when the ring holds no transitions, which
+        happens when the learner starts after the actor already
+        published the episode (the latest-frame ring keeps only the
+        most recent N slots; the learner started before the actor
+        reached a full episode).  In that case the self-imitation
+        gate is forced to "no" instead of producing a corrupt file.
+        """
+        if not self._recent_transitions:
+            return None
+        frames: list[np.ndarray] = []
+        actions: list[int] = []
+        timestamps: list[float] = []
+        for tr in self._recent_transitions:
+            # Use the (current) obs frame, not the next_obs — the
+            # .npz format expects "frame -> action -> frame" so the
+            # BC network sees (s_t, a_t) pairs.  Frame-stacks are
+            # flattened back to single 84x84 frames because the demo
+            # format does not store stacks.
+            frame = np.asarray(tr.obs[-1], dtype=np.uint8)  # newest slot
+            frames.append(frame)
+            actions.append(int(tr.action))
+            timestamps.append(float(getattr(tr, "env_id", 0)) / 30.0)
+        if not frames:
+            return None
+        n = len(frames)
+        done = np.zeros(n, dtype=bool)
+        done[-1] = True  # the latest transition was a terminal one
+        return {
+            "frames": np.stack(frames),
+            "actions": np.asarray(actions, dtype=np.int64),
+            "timestamps": np.asarray(timestamps, dtype=np.float64),
+            "done": done,
+        }
 
     def can_train(self, now: float) -> bool:
         if self.events_paused:
@@ -389,6 +634,16 @@ class Learner:
         opt = None
         import torch
 
+        # DEEP-FIX (v1.21.0): when the agent is a
+        # :class:`DQfDAgent` we use the joint-loss
+        # pretrain path (cross-entropy + DQfD arming)
+        # INSTEAD of the standard BC path.  The DQfD
+        # path also pre-fills the replay buffer with
+        # the demos so the BC anchor is sampled
+        # throughout online RL.
+        if bool(getattr(self.cfg.bc, "bc_pretrain", False)):
+            return self._pretrain_dqfd(ds, train_idx, val_idx, w,
+                                         report, demos_dir)
         opt = torch.optim.Adam(self.agent.online.parameters(),
                                lr=self.cfg.bc.learning_rate,
                                weight_decay=self.cfg.bc.weight_decay)
@@ -448,6 +703,243 @@ class Learner:
                              metric=history[-1]["val_acc"], higher_is_better=True)
         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
         return {"status": "ok", "history": history}
+
+    # ------------------------------------------------------------------ #
+    def _pretrain_dqfd(self, ds, train_idx, val_idx, w,
+                        report, demos_dir: str) -> dict[str, Any]:
+        """BC pretrain path used when the agent is a
+        :class:`DQfDAgent`.  Hands the demo frames +
+        actions to :meth:`DQfDAgent.pretrain_demos` and
+        pre-fills the replay buffer so the supervised
+        + margin terms fire on every subsequent online
+        update.
+
+        Why a separate method
+        ---------------------
+        The standard BC path runs ``self.agent.bc_epoch``
+        in a loop.  The DQfD agent does NOT have
+        ``bc_epoch`` (it uses ``pretrain_demos`` instead,
+        which is the standard Hester 2018 recipe).  The
+        demo format is also different: the standard BC
+        path uses ``ds.batch(chunk)`` (the dataset
+        loader's batching), whereas the DQfD agent
+        expects ``[N, F, H, W]`` float32 in [0, 1]
+        directly.  Adapting the demo to the right shape
+        lives in this method.
+        """
+        from bc_pretrain import pretrain_and_arm_dqfd
+        # Materialise the train+val frames and actions
+        # into the ``[N, F, H, W]`` float32 / [N] int64
+        # format the DQfD agent expects.
+        all_idx = list(train_idx) + list(val_idx)
+        if not all_idx:
+            return {"status": "skipped", "reason": "no_indices"}
+        xs, ys = ds.batch(all_idx)
+        # The dataset returns obs in the (B, F*H*W) or
+        # (B, F, H, W) layout the dataset uses; we need
+        # to figure out which.  The simplest is to ask
+        # the dataset directly.
+        obs_arr, act_arr = self._materialise_demos(ds, all_idx)
+        if len(obs_arr) == 0:
+            return {"status": "skipped", "reason": "empty_demos"}
+        # Convert to [0, 1] float32 if the dataset returns
+        # uint8.
+        if obs_arr.dtype == np.uint8:
+            obs_arr = obs_arr.astype(np.float32) / 255.0
+        report(f"DQfD BC pretrain on {len(obs_arr)} demo frames…")
+        put_bounded(self.metrics_q, {
+            "type": "log", "level": "info", "src": "learner",
+            "msg": f"🧠 DQfD BC pretrain trên {len(obs_arr)} khung hình, "
+                   f"agent={type(self.agent).__name__}."})
+        result = pretrain_and_arm_dqfd(self.agent, obs_arr, act_arr,
+                                          n_epochs=self.cfg.bc.epochs,
+                                          batch_size=self.cfg.bc.batch_size,
+                                          lr=self.cfg.bc.learning_rate)
+        # Pre-fill the replay buffer with the demo
+        # transitions so the next sample batch includes
+        # them with high priority.  This is the
+        # "demo pre-fill" pattern that keeps the BC
+        # anchor alive once online RL starts.
+        try:
+            from bc_pretrain import prefill_replay_with_demos
+            # Synthesize 1-step rewards (0 except +1 at
+            # the last step of each episode so the n-step
+            # builder has a terminal reward).
+            rewards = np.zeros(len(act_arr), dtype=np.float32)
+            # Find episode boundaries via the done mask.
+            done_mask = ds.episode_done_mask(all_idx)
+            rewards[done_mask] = 1.0
+            n_added = prefill_replay_with_demos(
+                self.buffer, obs_arr, act_arr, rewards,
+                frame_stack=self.cfg.perception.frame_stack,
+                gamma=self.cfg.rl.gamma,
+                n_step=self.cfg.rl.n_step,
+                priority_boost=100.0)
+            report(f"  pre-filled replay buffer with {n_added} "
+                   f"n-step demo transitions")
+            put_bounded(self.metrics_q, {
+                "type": "log", "level": "info", "src": "learner",
+                "msg": f"📥 replay buffer pre-filled với {n_added} "
+                       f"demo transitions (priority boost 100×)."})
+        except Exception as exc:  # noqa: BLE001 - reported
+            LOGGER.warning("demo pre-fill failed: %s", exc)
+            put_bounded(self.metrics_q, {
+                "type": "log", "level": "warning", "src": "learner",
+                "msg": f"demo pre-fill lỗi: {exc}"})
+        # Build a minimal "history" record so the
+        # checkpoint format stays consistent with the
+        # standard BC path.
+        history = [{
+            "epoch": self.cfg.bc.epochs,
+            "train_loss": result["bc_loss"],
+            "train_acc": 0.0,
+            "val_acc": 0.0,
+            "per_action": {},
+            "n_frames": result["n_frames"],
+            "method": "dqfd",
+        }]
+        self.bc_history = history
+        self.agent.sync_target()
+        self.bc_done = True
+        self.counters.bc_pretrained.value = 1.0
+        self._publish(force=True)
+        extra = {"bc": history[-1], "update_step": self.update_step,
+                 "dataset": str(demos_dir), "bc_done": True,
+                 "method": "dqfd"}
+        self.ckpt.save_model(self.agent.state_payload(), extra, which="best",
+                             metric=result["bc_loss"], higher_is_better=False)
+        self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
+        put_bounded(self.metrics_q, {
+            "type": "log", "level": "info", "src": "learner",
+            "msg": f"✅ DQfD BC xong: loss={result['bc_loss']:.4f} "
+                   f"trên {result['n_frames']} frames — actor sẽ "
+                   f"exploit (ε=0) cho tới khi policy drift."})
+        return {"status": "ok", "history": history, "method": "dqfd",
+                "bc_loss": result["bc_loss"]}
+
+    def _materialise_demos(self, ds, idx) -> tuple[np.ndarray, np.ndarray]:
+        """Helper: pull (obs, action) arrays for the
+        given dataset indices.  We dispatch on the
+        dataset's ``stack`` and ``frame_size``
+        attributes to build the right output shape.
+
+        The returned obs is ``[N, F, H, W]`` float32
+        in [0, 1]; the returned actions is ``[N]``
+        int64.
+        """
+        # The dataset's ``batch`` method returns a
+        # concatenation of every (obs, action) for the
+        # indices.  We re-batch in chunks to keep peak
+        # memory bounded.
+        chunk = 256
+        obs_chunks, act_chunks = [], []
+        for start in range(0, len(idx), chunk):
+            sub = idx[start:start + chunk]
+            xs, ys = ds.batch(sub)
+            obs_chunks.append(np.asarray(xs))
+            act_chunks.append(np.asarray(ys))
+        if not obs_chunks:
+            return np.zeros((0,)), np.zeros((0,))
+        obs_arr = np.concatenate(obs_chunks, 0)
+        act_arr = np.concatenate(act_chunks, 0)
+        # The dataset may return a flattened (N, F*H*W)
+        # layout.  Inflate to (N, F, H, W) so the
+        # ``pretrain_demos`` reshape path is consistent.
+        if obs_arr.ndim == 2:
+            F = int(getattr(ds, "stack", 4))
+            H = int(getattr(ds, "frame_size", 84))
+            total = obs_arr.shape[1]
+            assert total == F * H * H, (
+                f"demo obs shape {obs_arr.shape} not divisible "
+                f"by (F={F}, H={H})")
+            obs_arr = obs_arr.reshape(-1, F, H, H)
+        return obs_arr, act_arr
+
+    # ------------------------------------------------------------------ #
+    def pretrain_with_self_imitation(self, human_dir: str) -> dict[str, Any]:
+        """BC on the union of human demos and self-imitation episodes.
+
+        Reads the human demos from ``human_dir`` and the self pool
+        from :attr:`self_imitation.out_dir`, validates both, splits by
+        EPISODE (so a self copy and its source human demo can never
+        land in different folds), trains BC, and saves the new policy
+        as ``best_model.pth`` keyed on the val accuracy.  The point
+        is the same as :meth:`pretrain` — it bakes the recent good
+        runs into the policy without waiting for a manual button
+        press.
+        """
+        from dataset import validate_directory
+        from pathlib import Path as _P
+        human_eps, human_reps = validate_directory(human_dir)
+        self_dir = str(self.self_imitation.out_dir)
+        self_eps, self_reps = validate_directory(self_dir)
+        human_valid = [e for e, r in zip(human_eps, human_reps) if r.ok]
+        self_valid = [e for e, r in zip(self_eps, self_reps) if r.ok]
+        if not human_valid and not self_valid:
+            return {"status": "skipped", "reason": "no_valid_episodes"}
+        # Reuse the standard BC path by pretending the union came
+        # from a single directory.  We could just call :meth:`pretrain`
+        # on a synthetic loader but that would re-publish the
+        # "BC done" log; calling the BC trainer inline keeps the
+        # output quiet and uses the dataset's own validation.
+        from dataset import DemonstrationDataset
+        from demo_augment import DemoAugmentor
+        all_eps = human_valid + self_valid
+        ds = DemonstrationDataset(
+            all_eps, stack=self.cfg.perception.frame_stack,
+            dodge_oversample=self.cfg.bc.dodge_oversample,
+            augment=DemoAugmentor(),  # default = keypress window + mirror
+        )
+        train_idx, val_idx = ds.split_by_episode(self.cfg.bc.val_fraction,
+                                                 seed=self.cfg.seed)
+        if not val_idx:
+            val_idx = train_idx
+        import torch
+        opt = torch.optim.Adam(self.agent.online.parameters(),
+                               lr=self.cfg.bc.learning_rate,
+                               weight_decay=self.cfg.bc.weight_decay)
+        w = ds.class_weights(self.cfg.bc.class_balance)
+        import random
+        rng = random.Random(self.cfg.seed)
+        history: list[dict[str, Any]] = []
+        for epoch in range(self.cfg.bc.epochs):
+            order = list(train_idx)
+            rng.shuffle(order)
+            losses, accs = [], []
+            for i in range(0, len(order), self.cfg.bc.batch_size):
+                chunk = order[i: i + self.cfg.bc.batch_size]
+                xs, ys = ds.batch(chunk)
+                ws = w[ys]
+                m = self.agent.bc_epoch(xs, ys, ws, optimizer=opt)
+                losses.append(m["bc_loss"])
+                accs.append(m["bc_acc"])
+            vx, vy = ds.batch(val_idx[:4096])
+            ev = self.agent.bc_eval(vx, vy)
+            history.append({"epoch": epoch + 1,
+                            "train_loss": float(np.mean(losses)),
+                            "train_acc": float(np.mean(accs)),
+                            "val_acc": ev["bc_acc"],
+                            "per_action": ev["per_action"]})
+        self.bc_history = history
+        self.agent.sync_target()
+        self.bc_done = True
+        self.counters.bc_pretrained.value = 1.0
+        self._publish(force=True)
+        extra = {"bc": history[-1], "update_step": self.update_step,
+                 "dataset": f"human+self({len(self_valid)})",
+                 "bc_done": True, "self_imitation": True}
+        self.ckpt.save_model(self.agent.state_payload(), extra, which="best",
+                             metric=history[-1]["val_acc"],
+                             higher_is_better=True)
+        self.ckpt.save_model(self.agent.state_payload(), extra,
+                             which="latest")
+        put_bounded(self.metrics_q, {
+            "type": "log", "level": "info", "src": "learner",
+            "msg": f"♻ self-BC xong trên {len(human_valid)} human + "
+                   f"{len(self_valid)} self, val_acc="
+                   f"{history[-1]['val_acc']:.3f}"})
+        return {"status": "ok", "history": history,
+                "n_human": len(human_valid), "n_self": len(self_valid)}
 
     # ------------------------------------------------------------------ #
     def shutdown_save(self) -> None:
@@ -520,8 +1012,71 @@ def learner_main(
                             "type": "log", "level": "error", "src": "learner",
                             "msg": f"BC lỗi: {res['reason']}"})
                     put_bounded(metrics_q, {"type": "pretrain_done", "result": res})
+                elif cmd == "pretrain_with_self":
+                    # GUI button or auto-scheduler asks to retrain on the
+                    # union of human demos and self-imitation episodes.
+                    try:
+                        res = learner.pretrain_with_self_imitation(
+                            msg.get("human_dir",
+                                    str(cfg.paths.demos_dir)))
+                    except Exception as exc:  # noqa: BLE001
+                        res = {"status": "error",
+                               "reason": format_exception(exc)}
+                        put_bounded(metrics_q, {
+                            "type": "log", "level": "error", "src": "learner",
+                            "msg": f"self-BC lỗi: {res['reason']}"})
+                    put_bounded(metrics_q, {
+                        "type": "pretrain_done", "result": res})
                 elif cmd == "save_buffer":
                     learner.ckpt.buffer_save(learner.buffer)
+                elif cmd == "dream_now":
+                    # Manual override from the GUI: trigger a
+                    # mental-rehearsal round immediately.  The
+                    # round is throttled by the dreamer itself
+                    # (``dream_every_s``) so the operator cannot
+                    # accidentally pin the CPU by spamming the
+                    # button.
+                    try:
+                        written = learner.dreamer.maybe_dream(time.time())
+                        if written:
+                            put_bounded(metrics_q, {
+                                "type": "log",
+                                "level": "info",
+                                "src": "learner",
+                                "msg": (f"💭 dreamer: đã viết {len(written)} "
+                                        f"abstract episode "
+                                        f"(positive={learner.dreamer.stats.dreams_positive}, "
+                                        f"negative={learner.dreamer.stats.dreams_negative})"),
+                            })
+                    except Exception as exc:  # noqa: BLE001
+                        put_bounded(metrics_q, {
+                            "type": "log", "level": "error", "src": "learner",
+                            "msg": f"dreamer lỗi: {format_exception(exc)}"})
+                elif cmd == "set_dream_env":
+                    # The actor process (or the headless harness)
+                    # tells the learner to bind a fresh synthetic
+                    # env as the dreamer's verification back-door.
+                    # We construct the env on the *learner* side
+                    # because only the learner has torch (the
+                    # dreamer's Q fallback needs the online net)
+                    # and creating it here avoids the IPC
+                    # serialisation cost of shipping a live env.
+                    try:
+                        from environment import SyntheticGame
+                        seed = int(msg.get("seed", 0))
+                        env = SyntheticGame(seed=seed)
+                        learner._dream_env = env
+                        put_bounded(metrics_q, {
+                            "type": "log", "level": "info",
+                            "src": "learner",
+                            "msg": "dreamer: synthetic env bound "
+                                   "(mental-rehearsal will use env-replay)."})
+                    except Exception as exc:  # noqa: BLE001
+                        put_bounded(metrics_q, {
+                            "type": "log", "level": "warning",
+                            "src": "learner",
+                            "msg": f"dreamer: env bind failed, "
+                                   f"fallback to Q-score: {exc}"})
             # 2. transitions.  DEEP-FIX: the actor's auto-downgrader used to
             # put {"__cmd__": "set_profile", ...} on THIS queue while the
             # learner only ever read commands from cmd_q, and
@@ -554,11 +1109,66 @@ def learner_main(
             if learner.can_train(now):
                 learner.train_one(now)
                 did_work = True
+            # 3.4 latent-space dreamer: train the tiny VAE on the
+            # self-imitation pool.  This is cheap (~10 ms) so it
+            # runs in the same heartbeat as the RL update.  The
+            # dreamer checks ``train_every_n_updates`` internally
+            # so most calls are no-ops.
+            try:
+                dream_loss = learner.dreamer.maybe_train(
+                    learner.update_step)
+                if dream_loss is not None:
+                    put_bounded(metrics_q, {
+                        "type": "dreamer_train",
+                        "src": "learner",
+                        "loss": dream_loss,
+                    })
+            except Exception as exc:  # noqa: BLE001 - reported
+                put_bounded(metrics_q, {
+                    "type": "log", "level": "warning", "src": "learner",
+                    "msg": f"dreamer train lỗi: {format_exception(exc)}"})
             # 3.5 online best-model gate (actor-reported episode metrics)
             learner._poll_episode_metric()
+            # 3.6 self-BC auto-trigger: if the most recent gate asked
+            # for a self-imitation retrain, run it now (the GUI will
+            # receive a "pretrain_done" message just like the manual
+            # BC button).  The pre-train BC and self-BC are mutually
+            # exclusive in spirit (one runs at startup, the other on
+            # agent improvement), so the actor is NOT paused here —
+            # online RL keeps running while BC trains.
+            if getattr(learner, "_self_bc_pending", False):
+                learner._self_bc_pending = False
+                try:
+                    res = learner.pretrain_with_self_imitation(
+                        str(cfg.paths.demos_dir))
+                    put_bounded(metrics_q, {
+                        "type": "pretrain_done", "result": res})
+                except Exception as exc:  # noqa: BLE001 - reported
+                    put_bounded(metrics_q, {
+                        "type": "log", "level": "error", "src": "learner",
+                        "msg": f"self-BC lỗi: {format_exception(exc)}"})
             # 4. metrics heartbeat
             if now - last_report >= cfg.perf.report_interval_s:
                 last_report = now
+                # Mental-rehearsal round (throttled by
+                # ``dream_every_s``).  The dreamer uses the live
+                # policy and the self-imitation pool; if either is
+                # missing, it returns immediately.
+                try:
+                    learner.dreamer.maybe_dream(now)
+                except Exception as exc:  # noqa: BLE001 - reported
+                    put_bounded(metrics_q, {
+                        "type": "log", "level": "warning", "src": "learner",
+                        "msg": f"dreamer round lỗi: {format_exception(exc)}"})
+                si_stats = learner.self_imitation.stats()
+                d_heart = learner.dreamer.to_heartbeat()
+                # RND (curiosity) stats: the predictor loss
+                # and the running normaliser.  The GUI shows
+                # these so the operator can tell at a glance
+                # whether the agent is exploring novel
+                # states.
+                rnd_heart = (learner.rnd.to_heartbeat()
+                              if learner.rnd is not None else {})
                 put_bounded(metrics_q, {
                     "type": "metrics", "src": "learner", "t": time.time(),
                     "data": {
@@ -578,6 +1188,28 @@ def learner_main(
                                          else learner.best_rolling),
                         "best_gate": (None if learner.ckpt.best_metric is None
                                       else float(learner.ckpt.best_metric)),
+                        # Self-imitation pool stats; the GUI shows the
+                        # on-disk count and "episodes seen" so the
+                        # operator can see whether the gate is firing.
+                        "self_imitation_seen": si_stats["self_episodes_seen"],
+                        "self_imitation_saved": si_stats["self_episodes_saved"],
+                        "self_imitation_on_disk": si_stats["self_on_disk"],
+                        # Mental-rehearsal pool stats; the GUI shows
+                        # how many abstract episodes the dreamer has
+                        # written (positive vs negative) and the
+                        # current rolling Q mean.
+                        "dreams_total": d_heart["dreams_total"],
+                        "dreams_positive": d_heart["dreams_positive"],
+                        "dreams_negative": d_heart["dreams_negative"],
+                        "on_disk_positive": d_heart["on_disk_positive"],
+                        "on_disk_negative": d_heart["on_disk_negative"],
+                        "dream_q_mean": d_heart["dream_q_mean"],
+                        "dreamer_train_loss": d_heart["last_train_loss"],
+                        # RND (curiosity) — the operator can
+                        # see whether the agent is exploring
+                        # novel states.
+                        "rnd_norm": rnd_heart.get("rnd_norm", 0.0),
+                        "rnd_mean_intrinsic": rnd_heart.get("rnd_mean_intrinsic", 0.0),
                     },
                     "dropped_transitions": learner_dropped[0],
                 })

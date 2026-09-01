@@ -39,6 +39,7 @@ class RewardBreakdown:
     death: float = 0.0
     hazard: float = 0.0
     pixel_diff: float = 0.0
+    curriculum: float = 0.0
     total: float = 0.0
     clipped: bool = False
     reason: str = ""
@@ -49,6 +50,7 @@ class RewardBreakdown:
             "death": self.death,
             "hazard": self.hazard,
             "pixel_diff": self.pixel_diff,
+            "curriculum": self.curriculum,
             "total": self.total,
             "clipped": 1.0 if self.clipped else 0.0,
         }
@@ -187,7 +189,24 @@ class PendingHazardTracker:
 
 
 class SurvivalRewardCalculator:
-    """Total reward per actor step, from components to clipped total."""
+    """Total reward per actor step, from components to clipped total.
+
+    Curriculum milestones
+    ---------------------
+    ``cfg.curriculum_milestones`` is a sorted tuple of survival times
+    (seconds).  The first time the agent's elapsed survival in an
+    episode crosses a milestone, a one-shot ``cfg.curriculum_bonus`` is
+    paid; subsequent crossings of the SAME milestone are not paid.
+    The milestones re-arm at episode start so a long-lived agent gets
+    them every life.
+
+    The bonus is small and bounded: the default schedule (2/5/10/20 s
+    at +0.5 each) hands out at most +2.0 per episode, dwarfed by the
+    -10 death penalty.  The point is not to inflate the reward
+    landscape, it is to give the agent a gradient signal in the
+    "still alive but not yet surviving 10s" region where the per-frame
+    alive reward is too small to drive learning on its own.
+    """
 
     def __init__(self, cfg: RewardConfig, now=time.monotonic) -> None:
         self.cfg = cfg
@@ -196,12 +215,20 @@ class SurvivalRewardCalculator:
         self._episode_dead = False
         self._last_ts: Optional[float] = None
         self._last_ground_diff = 0.0
+        # Curriculum state: the index into curriculum_milestones of the
+        # NEXT milestone to cross.  Reset to 0 at episode start.
+        self._curriculum_idx = 0
+        self._episode_start_ts: Optional[float] = None
+        # The number of milestones actually crossed (audit + tests).
+        self.milestones_crossed = 0
 
     # ------------------------------------------------------------------ #
     def begin_episode(self, ts: Optional[float] = None) -> None:
         self._episode_dead = False
         self._last_ts = self.now() if ts is None else ts
         self._last_ground_diff = 0.0
+        self._curriculum_idx = 0
+        self._episode_start_ts = self._last_ts
 
     def alive_reward(self, ts: float) -> float:
         """Proportional to real elapsed time since the previous frame."""
@@ -212,6 +239,35 @@ class SurvivalRewardCalculator:
         self._last_ts = ts
         frames_equiv = dt * self.cfg.nominal_fps
         return self.cfg.alive_per_frame * frames_equiv
+
+    def curriculum_reward(self, ts: float) -> float:
+        """Pay a one-shot bonus for each milestone this episode crosses.
+
+        Returns the bonus granted THIS call (0 or ``cfg.curriculum_bonus``).
+        Re-arms only on :meth:`begin_episode`.  Out-of-order milestones
+        are accepted (the schedule is sorted at construction time so the
+        user can write them in any order) — we keep walking the index
+        forward instead of paying the first one we find.
+        """
+        milestones = self.cfg.curriculum_milestones
+        if not milestones or self.cfg.curriculum_bonus <= 0.0:
+            return 0.0
+        if self._episode_start_ts is None:
+            return 0.0
+        elapsed = ts - self._episode_start_ts
+        bonus = 0.0
+        idx = self._curriculum_idx
+        # Walk forward as long as the elapsed time has crossed the next
+        # milestone; if multiple milestones fall in the same frame we
+        # pay them all (rare, but well-defined: an "instant replay"
+        # episode that starts at a non-zero time).
+        while idx < len(milestones) and elapsed >= float(milestones[idx]):
+            bonus += float(self.cfg.curriculum_bonus)
+            idx += 1
+        if idx > self._curriculum_idx:
+            self.milestones_crossed += idx - self._curriculum_idx
+            self._curriculum_idx = idx
+        return bonus
 
     def death_reward(self) -> float:
         """-10 exactly once per episode."""
@@ -249,9 +305,15 @@ class SurvivalRewardCalculator:
             self.hazards.register(horizon)
         hazard = self.hazards.on_frame(horizon, action)
         self.hazards.expire_old(ts)
+        # curriculum is paid BEFORE the death penalty so the
+        # terminal-state transition still gets a normal "you just hit
+        # 10s for the first time" credit even when the same frame is
+        # the death frame.  The bonus is tiny relative to -10 so the
+        # net reward is still strongly negative on death.
+        curriculum = self.curriculum_reward(ts)
         pd = self.pixel_diff_reward(ground_gray, prev_ground_gray)
         death = self.death_reward() if died else 0.0
-        total = alive + hazard + pd + death
+        total = alive + hazard + pd + death + curriculum
         clipped = False
         if total < self.cfg.reward_clip_min:
             total, clipped = self.cfg.reward_clip_min, True
@@ -262,6 +324,7 @@ class SurvivalRewardCalculator:
             death=death,
             hazard=hazard,
             pixel_diff=pd,
+            curriculum=curriculum,
             total=total,
             clipped=clipped,
             reason="death" if died else "step",

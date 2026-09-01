@@ -10,6 +10,28 @@ The recorder NEVER presses keys itself; a pynput listener (when available)
 observes the human's keys.  Recording stops on F9, death detection, or a
 frame gap (browser stall), and the episode is written atomically as
 ``demos/episode_YYYYmmdd_HHMMSS.npz``.
+
+CAPTURE MODES
+-------------
+Two recording strategies are available (selected by ``cfg.demo_augment``):
+
+* ``keypress_window`` (default): the recorder still pulls every captured
+  frame, but it only PERSISTS the rows inside a ±N frame window around
+  every key press (and a single N-frame prelude so the policy has
+  context).  Stretches of pure NOOP between presses are dropped — those
+  are the majority of a 30-FPS recording and would otherwise drown the
+  rare, life-critical dodges in useless samples.
+
+* legacy (every-frame): the recorder persists every accepted frame.  The
+  downstream :class:`dataset.DemonstrationDataset` can still apply the
+  same keypress-window filter at training time when the user prefers
+  the data file to be the full recording.
+
+In BOTH modes the on-disk format is unchanged — the recorder is the
+single source of truth for the action column, the dataset is the
+single source of truth for which rows to train on.  This keeps every
+already-recorded demo usable: switching the mode never invalidates old
+files.
 """
 
 from __future__ import annotations
@@ -18,7 +40,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
@@ -138,6 +160,14 @@ class DemoRecorder:
         self._conf: list[float] = []
         self._death: list[str] = []
         self._score: list[float] = []
+        # Recording-side keypress index: the frame index at which each
+        # human key press was observed.  ``stop()`` consults this to
+        # decide which rows to persist (under keypress_window mode) and
+        # to report "this episode covered N presses" back to the GUI.
+        # We track the *original* index, before any window filter, so
+        # the window keeps the same relationship to the press no matter
+        # when ``stop()`` is called.
+        self._press_indices: List[int] = []
         self._recording = False
         self._lock = threading.Lock()
         self._current_action = NOOP
@@ -172,6 +202,10 @@ class DemoRecorder:
         self._dead_streak = 0
         self._alive_streak = 0
         self._wait_alive = False
+        # Counter exposed to the GUI summary so the operator can see
+        # how many presses the current episode has captured without
+        # touching the internal lists.  Reset in start().
+        self.press_count: int = 0
 
     #: keys that are shortcuts, never game actions (alt-tab, ctrl-arrow …)
     MODIFIER_KEYS = frozenset({
@@ -218,6 +252,16 @@ class DemoRecorder:
                 self._held_order.remove(key_name)
             self._held_order.append(key_name)
             self._recompute_current()
+            # Record the press index AFTER _current_action is set so the
+            # window built around it covers the frame the human actually
+            # saw when deciding to press.  ``len(self._frames)`` is the
+            # index the press will be ASSIGNED to (the next tick appends
+            # the row), so subtract 0 here is wrong — the press frame is
+            # the next one to be appended, which is ``len(_frames)``.
+            # Cap the recorded index at 0 so a press received before the
+            # first frame still maps to a valid row.
+            self._press_indices.append(max(0, len(self._frames)))
+            self.press_count = len(self._press_indices)
 
     def _handle_release(self, key_name: str) -> None:
         if key_name in self.MODIFIER_KEYS:
@@ -265,6 +309,8 @@ class DemoRecorder:
         self._conf.clear()
         self._death.clear()
         self._score.clear()
+        self._press_indices.clear()
+        self.press_count = 0
         self._current_action = NOOP
         self._held.clear()
         self._held_order.clear()
@@ -286,7 +332,17 @@ class DemoRecorder:
         return True
 
     def stop(self, done: bool = True) -> Optional[str]:
-        """Finalise and atomically write the episode; returns its path."""
+        """Finalise and atomically write the episode; returns its path.
+
+        The :class:`dataset.DemonstrationDataset` is the single source of
+        truth for which rows to TRAIN on; this method only decides which
+        rows to PERSIST.  When ``cfg.demo_augment.keypress_window`` is on
+        (the default), only the rows inside a ±N frame window around
+        each human key press are saved — that is the user's request "mỗi
+        lần người dùng bấm phím ở chế độ quay demo sẽ chụp lại và phân
+        vào mục tương ứng với phím".  When the option is off, every
+        captured frame is saved (legacy behaviour).
+        """
         if not self._recording:
             return None
         self._recording = False
@@ -303,6 +359,7 @@ class DemoRecorder:
             conf = list(self._conf)
             death = list(self._death)
             score = list(self._score)
+            press_indices = list(self._press_indices)
         lengths = {len(frames), len(actions), len(ts), len(conf),
                    len(death), len(score)}
         if len(lengths) != 1:
@@ -313,10 +370,30 @@ class DemoRecorder:
             n_min = min(lengths)
             frames, actions, ts = frames[:n_min], actions[:n_min], ts[:n_min]
             conf, death, score = conf[:n_min], death[:n_min], score[:n_min]
+            press_indices = [p for p in press_indices if p < n_min]
         n = len(frames)
         if n == 0:
             LOGGER.warning("demo recording stopped with 0 frames; nothing saved")
             return None
+        # ---- keypress-window filter (when enabled) -------------------- #
+        keep_idx = self._keypress_window_indices(
+            n=n, presses=press_indices,
+            cfg=getattr(self.cfg, "demo_augment", None))
+        if keep_idx is not None and keep_idx.size < n:
+            frames = [frames[i] for i in keep_idx]
+            actions = [actions[i] for i in keep_idx]
+            ts = [ts[i] for i in keep_idx]
+            conf = [conf[i] for i in keep_idx]
+            death = [death[i] for i in keep_idx]
+            score = [score[i] for i in keep_idx]
+            n = len(frames)
+            LOGGER.info(
+                "demo: keypress-window kept %d/%d frames (%d press "
+                "boundaries, ±%d pre / ±%d post)",
+                n, len(frames), len(press_indices),
+                int(getattr(self.cfg.demo_augment, "keypress_pre", 5)),
+                int(getattr(self.cfg.demo_augment, "keypress_post", 5)),
+            )
         done_flags = np.zeros(n, dtype=bool)
         if done:
             done_flags[-1] = True
@@ -335,6 +412,17 @@ class DemoRecorder:
             "anchor_calibrated": self.cfg.death.anchor_set(),
             "respawn_calibrated": self.cfg.input.respawn_set(),
             "recorded_at": time.time(),
+            # Record-side diagnostics so a user can later audit whether
+            # the file is the "every-frame" or the "keypress-window"
+            # variant.  The dataset uses this to keep the on-disk shape
+            # honest, and the GUI surfaces it as a one-line summary.
+            "keypress_window": bool(getattr(
+                getattr(self.cfg, "demo_augment", None), "keypress_window", True)),
+            "keypress_pre": int(getattr(
+                getattr(self.cfg, "demo_augment", None), "keypress_pre", 5)),
+            "keypress_post": int(getattr(
+                getattr(self.cfg, "demo_augment", None), "keypress_post", 5)),
+            "press_count": len(press_indices),
         }
         # DEEP-FIX: %Y%m%d_%H%M%S has one-second resolution, so two episodes
         # finished in the same second overwrote each other.  Add a monotonic
@@ -369,6 +457,52 @@ class DemoRecorder:
         self.episode_paths.append(str(path))
         LOGGER.info("demo episode saved: %s (%d steps)", path, n)
         return str(path)
+
+    @staticmethod
+    def _keypress_window_indices(n: int, presses: list[int], cfg: object
+                                 ) -> Optional[np.ndarray]:
+        """Decide which rows to persist under the keypress-window mode.
+
+        Returns ``None`` when the feature is off (legacy every-frame),
+        or a sorted, deduplicated numpy index array otherwise.  When the
+        episode has NO recorded presses the function returns the FULL
+        range (``arange(n)``) rather than an empty array: an all-NOOP
+        recording still has to land on disk so the user can audit the
+        "I forgot to press anything" failure mode, instead of producing
+        zero files silently.  The downstream dataset can drop it
+        later if it really has zero informative frames.
+
+        The rule matches :func:`demo_augment.keypress_windows` so the
+        recorder-side filter and the dataset-side filter agree.
+        """
+        if cfg is None or not getattr(cfg, "keypress_window", False):
+            return None
+        if n == 0:
+            return np.zeros(0, dtype=np.int64)
+        if not presses:
+            # No presses -> save the whole episode so the user can see
+            # "I forgot to play" in the saved file (and the GUI's
+            # episode summary is honest about it).
+            return np.arange(n, dtype=np.int64)
+        pre = max(0, int(getattr(cfg, "keypress_pre", 5)))
+        post = max(0, int(getattr(cfg, "keypress_post", 5)))
+        spans: list[tuple[int, int]] = []
+        for p in presses:
+            if p < 0 or p >= n:
+                continue  # stale press recorded before/after this episode
+            lo, hi = max(0, p - pre), min(n - 1, p + post)
+            spans.append((lo, hi))
+        if not spans:
+            return np.arange(n, dtype=np.int64)
+        spans.sort()
+        merged: list[list[int]] = []
+        for lo, hi in spans:
+            if merged and lo <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        idx = np.concatenate([np.arange(lo, hi + 1) for lo, hi in merged])
+        return np.unique(idx).astype(np.int64)
 
     # ------------------------------------------------------------------ #
     def _anchor_is_dead(self, image) -> Optional[bool]:
