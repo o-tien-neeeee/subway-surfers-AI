@@ -625,3 +625,33 @@ Phân tích mã nguồn [khxji/lunai](https://github.com/khxji/lunai) (`Lunai.py
 4. **Counter reward thay cho OCR** trên máy yếu — repo đã hỗ trợ: reward sống
    theo thời gian/step chính là counter; OCR điểm số chỉ dùng để đánh giá (đúng
    định hướng "score is evaluation-only" hiện có).
+
+---
+
+## Phụ lục B — Đối chứng: DQN+LSTM (CS386 Group 6) thất bại với reward +2/−10
+
+Project [m4n4n-j/subway-surfers-AI-main] (DQN-CNN + LSTM + experience replay +
+eligibility trace, grayscale 128×128, reward **+2 mỗi state sống / −10 khi
+chết**, APK trên Nox + PyAutoGUI): kết quả điểm TB ~250 (max 512) và agent
+học chiến lược rác *"keep jumping or rolling as the agent is not penalized
+for these actions and sometimes it helps to dodge"*.
+
+Bài học từ chính slide của họ:
+1. **Reward sống lớn (+2) nhưng vẫn phạt chết −10 vẫn hỏng.** Break-even chỉ
+   5 state, nhưng hình phạt chết chi phối gradient đầu và hành động
+   nhảy/cuộn "miễn phí + đôi khi né được" tạo cực trị cục bộ spam. ⇒ Chỉ tăng
+   reward sống là KHÔNG đủ; cần (a) reward toàn dương, không phạt chết cứng
+   (lunai) và/hoặc (b) khử spam hành động.
+2. **LSTM/eligibility trace không tạo ra tín hiệu vốn không có.** LSTM là bộ
+   nhớ trình tự; nếu observation thiếu thông tin né hoặc reward sai, kiến
+   trúc to hơn chỉ học nhanh hơn một chút — không sửa được MDP. Repo đã có
+   n-step trace; frame-stack + ObstacleTracker đã cấp trí nhớ chuyển động
+   cần thiết, nên LSTM là không bắt buộc trên CPU yếu.
+3. **Train "very less training"** (lời tự thú) là tác nhân phụ — RL màn hình
+   cần hàng trăm nghìn–triệu bước với auto-reset liên tục mới hội tụ.
+
+Đối chiếu ba thiết kế (xem Phụ lục A): lunai (toàn dương, không phạt chết,
+~1M step) thành công; CS386 (+2/−10, ít train) ra spam; bản cũ của repo
+(+0.02/−10, crop mất chân trời, ε khóa sớm) plateau. Repo hiện tại đã căn
+theo phía lunai: full-frame observation, counter reward dương,
+death_penalty=0 mặc định, n-step/PER, cộng DQfD/DAgger cho đường học từ người.
