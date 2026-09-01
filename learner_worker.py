@@ -92,13 +92,13 @@ class Learner:
     # ------------------------------------------------------------------ #
     def _load_or_fresh_buffer(self) -> PrioritizedReplayBuffer:
         fresh = lambda: PrioritizedReplayBuffer(
-            self.cfg.per, frame_size=self.cfg.perception.ground_size,
+            self.cfg.per, frame_size=self.cfg.perception.obs_size,
             gamma=self.cfg.rl.gamma,
         )
         loaded, ok = self.ckpt.buffer_load(
             lambda: PrioritizedReplayBuffer.load(
                 str(self.ckpt.buffer_path), self.cfg.per,
-                frame_size=self.cfg.perception.ground_size,
+                frame_size=self.cfg.perception.obs_size,
                 gamma=self.cfg.rl.gamma,
             )
         )
@@ -212,7 +212,12 @@ class Learner:
         beta = self.buffer.beta_for_step(self.update_step)
         t0 = time.perf_counter()
         try:
-            batch = self.buffer.sample(self.cfg.rl.batch_size, beta, rng=self.rng)
+            expert_frac = (self.cfg.rl.expert_batch_fraction
+                           if self.buffer.expert_size else 0.0)
+            batch = self.buffer.sample_mixed(
+                self.cfg.rl.batch_size, beta,
+                expert_fraction=expert_frac, rng=self.rng,
+            )
         except IndexError:
             return None
         sample_ms = (time.perf_counter() - t0) * 1000.0
@@ -280,7 +285,8 @@ class Learner:
                                          "src": "learner", "msg": msg})
             return {"status": "skipped", "reason": "not_enough_episodes"}
         report(f"BC dataset: {len(valid)}/{len(episodes)} valid episodes")
-        ds = DemonstrationDataset(valid, stack=self.cfg.perception.frame_stack)
+        ds = DemonstrationDataset(valid, stack=self.cfg.perception.frame_stack,
+                                  mirror=bool(self.cfg.bc.mirror_augment))
         train_idx, val_idx = ds.split_by_episode(self.cfg.bc.val_fraction,
                                                  seed=self.cfg.seed)
         if not val_idx:
@@ -323,13 +329,54 @@ class Learner:
                                                 f"val_acc={row['val_acc']:.3f}"})
         self.bc_history = history
         self.agent.sync_target()
+        # DQfD: demonstrations permanently live in the expert replay, so
+        # online RL keeps sampling them with the large-margin loss and cannot
+        # unlearn the human during fine-tuning.
+        n_expert = self._populate_expert_buffer(valid)
         self._publish(force=True)
         extra = {"bc": history[-1], "update_step": self.update_step,
-                 "dataset": str(demos_dir)}
+                 "dataset": str(demos_dir), "expert_transitions": n_expert}
         self.ckpt.save_model(self.agent.state_payload(), extra, which="best",
                              metric=history[-1]["val_acc"], higher_is_better=True)
         self.ckpt.save_model(self.agent.state_payload(), extra, which="latest")
-        return {"status": "ok", "history": history}
+        return {"status": "ok", "history": history, "expert_transitions": n_expert}
+
+    def _populate_expert_buffer(self, episodes) -> int:
+        """Convert BC demo episodes into permanent expert n-step transitions."""
+        from replay_buffer import NStepBuilder
+
+        k = self.cfg.perception.frame_stack
+        nstep = NStepBuilder(self.cfg.rl.n_step, self.cfg.rl.gamma)
+        added = 0
+        base = int(time.time()) % 10_000_000
+        for ei, ep in enumerate(episodes):
+            nstep.clear()
+            n = len(ep)
+            if n < k + 1:
+                continue
+            # stable per-frame pseudo env ids (real timestamps' order matters
+            # only for de-dup within the store).
+            env_ids = (base + ei * 1_000_000 + np.arange(n, dtype=np.int64),)
+            env_ids = tuple(int(x) for x in env_ids[0])
+            for i in range(n):
+                lo = max(0, i - k + 1)
+                stack = np.stack(
+                    [ep.frames[j] for j in range(lo, i + 1)]
+                    + [ep.frames[lo]] * (k - (i - lo + 1)),
+                    axis=0,
+                )
+                ids = env_ids[lo : i + 1] + (env_ids[lo],) * (k - (i - lo + 1))
+                for tr in nstep.push(stack, ids, int(ep.actions[i]),
+                                     0.0, bool(ep.done[i])):
+                    tr.expert = True
+                    self.buffer.add_expert_nstep(tr)
+                    added += 1
+        LOGGER.info("expert replay populated: %d demo transitions", added)
+        put_bounded(self.metrics_q, {
+            "type": "log", "level": "info", "src": "learner",
+            "msg": f"DQfD expert replay: {added} transitions from demos",
+        })
+        return added
 
     # ------------------------------------------------------------------ #
     def shutdown_save(self) -> None:

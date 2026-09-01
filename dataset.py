@@ -177,25 +177,39 @@ def validate_directory(directory: str | Path, target_fps: float = 30.0
 # Torch dataset for behaviour cloning (built lazily, uint8 on disk)
 # --------------------------------------------------------------------- #
 class DemonstrationDataset:
-    """Frame-stack BC dataset over validated episodes (memory-light)."""
+    """Frame-stack BC dataset over validated episodes (memory-light).
+
+    ``mirror`` doubles the data by left-right flipping the grayscale
+    observations and swapping LEFT<->RIGHT labels — subwAI/Bezet1 report this
+    materially improves robustness on the symmetric 3-lane game. Mirrored
+    samples are synthesised on access (no extra disk/RAM for frames).
+    """
+
+    #: label swap under horizontal mirror (LEFT<->RIGHT; JUMP/SLIDE unchanged)
+    MIRROR_ACTION = {0: 0, 1: 2, 2: 1, 3: 3, 4: 4}
 
     def __init__(self, episodes: list[Episode], stack: int = 4,
-                 deterministic: bool = True) -> None:
+                 deterministic: bool = True, mirror: bool = False) -> None:
         self.stack = stack
         self.deterministic = deterministic
+        self.mirror = mirror
         self._episodes = episodes
-        self._index: list[tuple[int, int]] = []  # (episode_idx, step)
+        self._index: list[tuple[int, int, int]] = []  # (episode_idx, step, flip)
         for ei, ep in enumerate(episodes):
             for si in range(len(ep)):
-                self._index.append((ei, si))
+                self._index.append((ei, si, 0))
+                if mirror:
+                    self._index.append((ei, si, 1))
 
     def __len__(self) -> int:
         return len(self._index)
 
     def class_counts(self) -> dict[int, int]:
         counts = dict.fromkeys(range(5), 0)
-        for ei, si in self._index:
+        for ei, si, flip in self._index:
             a = int(self._episodes[ei].actions[si])
+            if flip:
+                a = self.MIRROR_ACTION.get(a, a)
             if a in counts:
                 counts[a] += 1
         return counts
@@ -210,12 +224,16 @@ class DemonstrationDataset:
         return (w / w.max()).astype(np.float32)
 
     def get(self, i: int) -> tuple[np.ndarray, int]:
-        """Return ([stack,84,84] uint8, action); stack slides within episode."""
-        ei, si = self._index[i]
+        """Return ([stack,S,S] uint8, action); stack slides within episode."""
+        ei, si, flip = self._index[i]
         ep = self._episodes[ei]
         idxs = [max(0, si - k) for k in range(self.stack - 1, -1, -1)]
         stack = np.stack([ep.frames[j] for j in idxs], axis=0)
-        return stack, int(ep.actions[si])
+        a = int(ep.actions[si])
+        if flip:
+            stack = stack[:, :, ::-1]          # horizontal mirror
+            a = self.MIRROR_ACTION.get(a, a)
+        return np.ascontiguousarray(stack), int(a)
 
     def batch(self, indices: list[int]) -> tuple[np.ndarray, np.ndarray]:
         xs, ys = zip(*(self.get(i) for i in indices))
@@ -223,14 +241,18 @@ class DemonstrationDataset:
 
     def split_by_episode(self, val_fraction: float, seed: int = 0
                          ) -> tuple[list[int], list[int]]:
-        """Episode-level split -> (train_indices, val_indices) into self._index."""
+        """Episode-level split -> (train_indices, val_indices) into self._index.
+
+        Both mirror views of an episode stay on the SAME side of the split
+        (no flipped near-duplicate leakage into validation).
+        """
         rng = np.random.default_rng(seed)
         n_eps = len(self._episodes)
         order = rng.permutation(n_eps)
         n_val = max(1, round(n_eps * val_fraction)) if n_eps > 1 else 0
         val_eps = {int(e) for e in order[:n_val]}
         train_idx, val_idx = [], []
-        for pos, (ei, _si) in enumerate(self._index):
+        for pos, (ei, _si, _flip) in enumerate(self._index):
             (val_idx if int(ei) in val_eps else train_idx).append(pos)
         return train_idx, val_idx
 

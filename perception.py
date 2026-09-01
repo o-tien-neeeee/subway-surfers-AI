@@ -3,13 +3,21 @@
 Pipeline per frame (all numpy/cv2, no torch on this path):
 
   captured RGB region
-    ├─ horizon band  -> resize 40x40, grayscale  -> HorizonDetector
-    └─ ground band   -> resize 84x84, grayscale  -> uint8 FrameStack
+    ├─ horizon band  -> resize 40x40, grayscale  -> HorizonDetector (diff alarm)
+    ├─ FULL frame    -> resize SxS,   grayscale  -> POLICY observation (FrameStack)
+    └─ anchor patch  -> 5x5x3 median RGB         -> DeathDetector
+
+Deep-research fix (see DEEP_RESEARCH_vi.md §1.2 #1): the policy used to be fed
+only the lower 75 % crop ("ground") of the region. In Subway Surfers obstacles
+spawn at the HORIZON and rush down — cropping the top hid exactly the pixels
+the network must react to, leaving <1.5 s of visible trajectory. The policy
+observation is now the ENTIRE game region resized to ``policy_size`` (84x84);
+the horizon band survives only as the crude frame-diff alarm input.
 
 * Observations stay uint8 until they enter the network (normalise inside the
   forward pass) — 4x less RAM than float32 and zero-copy views for stacking.
-* The stack is a ring of 4 buffers; ``get()`` builds the [4,84,84] uint8
-  array once per inference (28 KB copy — negligible).
+* The stack is a ring of k buffers; ``get()`` builds the [k,S,S] uint8
+  array once per inference.
 * Handles black frames, duplicates and invalid frames explicitly: they never
   enter the stack, they are counted, and they never block the loop.
 """
@@ -73,15 +81,26 @@ class ZoneResult:
 
     frame_id: int
     ts: float
-    horizon_gray: np.ndarray | None  # 40x40 uint8
-    ground_gray: np.ndarray | None  # 84x84 uint8
+    horizon_gray: np.ndarray | None  # 40x40 uint8 (diff-alarm band)
+    policy_gray: np.ndarray | None   # SxS uint8 FULL-FRAME policy observation
     anchor_patch: np.ndarray | None  # 5x5x3 uint8
     valid: bool
     reason: str = "ok"
 
+    # Backwards-compatible alias (older code/tests referenced "ground_gray").
+    @property
+    def ground_gray(self) -> np.ndarray | None:
+        return self.policy_gray
+
 
 class ZonePreprocessor:
-    """Splits the region into horizon/ground zones and samples the anchor."""
+    """Produces the horizon alarm band, the FULL-FRAME policy view and anchor.
+
+    ``policy_size`` defaults to ``cfg.policy_size`` (the network observation
+    edge); ``horizon_size`` is the tiny diff-alarm band. The two are
+    intentionally independent: the alarm may stay low-res while the policy
+    sees the whole scene at full observation resolution.
+    """
 
     def __init__(
         self,
@@ -89,6 +108,7 @@ class ZonePreprocessor:
         horizon_frac: float,
         anchor_xy: tuple[int, int] | None = None,
         require_anchor: bool = True,
+        policy_size: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.horizon_frac = horizon_frac
@@ -97,13 +117,14 @@ class ZonePreprocessor:
         # the demo recorder (BC data does not need the anchor) and by the
         # actor when the user has not calibrated step 3 yet.
         self.require_anchor = require_anchor
+        self.policy_size = int(policy_size or cfg.obs_size)
         self.horizon_h_cache: dict[int, int] = {}
 
     def set_anchor(self, xy: tuple[int, int] | None) -> None:
         self.anchor_xy = xy
 
     def split_line(self, region_h: int) -> int:
-        """Pixel row separating horizon band from ground band."""
+        """Pixel row separating the horizon alarm band from the rest."""
         return max(1, round(region_h * self.horizon_frac))
 
     def process(self, image: np.ndarray, frame_id: int, ts: float) -> ZoneResult:
@@ -115,16 +136,17 @@ class ZonePreprocessor:
         split = self.split_line(h)
 
         horizon = image[:split, :, :]
-        ground = image[split:, :, :]
 
         horizon_gray = cv2.resize(
             rgb_to_gray(horizon),
             (self.cfg.horizon_size, self.cfg.horizon_size),
             interpolation=cv2.INTER_AREA,
         )
-        ground_gray = cv2.resize(
-            rgb_to_gray(ground),
-            (self.cfg.ground_size, self.cfg.ground_size),
+        # POLICY VIEW: the ENTIRE game region (sky/horizon + track), so the
+        # network can see obstacles the moment they spawn far away.
+        policy_gray = cv2.resize(
+            rgb_to_gray(image),
+            (self.policy_size, self.policy_size),
             interpolation=cv2.INTER_AREA,
         )
         patch = anchor_patch(image, *self.anchor_xy) if self.anchor_xy else None
@@ -133,7 +155,7 @@ class ZonePreprocessor:
             frame_id=frame_id,
             ts=ts,
             horizon_gray=horizon_gray,
-            ground_gray=ground_gray,
+            policy_gray=policy_gray,
             anchor_patch=patch,
             valid=valid,
             reason="ok" if valid else "anchor_missing",

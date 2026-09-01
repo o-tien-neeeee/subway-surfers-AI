@@ -96,7 +96,14 @@ class PerceptionConfig:
     #: Fraction of region height treated as the horizon band (step 5 slider).
     horizon_frac: float = 0.25
     horizon_size: int = 40
+    #: DEPRECATED legacy name for the policy crop. Kept for config
+    #: compatibility; the POLICY network now consumes the FULL frame
+    #: (``policy_size``), not the lower 75 % "ground" crop — obstacles
+    #: spawn at the horizon, so cropping it hid exactly what must be dodged.
     ground_size: int = 84
+    #: Size of the FULL-FRAME grayscale observation fed to the policy/BC
+    #: (84x84, entire game region resized). This is the real observation.
+    policy_size: int = 84
     frame_stack: int = 4
     #: Mean luminance below which a frame is treated as black/invalid.
     black_mean_threshold: float = 4.0
@@ -106,6 +113,11 @@ class PerceptionConfig:
             raise ConfigError(
                 f"horizon_frac must be within [0.15, 0.40], got {self.horizon_frac}"
             )
+
+    @property
+    def obs_size(self) -> int:
+        """Observation edge length used by the network and replay buffer."""
+        return int(self.policy_size)
 
 
 @dataclass
@@ -193,8 +205,12 @@ class InputConfig:
 @dataclass
 class SchedulerConfig:
     #: Normal-state decision cadence bounds (in captured frames).
+    #: Deep-research fix: with capture at 30 FPS a decision every 2-3 frames
+    #: is one AGENT step (~8-10 decisions/s) — the classic Atari frame-skip
+    #: structure — so the MDP, n-step returns and epsilon all count coherent
+    #: agent steps instead of a blurred 2-4-frame mix.
     min_decision_frames: int = 2
-    max_decision_frames: int = 4
+    max_decision_frames: int = 3
     #: Danger-state cadence (next available frame).
     danger_decision_frames: int = 1
     #: At most one buffered action beyond the current one.
@@ -209,17 +225,37 @@ class SchedulerConfig:
 
 @dataclass
 class RewardConfig:
-    #: Alive reward per frame at the nominal 30 FPS (~0.6/second).
-    alive_per_frame: float = 0.02
+    #: Alive reward per DECISION STEP (~10 steps/s with frame_skip=3).
+    #: The proven "counter" reward used by the no-code RL bots (e.g. lunai):
+    #: a steady POSITIVE reward every step the run continues, so episode
+    #: return is proportional to survival. ~1.0/s when summed.
+    alive_per_frame: float = 0.1
     nominal_fps: int = 30
-    death_penalty: float = -10.0
-    hazard_bonus: float = 0.1
+    #: Death penalty. The no-code RL tools that learned this game used
+    #: NO negative penalty (death simply ends the episode / bootstraps to 0)
+    #: and gave every step a positive reward — early episodes then rank
+    #: naturally by how long they survived, instead of all looking like the
+    #: same large negative number. Kept configurable (set <0 to re-enable).
+    death_penalty: float = 0.0
+    #: Legacy horizon-diff "hazard bonus": OFF (it rewarded ANY keypress on a
+    #: frame-diff alarm -> button-spam). Kept for ablation only.
+    hazard_bonus: float = 0.0
+    use_hazard_bonus: bool = False
     #: Pending-hazard events resolve after this many valid frames.
     hazard_resolve_frames: int = 2
     #: Pending events older than this are expired without reward.
     hazard_expiry_s: float = 1.2
-    reward_clip_min: float = -10.0
-    reward_clip_max: float = 1.0
+    #: Causal shaping from obstacle_perception.ObstacleTracker. With the
+    #: counter reward these are gentle nudges on top of the steady positive
+    #: signal (the counter reward alone already teaches survival).
+    clear_bonus: float = 0.2
+    danger_penalty: float = 0.0   # 0 = rely on the counter + clear bonus
+    #: Per-tap regulariser. 0 by default: the counter reward already makes
+    #: pointless taps waste decision steps (they don't earn extra reward),
+    #: so an explicit action penalty is unnecessary early on.
+    action_cost: float = 0.0
+    reward_clip_min: float = 0.0
+    reward_clip_max: float = 5.0
     #: Ablation switches (pixel-diff reward is OFF by default; see audit).
     use_pixel_diff_reward: bool = False
     pixel_diff_clip: float = 0.01
@@ -250,13 +286,33 @@ class RLConfig:
     warmup_transitions: int = 500
     #: Training cadence (learner updates) — independent of action cadence.
     max_updates_per_second: float = 20.0
+    #: Frame-skip (Atari-style): one agent decision per `frame_skip` captured
+    #: frames; the chosen action is held and rewards are summed over the
+    #: skip. Transitions/stack/n-step are all indexed by AGENT STEPS, so
+    #: gamma=0.99 per step yields an effective horizon of ~100 steps
+    #: (~30 s at frame_skip=3 / 30 FPS) instead of ~3.3 s when gamma was
+    #: applied per raw frame.
+    frame_skip: int = 3
     n_step: int = 3
-    #: Epsilon decays LINEARLY over `epsilon_decay_frames` ENV frames
-    #: (frames observed by the actor), from start to end.  Explicitly NOT
-    #: learner updates and NOT action steps.
+    #: Epsilon decays LINEARLY over `epsilon_decay_steps` AGENT DECISION
+    #: STEPS from start to end. Deep-research fix: decay used to finish in
+    #: ~150k env frames (~episode 600-800) — before anything could be
+    #: learned the greedy-blind policy was locked in. Counting agent steps
+    #: and spanning a much longer schedule keeps exploration alive.
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay_frames: int = 150_000
+    epsilon_decay_steps: int = 300_000
+    #: Legacy field (env-frame based decay) retained for config round-trips;
+    #: ignored when >0 epsilon_decay_steps governs. 0 = use the new schedule.
+    epsilon_decay_frames: int = 0
+    #: DQfD (deep Q-learning from demonstrations): large-margin supervised
+    #: loss on expert transitions that permanently live in an expert replay.
+    dqfd_margin: float = 0.8
+    dqfd_margin_weight: float = 0.3
+    #: Expert transitions get this fraction of every sampled batch and a
+    #: priority bonus so demonstrations are never forgotten during RL.
+    expert_batch_fraction: float = 0.25
+    expert_priority_bonus: float = 1.0
     checkpoint_every_updates: int = 500
     torch_threads: int = 1
     #: Which actor-reported episode metric gates best_model.pth during ONLINE
@@ -278,6 +334,30 @@ class BCConfig:
     #: Minimum usable episodes; below this BC is refused with a GUI message.
     min_episodes: int = 2
     class_balance: str = "inverse_sqrt"
+    #: Deep-research fix for "learning from humans": human reactions are
+    #: recorded ~200-300 ms BEFORE impact, while the frames that NEED the
+    #: decision (obstacle still far away) were labelled NOOP. Labels are
+    #: therefore BACKDATED from the keypress moment by this many milliseconds
+    #: (fractions of capture cadence rounded per-frame) so the policy learns
+    #: to commit while the obstacle is still at decision distance.
+    label_backdate_ms: float = 220.0
+    #: Keep a short positive-label window (ms) after the backdated onset so
+    #: an action decision covers ~one decision step rather than 1 frame.
+    label_hold_ms: float = 120.0
+    #: Mirror (left-right flip) augmentation for BC — doubles data and
+    #: teaches left/right symmetry (LEFT<->RIGHT labels swapped), reported
+    #: to materially improve robustness on this game.
+    mirror_augment: bool = True
+    #: Light photometric augmentation (brightness/contrast jitter) at load.
+    photometric_augment: bool = True
+    #: DAgger / HG-DAgger (human-gated intervention): while the bot plays,
+    #: the human may seize control; frames taken during/after an intervention
+    #: are recorded as correction demos (the states the bot actually visits
+    #: and fails in — the covariate-shift fix for behavioural cloning).
+    dagger: bool = True
+    #: Keep recording correction frames for this long after the human
+    #: releases the key (covers the recovery trajectory).
+    dagger_tail_ms: float = 700.0
 
 
 @dataclass
@@ -368,6 +448,10 @@ class BotConfig:
             raise ConfigError("rl.gamma must be in (0, 1)")
         if self.rl.n_step < 1 or self.rl.n_step > 10:
             raise ConfigError("rl.n_step must be in [1, 10]")
+        if self.rl.frame_skip < 1 or self.rl.frame_skip > 8:
+            raise ConfigError("rl.frame_skip must be in [1, 8]")
+        if self.rl.epsilon_decay_steps < 1000:
+            raise ConfigError("rl.epsilon_decay_steps must be >= 1000")
         if self.rl.best_metric not in ("survival_s", "total_reward"):
             raise ConfigError(
                 "rl.best_metric must be 'survival_s' or 'total_reward'"
@@ -387,7 +471,7 @@ class BotConfig:
         return warnings
 
     def _replay_ram_estimate_gb(self) -> float:
-        frame_bytes = self.perception.ground_size ** 2
+        frame_bytes = self.perception.obs_size ** 2
         # Frame store keeps unique frames once (lazy stacking); priorities,
         # actions and bookkeeping add a small constant per transition.
         per_transition = frame_bytes + 64

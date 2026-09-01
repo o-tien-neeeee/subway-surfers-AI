@@ -32,7 +32,7 @@ from typing import Any
 import numpy as np
 
 from action_scheduler import ActionScheduler, PlannedAction
-from agent import InferencePolicy, epsilon_for_frame
+from agent import InferencePolicy, epsilon_for_frame, epsilon_for_step
 from config import NOOP, BotConfig
 from death_detector import (
     ColorAnchorDeathDetector,
@@ -46,6 +46,7 @@ from ipc import SharedFrameRing, SharedWeights
 from logging_utils import get_logger, put_bounded
 from metrics import FpsMeter, LatencyMeter
 from models import DuelingDQN
+from obstacle_perception import ObstacleTracker
 from perception import FrameStack, ZonePreprocessor
 from replay_buffer import NStepBuilder
 from rewards import SurvivalRewardCalculator
@@ -117,25 +118,42 @@ class SyntheticGame:
                 self._last_slide_t = self._t
             self._spawn_timer -= dt
             if self._spawn_timer <= 0:
-                self.spawn_cooldown = max(0.35, self.spawn_cooldown * 0.995)
+                # Fairer, learnable cadence: obstacles arrive roughly
+                # every 0.9-1.6 s at the start, tightening to ~0.7 s — the
+                # old 0.35-0.6 s spawn rate made even an oracle die in ~3 s
+                # (multiple overlapping obstacles, no reaction window).
+                self.spawn_cooldown = max(0.7, self.spawn_cooldown * 0.997)
                 self._spawn_timer = self.spawn_cooldown
                 kind = str(self.rng.choice(["lane", "lane", "low", "high"]))
                 lane = int(self.rng.integers(0, self.lanes))
+                # Keep at least one lane open among obstacles that are still
+                # far away (never block all three lanes simultaneously) and
+                # avoid stacking a fresh obstacle directly on a near one.
+                near_lanes = {o["lane"] for o in self.obstacles if o["prog"] < 0.35}
+                if len(near_lanes) >= self.lanes - 1:
+                    open_lanes = [l for l in range(self.lanes) if l not in near_lanes]
+                    if open_lanes:
+                        lane = int(self.rng.choice(open_lanes))
                 self.obstacles.append({"kind": kind, "lane": lane, "prog": 0.0,
-                                       "speed": float(self.rng.uniform(0.45, 0.75))})
+                                       "speed": float(self.rng.uniform(0.45, 0.65))})
             survived: list[dict[str, float]] = []
             for ob in self.obstacles:
                 ob["prog"] += ob["speed"] * dt
                 if ob["prog"] < 0.97:
                     survived.append(ob)
                     continue
-                # collision row: in our lane and not dodged -> death
+                # collision row: an obstacle in our lane is survivable for
+                # low/high barriers via JUMP/SLIDE (with a grace window so a
+                # tap a few frames early still counts), and for trains ("lane")
+                # via switching lanes before this row.
                 if ob["lane"] == self.player_lane:
                     dodged = False
                     if ob["kind"] == "low":
-                        dodged = (action == 3) or (self._t - self._last_jump_t) < 0.35
+                        dodged = (action == 3) or (self._t - self._last_jump_t) < 0.5
                     elif ob["kind"] == "high":
-                        dodged = (action == 4) or (self._t - self._last_slide_t) < 0.35
+                        dodged = (action == 4) or (self._t - self._last_slide_t) < 0.5
+                    # "lane" (train) is dodged by NOT being in its lane —
+                    # being here means the lane change did not happen in time.
                     if not dodged:
                         self._pending_death = True
             self.obstacles = survived
@@ -213,10 +231,11 @@ class GameEnvironment:
         death_cfg = self._death_cfg_with_anchor()
         self.death = ColorAnchorDeathDetector(death_cfg)
         self.reward_calc = SurvivalRewardCalculator(cfg.reward, now=lambda: self._t)
-        self.stack = FrameStack(cfg.perception.frame_stack, cfg.perception.ground_size)
+        self.stack = FrameStack(cfg.perception.frame_stack, cfg.perception.obs_size)
         self.nstep = NStepBuilder(cfg.rl.n_step, cfg.rl.gamma)
+        self.obstacles = ObstacleTracker(player_lane=self.game.player_lane)
         self._t = 0.0
-        self._env_ids: deque[int] = deque(maxlen=4)
+        self._env_ids: deque[int] = deque(maxlen=cfg.perception.frame_stack)
         self._last_action = NOOP
         self._prev_action = NOOP
         self.steps = 0
@@ -242,10 +261,11 @@ class GameEnvironment:
         self._env_ids.clear()
         self._last_action = NOOP
         self.steps = 0
+        self.obstacles.reset()
         self.episode += 1
         return self._ingest(reset=True)
 
-    def _ingest(self, reset: bool = False) -> np.ndarray:
+    def _ingest(self, reset: bool = False):
         frame = self.game.render()
         ts = self._t
         z = self.pre.process(frame, self.game.frame_id, ts)
@@ -254,37 +274,63 @@ class GameEnvironment:
         self.detector.update(z.horizon_gray, z.frame_id, ts)
         self.death.update(z.anchor_patch, z.frame_id, ts)
         fid = self.game.frame_id
+        k = self.cfg.perception.frame_stack
         if reset:
-            self.stack.reset(z.ground_gray)
-            self._env_ids = deque([fid] * 4, maxlen=4)
+            self.stack.reset(z.policy_gray)
+            self._env_ids = deque([fid] * k, maxlen=k)
         else:
-            self.stack.push(z.ground_gray)
+            self.stack.push(z.policy_gray)
             self._env_ids.append(fid)
         return self.stack.get()
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, StepInfo]:
-        self._t += 1.0 / self.cfg.capture.target_fps
-        ts = self._t
-        # 1. act on the synthetic game
-        self.game.step(int(action))
-        # 2. ingest the resulting frame (perception + detectors)
-        frame = self.game.render()
-        z = self.pre.process(frame, self.game.frame_id, ts)
-        hz = self.detector.update(z.horizon_gray, z.frame_id, ts)
-        dr = self.death.update(z.anchor_patch, z.frame_id, ts)
-        died = dr.state is DeathState.DEAD_CONFIRMED
-        self.stack.push(z.ground_gray)
+        """Advance ONE AGENT STEP = ``frame_skip`` sub-steps of the game.
+
+        The chosen action is applied at the start and HELD for the skip (a
+        fresh tap is not re-sent — Subway Surfers latches lane changes and
+        jump/roll animations, matching the live pipeline's tap semantics).
+        Rewards are accumulated over the sub-steps; the observation stack
+        advances by ONE decision-step frame (Atari frame-skip structure).
+        """
+        skip = max(1, int(self.cfg.rl.frame_skip))
+        dt = 1.0 / self.cfg.capture.target_fps
+        total_r = 0.0
+        hz = None
+        dr = None
+        z = None
+        died = False
+        occ = None
+        for _ in range(skip):
+            self._t += dt
+            ts = self._t
+            self.game.step(int(action))          # action held
+            frame = self.game.render()
+            z = self.pre.process(frame, self.game.frame_id, ts)
+            hz = self.detector.update(z.horizon_gray, z.frame_id, ts)
+            dr = self.death.update(z.anchor_patch, z.frame_id, ts)
+            sub_died = dr.state is DeathState.DEAD_CONFIRMED
+            if not sub_died:
+                occ = self.obstacles.update(
+                    z.policy_gray, player_lane=self.game.player_lane
+                )
+            breakdown = self.reward_calc.step(
+                ts=ts, action=int(action), horizon=hz,
+                ground_gray=z.policy_gray, died=sub_died,
+                clear=bool(occ.clear) if occ else False,
+                danger=bool(occ.danger) if occ else False,
+            )
+            total_r += breakdown.total
+            died = died or sub_died
+            if died:
+                break
+        # stack advances ONE frame per agent step (the frame after the skip)
+        self.stack.push(z.policy_gray)
         self._env_ids.append(self.game.frame_id)
         obs = self.stack.get()
-        # 3. reward for this frame given the action just taken
-        breakdown = self.reward_calc.step(
-            ts=ts, action=int(action), horizon=hz,
-            ground_gray=z.ground_gray, died=died,
-        )
         self.steps += 1
         info = StepInfo(horizon=hz, death=dr,
-                        reward_breakdown=breakdown.to_dict(), action_step=self.steps)
-        return obs, breakdown.total, died, info
+                        reward_breakdown={"total": total_r}, action_step=self.steps)
+        return obs, total_r, died, info
 
     def pop_nstep_transitions(self, obs: np.ndarray, action: int, reward: float,
                               done: bool) -> list:
@@ -364,14 +410,17 @@ class BotActor:
         self.horizon = HorizonDetector(cfg.horizon, cfg.perception.horizon_size)
         self.death = ColorAnchorDeathDetector(cfg.death) if cfg.death.anchor_set() else None
         self.reward_calc = SurvivalRewardCalculator(cfg.reward)
-        self.stack = FrameStack(cfg.perception.frame_stack, cfg.perception.ground_size)
+        # Structured obstacle tracker -> causal clear/danger shaping.
+        self.obstacles = ObstacleTracker()
+        self.frame_skip = max(1, int(cfg.rl.frame_skip))
+        self.stack = FrameStack(cfg.perception.frame_stack, cfg.perception.obs_size)
         self.scheduler = ActionScheduler(cfg.scheduler,
                                           cooldown_ms=cfg.input.cooldown_ms)
         self.scheduler.ttl_ms = float(cfg.input.action_ttl_ms)
         self.input = InputController(cfg.input, backend=input_backend)
         model = DuelingDQN.from_profile(cfg.rl.profile,
                                         cfg.perception.frame_stack,
-                                        cfg.perception.ground_size)
+                                        cfg.perception.obs_size)
         self.policy = InferencePolicy(model, seed=seed)
         self.nstep = NStepBuilder(cfg.rl.n_step, cfg.rl.gamma)
 
@@ -477,7 +526,7 @@ class BotActor:
         z = self.pre.process(frame.image, frame.frame_id, t_frame)
         self.counters.env_frame_id.value = frame.frame_id
 
-        if not z.valid or z.ground_gray is None:
+        if not z.valid or z.policy_gray is None:
             self._put_log("warning", f"invalid frame {frame.frame_id}: {z.reason}")
             time.sleep(0.002)
             return
@@ -491,55 +540,96 @@ class BotActor:
 
         # fresh episode: seed the stack with this frame (no stale pixels)
         if self._episode_start_ts == 0.0:
-            self.stack.reset(z.ground_gray)
+            self.stack.reset(z.policy_gray)
             self._env_ids = deque([z.frame_id] * self.cfg.perception.frame_stack,
                                   maxlen=self.cfg.perception.frame_stack)
             self._begin_episode(t_frame)
             self.fps_meter.tick(t_frame)
+            self._step_frames = 0
+            self._step_reward = 0.0
+            self._step_action = NOOP
             return
 
-        # live frame: update observation stack
-        self.stack.push(z.ground_gray)
-        self._env_ids.append(frame.frame_id)
         self.fps_meter.tick(t_frame)
         self._episode_frames += 1
 
-        danger = hz.detected and hz.confidence >= 0.5
+        # ---- per-frame perception within the current agent step ---------
+        # Structural danger (an obstacle is in our lane right in front of us)
+        # and causal clear/danger shaping from the obstacle tracker.
+        occ = self.obstacles.update(z.policy_gray)
+        clear = bool(occ.clear)
+        danger_struct = bool(occ.danger)
+        danger = (hz.detected and hz.confidence >= 0.5) or danger_struct
         self.counters.danger_flag.value = 1 if danger else 0
-        # §9: cadence adapts to CPU load AND horizon confidence together.
-        self.scheduler.set_signal(self._cpu_load_estimate(), hz.confidence)
-        if self.scheduler.on_frame(danger=danger):
+        self.scheduler.set_signal(self._cpu_load_estimate(),
+                                  max(hz.confidence, 0.8 if danger_struct else 0.0))
+
+        # ---- decide on the FIRST frame of each agent step ----------------
+        # frame-skip structure: one decision every `frame_skip` captured
+        # frames; the chosen action is held across the skip. The skip IS the
+        # decision cadence (Atari frame-skip), so we decide every agent step
+        # rather than re-using the scheduler's own 2-3-frame counter (which
+        # would otherwise skip decisions). pop_executable still enforces TTL
+        # and duplicate suppression for safe key delivery.
+        first_frame_of_step = (self._step_frames == 0)
+        if first_frame_of_step:
+            self._step_action = NOOP
+            self.scheduler.on_frame(danger=danger)  # keep danger stats fresh
             self._decide(danger)
+            planned = self.scheduler.pop_executable()
+            if planned is not None:
+                self._execute(planned, t_frame)
+                self._step_action = planned.action
+            self.counters.action_step.value = self.scheduler.action_step
+            # epsilon is indexed by AGENT DECISION STEPS now (a stable clock
+            # under variable cadence), not raw env frames.
+            self.counters.epsilon.value = epsilon_for_step(
+                max(1, self.scheduler.action_step), self.cfg.rl)
 
-        planned = self.scheduler.pop_executable()
-        if planned is not None:
-            self._execute(planned, t_frame)
-        # keep the shared action_step counter authoritative for the GUI
-        self.counters.action_step.value = self.scheduler.action_step
-
+        # ---- per-frame reward for the action held this step --------------
         reward = self.reward_calc.step(
             ts=t_frame,
-            action=self._last_action,
+            action=self._step_action,
             horizon=hz,
-            ground_gray=z.ground_gray,
+            ground_gray=z.policy_gray,
             prev_ground_gray=self._prev_ground,
             died=False,
+            clear=clear,
+            danger=danger_struct,
         )
-        self._prev_ground = z.ground_gray
+        self._prev_ground = z.policy_gray
         self._episode_reward += reward.total
-        self._ship_transition(action=self._last_action, reward=reward.total,
-                              done=False, ts=t_frame)
+        self._step_reward += reward.total
+        self._step_frames += 1
+
+        # ---- complete the agent step after `frame_skip` frames -----------
+        step_done = self._step_frames >= self.frame_skip
+        if step_done:
+            # The observation handed to the learner as s_{t+1} is the stack
+            # ending on the frame right after the skip (the frame whose
+            # processing produced the step reward). Push it once here.
+            self.stack.push(z.policy_gray)
+            self._env_ids.append(frame.frame_id)
+            self._ship_transition(action=self._step_action,
+                                  reward=self._step_reward, done=False,
+                                  ts=t_frame)
+            self._step_frames = 0
+            self._step_reward = 0.0
         self._maybe_perf_check()
 
     _prev_ground: Any = None
     _last_action: int = NOOP
+    _step_frames: int = 0
+    _step_reward: float = 0.0
+    _step_action: int = NOOP
 
     # ------------------------------------------------------------------ #
     def _decide(self, danger: bool) -> None:
         t0 = time.perf_counter()
         self.policy.refresh_weights(self.shared_weights)
-        eps = epsilon_for_frame(int(self.counters.env_frame_id.value), self.cfg.rl)
-        self.counters.epsilon.value = eps
+        # epsilon is owned by the frame-skip step clock (set once per agent
+        # step in _process_frame); here we just act under the current value.
+        eps = float(self.counters.epsilon.value)
         action = self.policy.act(self.stack.get(), eps)
         self.infer_ms.observe_ms((time.perf_counter() - t0) * 1000.0)
         self.scheduler.submit(action, danger=danger)
@@ -579,6 +669,10 @@ class BotActor:
         self.scheduler.reset_episode()
         self.nstep.clear()
         self._prev_ground = None
+        self._step_frames = 0
+        self._step_reward = 0.0
+        self._step_action = NOOP
+        self.obstacles.reset()
         self._episode_stats_frames0 = self.counters.env_frame_id.value
 
     def _end_episode(self, reason: str) -> None:
@@ -619,15 +713,19 @@ class BotActor:
         self.scheduler.interrupt()
         self._put_log("warning", f"death confirmed at frame {z.frame_id} "
                                  f"(distance={self.death.last_distance:.1f})")
-        # terminal transition with death penalty
-        self.stack.push(z.ground_gray)
+        # terminal transition with death penalty (closing the current
+        # in-flight agent step: its summed reward includes the -10).
+        self.stack.push(z.policy_gray)
         self._env_ids.append(z.frame_id)
         reward = self.reward_calc.step(
-            ts=t_frame, action=self._last_action, horizon=hz,
-            ground_gray=z.ground_gray, died=True,
+            ts=t_frame, action=self._step_action, horizon=hz,
+            ground_gray=z.policy_gray, died=True,
         )
         self._episode_reward += reward.total
-        self._ship_transition(self._last_action, reward.total, True, t_frame)
+        step_r = self._step_reward + reward.total
+        self._ship_transition(self._step_action, step_r, True, t_frame)
+        self._step_frames = 0
+        self._step_reward = 0.0
         self._end_episode(reason="death")
 
         # 5-8: respawn loop with bounded clicks
@@ -691,6 +789,10 @@ class BotActor:
     def death_reset_detectors(self) -> None:
         self.horizon.reset()
         self.reward_calc = SurvivalRewardCalculator(self.cfg.reward)
+        self.obstacles.reset()
+        self._step_frames = 0
+        self._step_reward = 0.0
+        self._step_action = NOOP
 
     # ------------------------------------------------------------------ #
     # Performance watchdog + auto-downgrade (never silently violated)
@@ -737,7 +839,7 @@ class BotActor:
                       f"PERF BUDGET EXCEEDED (p95={p95:.0f}ms fps={fps:.1f}): "
                       f"downgrading model profile to '{lighter}'")
         model = DuelingDQN.from_profile(lighter, self.cfg.perception.frame_stack,
-                                        self.cfg.perception.ground_size)
+                                        self.cfg.perception.obs_size)
         self.policy = InferencePolicy(model, seed=self.cfg.seed)
         put_bounded(self.transition_q, {"__cmd__": "set_profile", "profile": lighter})
         self._perf_violation_since = time.monotonic()

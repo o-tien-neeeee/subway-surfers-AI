@@ -11,7 +11,7 @@ Target machine: Windows 64-bit, i5-7200U (2C/4T), 12 GB RAM, Intel HD 620,
 Chrome.
 
 > **Honesty first.** Everything in this repo runs and is unit-tested headless
-> (403 tests, see §Testing). The bot has **not yet been run against the real
+> (427 tests, see §Testing). The bot has **not yet been run against the real
 > Poki game** — no real-game benchmark numbers exist yet, so every real-game
 > metric is labelled *not yet measured*. Nothing here is claimed to be
 > "superhuman", "frame-perfect", or "production-ready"; those labels require
@@ -19,11 +19,82 @@ Chrome.
 
 ---
 
-## 0. What's new in this upgrade (v1.1)
+## 0. What's new in this upgrade (v1.2 — deep-research learning fixes)
 
-Continuing from the first complete build, this round closes the remaining
-specification gaps and hardens four subsystems — all verified by new tests
-(340 → 403):
+This round re-architects the **learning problem itself**, guided by the
+findings in `DEEP_RESEARCH_vi.md` (the symptom it answers: *6 000 episodes
+trained with only ~1 s average improvement*). The diagnosis was **not** model
+size or CPU — the MDP itself hid the information and cancelled the gradient.
+All changes are covered by tests (403 → **427**, all green headless):
+
+1. **The policy now sees the WHOLE frame.** Perception fed the CNN only the
+   lower 75 % crop; obstacles spawn at the horizon (top 25 %) and were
+   invisible until <1.5 s before impact. `ZonePreprocessor` now emits
+   `policy_gray` — the **entire** game region resized to `policy_size` (84) —
+   as the network/BC observation; the horizon band survives only as the
+   crude frame-diff alarm. (`perception.py`, new `policy_size`/`obs_size`.)
+2. **Atari-style frame-skip MDP.** One agent decision per `rl.frame_skip`
+   (default 3) captured frames; the action is held and rewards summed over
+   the skip; the observation stack, n-step returns and transitions are all
+   indexed by **agent steps**. `γ=0.99` per step now gives an effective
+   horizon of ~100 steps (~30 s) instead of ~3.3 s when γ was applied per
+   raw 30 FPS frame. (`environment.py`, `config.py`.)
+3. **A dense, positive reward — the style that actually learned this game.**
+   The old `+0.1` hazard bonus paid out for *any* keypress on a frame-diff
+   alarm (it trained "keep jumping/rolling"), and the `+0.02/frame` survival
+   vs `-10` death scale needed a >16 s episode just to break even, so every
+   short episode looked like the same large negative number. The reward is
+   now the **proven "counter" reward used by the no-code RL bots that have
+   demonstrably learned Subway Surfers** (e.g. the *lunai* DQN tool,
+   [github.com/khxji/lunai](https://github.com/khxji/lunai), ~20 h / 3 000
+   auto-reset runs to a score >3 600): a steady **positive per-decision-step
+   reward** (`alive_per_frame`, episode return ∝ survival time) with
+   **death penalty = 0** by default (death just ends the episode / bootstraps
+   to 0, so runs rank naturally by how long they survived instead of all
+   reading as −10). The legacy `-10` penalty, the danger/action terms and the
+   hazard bonus remain available as config flags for ablations.
+   `ObstacleTracker` (`obstacle_perception.py`), a tiny numpy lane/depth
+   occupancy grid, additionally emits a **+`clear_bonus`** when an obstacle
+   passes the player harmlessly (successful-dodge credit), and can drive the
+   scheduler's danger flag. The reward is the OCR-free **counter** (a steady
+   per-step reward) — deliberately chosen for the weak CPU, since OCR per
+   frame is both costly and noisy; the on-screen score stays
+   evaluation-only (see §11), consistent with the repo's "no unvalidated OCR
+   reward" policy.
+4. **Exploration no longer locks the blind policy.** ε decays over
+   **agent decision steps** (`epsilon_decay_steps`, default 300 000) instead
+   of finishing in ~150 k env frames (~episode 600–800), before anything
+   could be learned. (`agent.epsilon_for_step`.)
+5. **Learning from humans, done correctly.**
+   * Demo **label backdating** (`bc.label_backdate_ms`, ~220 ms): the human
+     commits before impact, so the tap label is shifted back to the frames
+     where the obstacle is still far away — the frames that actually need the
+     decision (previously they were labelled NOOP). Full-frame demos.
+   * **Mirror augmentation** for BC (left/right flip + LEFT↔RIGHT label swap),
+     which publicly-documented Subway Surfers bots report materially improves
+     robustness. (`dataset.DemonstrationDataset(mirror=True)`.)
+   * **DQfD** — demonstrations are converted to a **permanent expert replay**
+     (`add_expert_nstep`, never evicted, its own frame store), every learner
+     batch mixes `expert_batch_fraction` (25 %) expert rows, and a
+     **large-margin loss** forces Q(expert action) ≥ Q(other) + `dqfd_margin`
+     so online RL cannot unlearn the human.
+   * **HG-DAgger** — while the bot plays, any human gameplay key seizes
+     control and auto-records a correction demo for the states the policy
+     actually visits and fails in (the covariate-shift fix); it auto-saves
+     after `bc.dagger_tail_ms`. (`demonstration_recorder.py`.)
+6. **Fairer synthetic game** for headless research: obstacle cadence relaxed
+   (0.35–0.6 s → ~0.7–1.6 s), jump/roll grace window 0.35 → 0.5 s, and the
+   generator keeps at least one lane open (never blocks all three at once).
+
+The survey behind these fixes (and the BC-first vs RL-from-scratch evidence
+from existing Subway Surfers projects) is in `DEEP_RESEARCH_vi.md`.
+
+---
+
+## 0b. What's new in the previous upgrade (v1.1)
+
+Continuing from the first complete build, that round closes the remaining
+specification gaps and hardens four subsystems — all verified by tests:
 
 1. **Online best-model gating (§12).** `best_model.pth` used to be written
    only by behaviour cloning. Now the actor reports every finished episode
@@ -64,7 +135,7 @@ screen geometry + keymap + calibration metadata.
 |---|----------|--------------|----------------------|
 | A1 | Classic Atari CNN (Conv×3 → flatten → 512-dense) parameter count? | The flatten head alone is 7·7·64·512 ≈ **1.61 M params** (plus 3136·512 multiplies per forward pass) — dwarfing the convs and blowing both the 80 k StrictLite budget and CPU latency budget. | Rejected. Encoder → **global average pooling** → small dueling heads; depthwise-separable convs for StrictLite. Measured: 49 k / 96 k / 348 k params (§4). |
 | A2 | BatchNorm with small online batches + replay training? | Unstable here: (a) replay batches are drawn from an old distribution while online data shifts; (b) **actor and learner are different processes** — inference uses running stats that the training process is updating, so identical weights give different features; (c) batch=32 online stats are noisy. | **GroupNorm(8)** everywhere (batch-size independent, identical train/eval behaviour). Enforced by `tests/test_models.py::test_no_batchnorm_anywhere`. |
-| A3 | Inference every 4 frames vs "near-frame-perfect" play? | At 30 FPS, a 4-frame cadence is a **133 ms reaction floor** — Subway Surfers dodges routinely need < 300 ms, so 4 frames is viable but marginal; 1-frame decisions are impossible for this CPU while also training. | Adaptive cadence: **2–4 frames normal (load-dependent), 1 frame in danger** (horizon detector fires). Measured, not assumed: p50/p95 inference 1.3/2.0 ms (§4). |
+| A3 | Inference every 4 frames vs "near-frame-perfect" play? | At 30 FPS, a multi-frame cadence sets a reaction floor (~100 ms/frame) — Subway Surfers dodges routinely need < 300 ms; 1-frame decisions are impossible for this CPU while also training. | **Atari-style frame-skip MDP (v1.2):** decide once every `frame_skip` (3) captured frames, hold the action, sum rewards; react on the next frame in danger (obstacle-tracker/horizon alarm). Measured, not assumed: p50/p95 inference ~1–2 ms (§4). |
 | A4 | Training in a separate *thread* vs the Python GIL? | A learner **thread** would serialise torch backward passes with frame processing under the GIL — capture stalls guaranteed. | Learner is a separate **process** (`spawn`); weights flow through shared memory to an actor-local copy (version-guarded, ≤ 1.4 MB memcpy). |
 | A5 | Replay-buffer persistence vs 12 GB RAM? | Naive storage (4×84×84 uint8 obs + next-obs per transition) ≈ 56 KB × 30 000 = **1.7 GB**, plus torch + Chrome — too close to the 4 GB working-set limit. | **Lazy frame store**: each unique 84×84 frame stored once (~7 KB), transitions reference frame ids; eviction-validated at sample time. ≈ 210–260 MB at 30 k transitions. Config warns above 1 GB (`BotConfig._replay_ram_estimate_gb`). |
 | A6 | Raw pixel-difference rewards → reward hacking? | Yes: flashing score popups, coin sparkles and camera shake mint unlimited "novelty" reward; a policy can learn to *die spectacularly* for pixels. | Pixel-diff reward is **OFF by default**, tightly clipped (±0.01), normalised, and behind an ablation switch; a dedicated reward-hacking test (`test_reward_logic.py::TestPixelDiffAblation::test_reward_hacking_resistance`) proves bounded payout. Survival-time reward is primary. |
@@ -80,8 +151,10 @@ screen geometry + keymap + calibration metadata.
 2. **80 k parameter limit vs "maximum learning performance"** — kept as the
    *StrictLite* profile guarantee; BalancedCPU/QualityCPU exceed it **only
    when profiling passes** (§4). Default profile is StrictLite.
-3. **"Inference every 4 frames" vs "decide every frame in danger"** — both:
-   normal state 2–4 frames, danger state 1 frame (§Adaptive timing).
+3. **"Reaction latency vs training budget"** — resolved with a fixed
+   frame-skip MDP: one decision every 3 captured frames with the action held
+   (Atari convention), plus an immediate next-frame reaction when the
+   obstacle tracker/horizon alarm fires in danger.
 4. **Threading for the learner vs GIL** — process instead of thread (A4).
 5. **Pixel-diff reward vs reward hacking** — disabled by default, clipped,
    ablation-gated (A6).
@@ -148,11 +221,12 @@ subway-surfers-AI/
 ├── capture_worker.py         # mss/synthetic capture process
 ├── input_controller.py       # safe keys/clicks, guardian, dry-run
 ├── safety_watchdog.py        # watchdog thread + F8 hotkey
-├── environment.py            # actor loop, synthetic game, sync env
-├── perception.py             # zones, anchor patch, frame stack
+├── environment.py            # actor loop, synthetic game, sync env (frame-skip)
+├── perception.py             # FULL-FRAME policy view, anchor patch, frame stack
+├── obstacle_perception.py    # lane/depth occupancy -> clear/danger shaping
 ├── death_detector.py         # colour anchor + debounce + respawn ctl
-├── horizon_detector.py       # frame-diff hazard detector
-├── action_scheduler.py       # adaptive cadence, buffering, TTL
+├── horizon_detector.py       # frame-diff hazard alarm
+├── action_scheduler.py       # action buffering/TTL (cadence = frame-skip)
 ├── replay_buffer.py          # PER sum-tree, lazy frames, n-step, atomic IO
 ├── dataset.py                # demo validation, episode split, BC dataset
 ├── demonstration_recorder.py # human demo recording (npz)
@@ -168,7 +242,7 @@ subway-surfers-AI/
 ├── evaluation.py             # honest eval protocol + reports
 ├── evaluation_tool.py        # headless evaluation runner
 ├── requirements.txt · config.example.json · pytest.ini
-└── tests/                    # 15 test files, 403 tests
+└── tests/                    # 18 test files, 427 tests
 ```
 
 ---
@@ -201,9 +275,14 @@ Design per profile (`models.py`):
 
 RL core: **Double DQN** + dueling heads + n-step returns (default 3) +
 **Prioritized Experience Replay** (α=0.6, β 0.4→1.0), Huber loss, grad-clip
-10, Adam 1e-4, hard target sync every 1000 updates, ε-greedy 1.0→0.05
-linear over **150 000 env frames** (the word "step" is defined once:
-ε decays on env frames observed by the actor, nothing else).
+10, Adam 1e-4, hard target sync every 1000 updates. The agent runs on an
+**Atari-style frame-skip MDP** (one decision per `rl.frame_skip` captured
+frames, default 3; γ=0.99 per decision → ~30 s effective horizon), so
+**ε-greedy 1.0→0.05 decays linearly over 300 000 agent decision steps**
+(`rl.epsilon_decay_steps`) — a stable clock under variable cadence.
+Imitation support: behaviour cloning (full-frame demos, label backdating,
+mirror augmentation) → permanent **DQfD expert replay** with a large-margin
+loss, plus **HG-DAgger** human-intervention correction demos.
 
 ---
 
@@ -216,7 +295,7 @@ py -3.11 -m venv .venv
 pip install -r requirements.txt
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU-only wheel
 python -m compileall .          # must exit clean
-python -m pytest -q             # 403 passed (headless, no display needed)
+python -m pytest -q             # 427 passed (headless, no display needed)
 python profiling.py             # re-measure on THIS machine
 python app.py                   # GUI
 ```
@@ -249,14 +328,22 @@ dry-run input, same three-process pipeline).
 ## 7. Demonstrations & datasets
 
 * Record: GUI → Step 6 → **● Record demo** (F9 stop). Saves
-  `demos/episode_*.npz`: 84×84 uint8 ground frames, actions, timestamps,
-  done, optional score/confidence/death-state + browser-geometry metadata.
-  No duplicated frame stacks are stored.
+  `demos/episode_*.npz`: 84×84 uint8 **full-frame** policy frames, actions,
+  timestamps, done, optional score/confidence/death-state + geometry
+  metadata. Labels are **backdated** (`bc.label_backdate_ms`): a keypress is
+  assigned to the frames where the obstacle is still at decision distance
+  (the human commits ~200 ms before impact), instead of labelling those
+  frames NOOP.
 * Validate: `python app.py --validate-demos demos` — missing-frame gaps,
   invalid actions, timestamp order, episode boundaries, class imbalance,
   and an **episode-level** train/val split (no frame leakage).
-* Pretrain (BC): `python app.py --pretrain demos` or the GUI button
-  (class-balanced cross-entropy on the advantage logits, DQfD-style).
+* Pretrain (BC): `python app.py --pretrain demos` or the GUI button —
+  class-balanced cross-entropy on the advantage logits with **mirror
+  augmentation** (left/right flip + LEFT↔RIGHT label swap). BC then fills a
+  **permanent DQfD expert replay**: ~25 % of every RL batch is demo data
+  trained with a large-margin loss so the policy does not unlearn the human.
+  **HG-DAgger**: while the bot plays, any human gameplay key auto-records a
+  correction demo for the states the policy actually fails in.
   If fewer than 2 valid episodes exist, BC is **refused with a message** and
   the pipeline falls back to online RL with a warm-up phase — it never
   pretends pretraining happened.
@@ -265,16 +352,20 @@ dry-run input, same three-process pipeline).
 
 ```bash
 python -m compileall .     # clean compile of every file
-python -m pytest -q        # 403 tests
+python -m pytest -q        # 427 tests
 python app.py --headless --steps 600       # end-to-end smoke (fake game)
 python app.py --evaluate 5                 # headless eval + honest report
 ```
 
 Test coverage highlights: horizon detection & debounce; colour-anchor death
 ladder + false-positive flashes + respawn machine (timeout → FAILED, never
-clicks forever); reward clipping + pending-hazard logic + no-future-leak +
-reward-hacking bounds; action cadence/danger/expiry/duplicates + confidence-
-aware cadence; key release after backend exceptions + guardian force-release
+clicks forever); reward counter/clear/danger shaping + clipping +
+reward-hacking bounds (legacy pending-hazard ablation gated off by default);
+full-frame observations, frame-skip MDP, agent-step ε schedule, obstacle
+tracker; DQfD large-margin loss + never-evict expert replay + expert-mixed
+batches; BC mirror augmentation + backdated demo labels + HG-DAgger
+intervention recording; action TTL/duplicate suppression; key release after
+backend exceptions + guardian force-release
 + focus gate; PER maths, NaN protection, eviction validation, persistence +
 corruption recovery; checkpoint atomicity, best-model policy, RNG-state round
 trip, online best-model gating + restart protection; Mann-Whitney/bootstrap/
@@ -347,18 +438,24 @@ python app.py --evaluate 20         # per-episode stats + system profile
 - [x] Five discrete actions; configurable keys; TTL, cooldown, duplicate
       suppression, buffering; guaranteed key release (guardian + watchdog +
       exception paths); dry-run mode; focus gate
-- [x] Adaptive cadence 2–4 frames / 1 in danger, from CPU load AND horizon
-      confidence; separate counters
+- [x] Atari-style frame-skip cadence (one decision per `frame_skip` frames,
+      action held, rewards summed), 1-frame reaction in danger; TTL/duplicate
+      suppression on key delivery
+- [x] Full-frame policy observation (the horizon is visible — obstacles spawn
+      there), separate low-res horizon alarm band
 - [x] PER (α/β, IS weights, sum-tree, NaN guards, eviction validation),
       n-step returns, lazy uint8 frame storage, atomic persistence with
       sha256 + `.corrupt` quarantine
-- [x] Survival reward (time-proportional), −10 death, +0.1 pending hazard
-      (no future leak), clipping [−10, 1], pixel-diff ablation OFF +
+- [x] Dense positive counter reward (proven style; episode return ∝ survival),
+      death penalty OFF by default (configurable); causal `+clear` shaping from
+      the obstacle tracker; legacy pixel-diff/hazard-bonus ablations OFF +
       hacking test
-- [x] Double DQN + dueling + target net + Huber + grad clip + ε schedule
-      defined on env frames
-- [x] BC pretraining with episode-level split, class weighting, per-action
-      accuracy; refuses insufficient data instead of faking it
+- [x] Double DQN + dueling + target net + Huber + grad clip + frame-skip MDP;
+      ε schedule defined on agent decision steps; DQfD large-margin loss
+- [x] BC pretraining with episode-level split, class weighting, mirror
+      augmentation, backdated labels, per-action accuracy; permanent DQfD
+      expert replay; HG-DAgger correction recording; refuses insufficient
+      data instead of faking it
 - [x] Checkpoints (best/latest/buffer) atomic + RNG states + git/config hash;
       best_model.pth gated online by the rolling episode metric and
       protected against regression across restarts
@@ -369,7 +466,7 @@ python app.py --evaluate 20         # per-episode stats + system profile
       worker crashes, no stuck keys on any shutdown path
 - [x] No bare excepts / `except Exception: pass` / TODO stubs / network
       calls (AST-enforced tests)
-- [x] 403 automated tests green; `compileall` clean
+- [x] 427 automated tests green; `compileall` clean
 
 **Requires the real Poki game on the target machine (pending)**
 

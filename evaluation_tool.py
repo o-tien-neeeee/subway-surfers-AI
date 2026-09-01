@@ -28,7 +28,7 @@ def load_policy(cfg: BotConfig, which: str = "best") -> InferencePolicy:
     ckpt = CheckpointManager(cfg.paths.checkpoints_dir, cfg.rl.profile)
     payload = ckpt.load_model(which) or ckpt.load_model("latest")
     model = DuelingDQN.from_profile(cfg.rl.profile, cfg.perception.frame_stack,
-                                    cfg.perception.ground_size)
+                                    cfg.perception.obs_size)
     if payload is not None and payload.get("profile") == cfg.rl.profile:
         model.load_state_dict(payload["agent"]["online"])
         LOGGER.info("evaluation policy loaded from %s checkpoint (%s)",

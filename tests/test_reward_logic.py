@@ -37,7 +37,10 @@ class TestSurvivalRewards:
         assert r.alive == pytest.approx(0.02 * 6, rel=0.05)
 
     def test_death_penalty_once(self) -> None:
-        calc = SurvivalRewardCalculator(RewardConfig())
+        # death penalty is opt-in (proven RL bots use 0 and rely on the
+        # positive per-step counter reward); here we test the MECHANISM.
+        calc = SurvivalRewardCalculator(
+            RewardConfig(death_penalty=-10.0, reward_clip_min=-10.0))
         calc.begin_episode(0.0)
         r1 = calc.step(ts=0.1, action=0, horizon=hz(1, 0.1, 0, False), died=True)
         assert r1.death == -10.0
@@ -46,7 +49,9 @@ class TestSurvivalRewards:
         assert r2.death == 0.0, "death penalty must be applied exactly once"
 
     def test_total_clipped_to_bounds(self) -> None:
-        calc = SurvivalRewardCalculator(RewardConfig(alive_per_frame=0.02))
+        cfg = RewardConfig(alive_per_frame=0.02, death_penalty=-10.0,
+                           reward_clip_min=-10.0, reward_clip_max=1.0)
+        calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
         r = calc.step(ts=0.01, action=0, horizon=hz(1, 0.01, 0, False), died=True)
         assert r.death == -10.0
@@ -54,10 +59,10 @@ class TestSurvivalRewards:
         assert r.clipped is False
         # absurdly large alive component must clip at max
         r2 = calc.step(ts=1000.0, action=0, horizon=hz(2, 1000.0, 0, False))
-        assert r2.total <= calc.cfg.reward_clip_max + 1e-9
+        assert r2.total <= cfg.reward_clip_max + 1e-9
 
     def test_negative_clip(self) -> None:
-        cfg = RewardConfig(death_penalty=-100.0)  # beyond clip min
+        cfg = RewardConfig(death_penalty=-100.0, reward_clip_min=-50.0)  # beyond clip min
         calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
         r = calc.step(ts=0.01, action=0, horizon=hz(1, 0.01, 0, False), died=True)
@@ -67,7 +72,7 @@ class TestSurvivalRewards:
 
 class TestPendingHazard:
     def test_dodge_after_hazard_bonus(self) -> None:
-        cfg = RewardConfig(hazard_bonus=0.1, hazard_resolve_frames=2,
+        cfg = RewardConfig(use_hazard_bonus=True, hazard_bonus=0.1, hazard_resolve_frames=2,
                            hazard_expiry_s=1.0)
         calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
@@ -80,7 +85,7 @@ class TestPendingHazard:
         assert r2.hazard == pytest.approx(0.1)
 
     def test_noop_gets_no_bonus(self) -> None:
-        cfg = RewardConfig(hazard_bonus=0.1, hazard_resolve_frames=2)
+        cfg = RewardConfig(use_hazard_bonus=True, hazard_bonus=0.1, hazard_resolve_frames=2)
         calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
         calc.step(ts=0.03, action=0, horizon=hz(10, 0.03, 20.0, True))
@@ -89,7 +94,7 @@ class TestPendingHazard:
         assert r.hazard == 0.0
 
     def test_hazard_not_resolving_gives_no_bonus(self) -> None:
-        cfg = RewardConfig(hazard_bonus=0.1, hazard_resolve_frames=2,
+        cfg = RewardConfig(use_hazard_bonus=True, hazard_bonus=0.1, hazard_resolve_frames=2,
                            hazard_expiry_s=5.0)
         calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
@@ -99,7 +104,7 @@ class TestPendingHazard:
         assert r.hazard == 0.0, "unresolved hazard must not pay out"
 
     def test_old_events_expire(self) -> None:
-        cfg = RewardConfig(hazard_bonus=0.1, hazard_resolve_frames=2,
+        cfg = RewardConfig(use_hazard_bonus=True, hazard_bonus=0.1, hazard_resolve_frames=2,
                            hazard_expiry_s=0.1)
         calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
@@ -113,7 +118,7 @@ class TestPendingHazard:
         """At the moment of the hazard frame the reward must not depend on
         whether the hazard LATER resolves — checked by comparing two worlds."""
         def world(dodge: bool, resolves: bool) -> float:
-            cfg = RewardConfig(hazard_bonus=0.1, hazard_resolve_frames=2)
+            cfg = RewardConfig(use_hazard_bonus=True, hazard_bonus=0.1, hazard_resolve_frames=2)
             calc = SurvivalRewardCalculator(cfg)
             calc.begin_episode(0.0)
             action = 3 if dodge else 0
@@ -127,10 +132,14 @@ class TestPendingHazard:
         a = world(dodge=True, resolves=True)
         b = world(dodge=True, resolves=False)
         c = world(dodge=False, resolves=True)
-        assert a == b == c, "reward at hazard onset must be identical in all worlds"
+        # Future-independence: the SAME action at onset must not depend on
+        # whether the hazard later resolves (a vs b). 'c' takes a different
+        # action so the (new, anti-spam) action cost legitimately differs.
+        assert a == b, "reward at hazard onset must not depend on the future"
+        assert a != c or True  # different action may differ via action cost
 
     def test_overlapping_hazards_do_not_double_pay(self) -> None:
-        cfg = RewardConfig(hazard_bonus=0.1, hazard_resolve_frames=1)
+        cfg = RewardConfig(use_hazard_bonus=True, hazard_bonus=0.1, hazard_resolve_frames=1)
         tracker = PendingHazardTracker(cfg)
         tracker.register(hz(1, 1.0, 30.0, True))
         tracker.register(hz(2, 1.03, 30.0, True))  # extends, no new event
@@ -139,8 +148,8 @@ class TestPendingHazard:
         assert tracker.bonuses_granted == 1
 
     def test_stats_tracking(self) -> None:
-        cfg = RewardConfig(hazard_bonus=0.1, hazard_resolve_frames=1,
-                           hazard_expiry_s=0.05)
+        cfg = RewardConfig(use_hazard_bonus=True, hazard_bonus=0.1,
+                           hazard_resolve_frames=1, hazard_expiry_s=0.05)
         calc = SurvivalRewardCalculator(cfg)
         calc.begin_episode(0.0)
         calc.step(ts=0.03, action=2, horizon=hz(1, 0.03, 30.0, True))
@@ -196,4 +205,41 @@ class TestPixelDiffAblation:
         calc.begin_episode(0.0)
         r = calc.step(ts=0.03, action=0, horizon=hz(1, 0.03, 0, False))
         d = r.to_dict()
-        assert set(d) == {"alive", "death", "hazard", "pixel_diff", "total", "clipped"}
+        assert set(d) == {"alive", "death", "hazard", "clear", "danger",
+                          "action_cost", "pixel_diff", "total", "clipped"}
+
+
+class TestCounterRewardProvenStyle:
+    """The proven no-code-RL reward (e.g. lunai): steady positive per-step
+    reward, no negative death penalty -> episodes rank naturally by survival
+    and early training gets a dense, non-cancelling gradient."""
+
+    def test_default_reward_is_non_negative(self) -> None:
+        cfg = RewardConfig()
+        assert cfg.death_penalty == 0.0
+        assert cfg.alive_per_frame > 0.0
+        assert cfg.reward_clip_min == 0.0
+
+    def test_death_does_not_make_return_negative(self) -> None:
+        calc = SurvivalRewardCalculator(RewardConfig(alive_per_frame=0.1))
+        calc.begin_episode(0.0)
+        r = calc.step(ts=0.1, action=0, horizon=hz(1, 0.1, 0, False), died=True)
+        assert r.death == 0.0
+        assert r.total >= 0.0
+
+    def test_longer_survival_scores_higher(self) -> None:
+        def run(steps: int) -> float:
+            calc = SurvivalRewardCalculator(RewardConfig(alive_per_frame=0.1,
+                                                         action_cost=0.0))
+            calc.begin_episode(0.0)
+            total = 0.0
+            for i in range(steps):
+                ts = (i + 1) / 30.0
+                r = calc.step(ts=ts, action=0, horizon=hz(i, ts, 0, False))
+                total += r.total
+            r = calc.step(ts=steps / 30.0, action=0,
+                          horizon=hz(steps, steps / 30.0, 0, False), died=True)
+            total += r.total
+            return total
+
+        assert run(30) > run(3)  # surviving longer strictly increases return

@@ -37,6 +37,9 @@ class RewardBreakdown:
     alive: float = 0.0
     death: float = 0.0
     hazard: float = 0.0
+    clear: float = 0.0
+    danger: float = 0.0
+    action_cost: float = 0.0
     pixel_diff: float = 0.0
     total: float = 0.0
     clipped: bool = False
@@ -47,6 +50,9 @@ class RewardBreakdown:
             "alive": self.alive,
             "death": self.death,
             "hazard": self.hazard,
+            "clear": self.clear,
+            "danger": self.danger,
+            "action_cost": self.action_cost,
             "pixel_diff": self.pixel_diff,
             "total": self.total,
             "clipped": 1.0 if self.clipped else 0.0,
@@ -207,16 +213,47 @@ class SurvivalRewardCalculator:
         ground_gray=None,
         prev_ground_gray=None,
         died: bool = False,
+        clear: bool = False,
+        danger: bool = False,
+        shaped: float | None = None,
     ) -> RewardBreakdown:
+        """One reward evaluation (per AGENT DECISION STEP with frame-skip).
+
+        Causal shaping (deep-research fix, see DEEP_RESEARCH_vi.md §4.3),
+        supplied by the perception/environment layer — never from UI pixels:
+          * ``clear=True``  -> +clear_bonus: an obstacle just passed the
+            player harmlessly (a successful dodge finally gets credit).
+          * ``danger=True`` -> -danger_penalty per step while an obstacle
+            occupies the cell directly ahead (early, policy-invariant-ish
+            signal that precedes death by ~1 s).
+          * a non-NOOP action costs -action_cost: anti-spam regulariser that
+            kills the "keep jumping/rolling" local optimum.
+        ``shaped`` lets a caller hand a fully precomputed shaping value (e.g.
+        the structured CV path); when given it overrides clear/danger/cost.
+        """
         alive = self.alive_reward(ts)
         hazard = 0.0
-        if horizon.detected:
-            self.hazards.register(horizon)
-        hazard = self.hazards.on_frame(horizon, action)
-        self.hazards.expire_old(ts)
+        # Legacy horizon-diff "hazard bonus": OFF by default (it rewarded ANY
+        # keypress on a frame-diff alarm -> button-spam). Enabled only when
+        # explicitly turned on with a positive bonus (kept for ablation).
+        hazard_on = getattr(self.cfg, "use_hazard_bonus", False)
+        if hazard_on and self.cfg.hazard_bonus and self.cfg.hazard_bonus > 0.0:
+            if horizon.detected:
+                self.hazards.register(horizon)
+            hazard = self.hazards.on_frame(horizon, action)
+            self.hazards.expire_old(ts)
+        if shaped is not None:
+            shaping = float(shaped)
+            clear_r = danger_r = cost_r = 0.0
+        else:
+            clear_r = self.cfg.clear_bonus if clear else 0.0
+            danger_r = self.cfg.danger_penalty if danger else 0.0
+            cost_r = (-self.cfg.action_cost
+                      if (action != 0 and not died) else 0.0)
+            shaping = clear_r + danger_r + cost_r
         pd = self.pixel_diff_reward(ground_gray, prev_ground_gray)
         death = self.death_reward() if died else 0.0
-        total = alive + hazard + pd + death
+        total = alive + hazard + shaping + pd + death
         clipped = False
         if total < self.cfg.reward_clip_min:
             total, clipped = self.cfg.reward_clip_min, True
@@ -226,6 +263,9 @@ class SurvivalRewardCalculator:
             alive=alive,
             death=death,
             hazard=hazard,
+            clear=clear_r,
+            danger=danger_r,
+            action_cost=cost_r,
             pixel_diff=pd,
             total=total,
             clipped=clipped,
