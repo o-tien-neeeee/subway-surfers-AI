@@ -126,15 +126,24 @@ class ZoneResult:
 
     frame_id: int
     ts: float
-    horizon_gray: Optional[np.ndarray]  # 40x40 uint8
-    ground_gray: Optional[np.ndarray]  # 84x84 uint8
+    horizon_gray: Optional[np.ndarray]  # 40x40 uint8 (alarm band)
+    ground_gray: Optional[np.ndarray]  # SxS uint8 FULL-FRAME policy view
     anchor_patch: Optional[np.ndarray]  # 5x5x3 uint8
     valid: bool
     reason: str = "ok"
 
 
 class ZonePreprocessor:
-    """Splits the region into horizon/ground zones and samples the anchor."""
+    """Produces the horizon alarm band, the FULL-FRAME policy view and anchor.
+
+    Deep-research fix (v1.24): ``ground_gray`` is now the ENTIRE game region
+    resized to ``ground_size`` (still SxS uint8), not the lower-75% crop.
+    Subway Surfers obstacles spawn at the HORIZON (top of the frame) and rush
+    down; the old lower-crop hid exactly the pixels the policy must react to,
+    leaving <1.5 s of visible trajectory. The horizon band survives only as
+    the crude frame-diff alarm input. The field name ``ground_gray`` is kept
+    for compatibility with the rest of the codebase (it is the policy view).
+    """
 
     def __init__(
         self,
@@ -156,7 +165,7 @@ class ZonePreprocessor:
         self.anchor_xy = xy
 
     def split_line(self, region_h: int) -> int:
-        """Pixel row separating horizon band from ground band."""
+        """Pixel row separating the horizon ALARM band from the rest."""
         return max(1, int(round(region_h * self.horizon_frac)))
 
     def process(self, image: np.ndarray, frame_id: int, ts: float) -> ZoneResult:
@@ -168,15 +177,17 @@ class ZonePreprocessor:
         split = self.split_line(h)
 
         horizon = image[:split, :, :]
-        ground = image[split:, :, :]
 
         horizon_gray = cv2.resize(
             rgb_to_gray(horizon),
             (self.cfg.horizon_size, self.cfg.horizon_size),
             interpolation=cv2.INTER_AREA,
         )
+        # POLICY VIEW: the ENTIRE game region (sky/horizon + track), resized
+        # to the observation edge, so obstacles are visible the moment they
+        # spawn far away. Kept under the legacy name ``ground_gray``.
         ground_gray = cv2.resize(
-            rgb_to_gray(ground),
+            rgb_to_gray(image),
             (self.cfg.ground_size, self.cfg.ground_size),
             interpolation=cv2.INTER_AREA,
         )

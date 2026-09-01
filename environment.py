@@ -679,7 +679,17 @@ class BotActor:
         # DEEP-FIX: effective_epsilon() caps exploration once behaviour cloning
         # has produced a policy, so the actor actually USES the BC policy instead
         # of playing randomly at epsilon~1.0 and dying every ~1s.
-        eps = effective_epsilon(int(self.counters.env_frame_id.value),
+        #
+        # MDP-FIX (v1.24.0): epsilon must be indexed by DECISION steps, not raw
+        # captured frames.  The ActionScheduler decides on a cadence of one
+        # action every 2-4 frames (and re-decides immediately on danger), so the
+        # agent's true time step is the *decision*.  Indexing the epsilon
+        # schedule by env_frame_id made exploration decay 2-4x faster than the
+        # decisions the policy actually experienced -- the schedule and the MDP
+        # ran on different clocks.  ``scheduler.stats.decisions`` counts exactly
+        # the times we chose an action, which is the RL agent's step counter.
+        decision_step = int(self.scheduler.stats.decisions)
+        eps = effective_epsilon(decision_step,
                                 self.cfg.rl, self.counters.bc_pretrained.value)
         self.counters.epsilon.value = eps
         action = self.policy.act(self.stack.get(), eps)

@@ -450,16 +450,22 @@ class RLConfig:
     #: Training cadence (learner updates) — independent of action cadence.
     max_updates_per_second: float = 20.0
     n_step: int = 5
-    #: Epsilon decays LINEARLY over `epsilon_decay_frames` ENV frames
-    #: (frames observed by the actor), from start to end.  Explicitly NOT
-    #: learner updates and NOT action steps.
-    #: DEEP-FIX: was 150_000 (~83 min), so a from-scratch run with no BC stayed
-    #: at epsilon~0.99 for the whole session — 99% random, ignoring whatever the
-    #: Q-net had learned, dying every ~1s and never bootstrapping.  50_000 lets
-    #: the no-BC path start exploiting its improving policy within ~10 min so it
-    #: can actually learn something from random play.  (With BC, exploration is
-    #: capped at epsilon_after_bc regardless, so this only affects the no-BC path
-    #: and the late decay below that cap.)
+    #: Epsilon decays LINEARLY over `epsilon_decay_frames` DECISION steps
+    #: (actions actually chosen by the actor — one per ActionScheduler decision),
+    #: from start to end.  Explicitly NOT learner updates and NOT raw captured
+    #: frames.
+    #: MDP-FIX (v1.24.0): the field name is kept for compatibility but the unit
+    #: is the agent's real time step = a *decision*.  The scheduler holds an
+    #: action for 2-4 frames (and re-decides on danger), so a captured frame is
+    #: not an MDP step; indexing epsilon by raw frames decayed exploration 2-4x
+    #: faster than the decisions the policy experienced.  50_000 decisions
+    #: (~2-4x that many frames) matches the original "start exploiting within
+    #: ~10-40 min" tuning while sharing a clock with the replay stream.
+    #: DEEP-FIX (v1.13): was 150_000, so a from-scratch run with no BC stayed at
+    #: epsilon~0.99 for the whole session — 99% random, ignoring whatever the
+    #: Q-net had learned, dying every ~1s and never bootstrapping.  (With BC,
+    #: exploration is capped at epsilon_after_bc / disabled regardless, so this
+    #: only affects the no-BC path and the late decay below that cap.)
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay_frames: int = 50_000

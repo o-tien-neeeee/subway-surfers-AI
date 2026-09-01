@@ -128,7 +128,13 @@ class InferencePolicy:
 
 
 def epsilon_for_frame(frame: int, cfg: RLConfig) -> float:
-    """Linear decay in ENV frames: the only definition of 'step' for eps."""
+    """Linear exploration decay over ``cfg.epsilon_decay_frames`` steps.
+
+    MDP-FIX (v1.24.0): the caller must pass the number of *decision* steps
+    (actions chosen), not raw captured frames.  An agent step is one
+    ActionScheduler decision — the action is then held across the following
+    2-4 frames (frame-skip MDP), so decisions are the true time index.
+    """
     if frame <= 0:
         return cfg.epsilon_start
     frac = min(1.0, frame / max(1, cfg.epsilon_decay_frames))

@@ -1,6 +1,6 @@
 # Subway Surfers Research Bot (screen-capture RL agent)
 
-> **Current version / Phiên bản hiện tại: `1.23.0`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
+> **Current version / Phiên bản hiện tại: `1.24.0`** — nguồn: `version.py` → `APP_VERSION`; lịch sử đầy đủ trong `DEEP_FIX_REPORT.md`. (README này được test buộc phải khớp `APP_VERSION` mỗi phiên.)
 
 A personal, **black-box** UI-automation research bot that plays
 [Poki Subway Surfers](https://poki.com/en/g/subway-surfers) using only screen
@@ -282,6 +282,30 @@ better algorithm.
 
 **Test counts**: 955/955 PASS in 2:14 (up from 874/874
 in v1.21.0).
+
+## 0b. What's new in v1.24 — deep vision fix (policy sees the horizon)
+
+Before v1.24 the policy observation was the **bottom 75% crop** of the game
+frame (`ground = image[split:]` in `perception.py`).  Obstacles spawn at the
+**horizon (top 25%)**, so the CNN was blind to them until they were <1.5 s
+away — the root-cause bug behind many rounds of reward tuning that never made
+the AI learn.  All reference agents (lunai, subwAI, the CS386 DQN) feed the
+**full frame**.  v1.24:
+
+* `ZonePreprocessor` now feeds the **full game region** resized to 84×84 as
+  the policy observation (`ground_gray` keeps its name for compatibility; only
+  its content changed).  The horizon band is still used only for the
+  frame-diff alarm.
+* The epsilon schedule now decays over **decision steps** (one per
+  `ActionScheduler` decision), not raw captured frames.  Because an action is
+  held for 2–4 frames (the existing frame-skip cadence), indexing epsilon by
+  raw frames made exploration decay 2–4× faster than the decisions the policy
+  actually experienced — the schedule and the MDP ran on different clocks.
+  Frame-skip cadence itself was already correct and is untouched.
+* New **`obstacle_perception.py`** — `ObstacleTracker`: a 3-lane × 5-distance
+  occupancy grid from pure-numpy CV (<0.2 ms) that detects obstacles in the
+  player's lane and emits a `danger`/`clear` signal, without touching any
+  existing algorithm (pinned by `tests/test_obstacle_perception.py`).
 
 ## 0c. What's new in v1.23 — IBRL + SIL + EMA + Auto-Entropy (massive AI upgrade)
 
